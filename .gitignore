@@ -68,7 +68,7 @@ venv.bak/
 # AI Context Files
 .gemini
 .agents/
-plans/
+docs/
 
 # Data and Weights
 data/
