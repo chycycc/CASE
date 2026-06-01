@@ -22,9 +22,10 @@ def make_model(vocab, emo_num, strategy_num):
     model.to(config.device)
     
     # Intialization
-    for n, p in model.named_parameters():
-        if p.dim() > 1 and (n != "embedding.lut.weight" and config.pretrain_emb):
-            xavier_uniform_(p)
+    if not is_eval:
+        for n, p in model.named_parameters():
+            if p.dim() > 1 and (n != "embedding.lut.weight" and config.pretrain_emb):
+                xavier_uniform_(p)
 
     print("# PARAMETERS", count_parameters(model))
 
@@ -131,7 +132,7 @@ def test(model, test_set):
         model, test_set, ty="test", max_dec_step=50
     )
     file_summary = config.save_path + "/results.txt"
-    with open(file_summary, "w") as f:
+    with open(file_summary, "w", encoding="utf-8") as f:
         f.write("EVAL\tBOW_Loss\tKL_Loss\tMIM_Loss\tCTX_Loss\tPPL\tSTR_loss\tSTR_acc\tEMO_loss\tEMO_acc\n")
         f.write(
             "{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\n".format(

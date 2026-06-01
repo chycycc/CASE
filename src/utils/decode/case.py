@@ -343,7 +343,7 @@ class Translator(object):
             
             fine_emotion = react_batch_enc[:, 0]
             emotion_emb = self.model.emotion_norm(torch.cat((concept_enc, fine_emotion), dim=-1))
-            emo_gate = F.sigmoid(self.model.emotion_gate(emotion_emb))
+            emo_gate = torch.sigmoid(self.model.emotion_gate(emotion_emb))
             emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
             
             # Merge Context, Cognition-Affection-Strategy Signals
@@ -472,10 +472,10 @@ def get_input_from_batch(batch):
         coverage = torch.zeros(enc_batch.size()).to(config.device)
 
     if enc_batch_extend_vocab is not None:
-        enc_batch_extend_vocab.to(config.device)
+        enc_batch_extend_vocab = enc_batch_extend_vocab.to(config.device)
     if extra_zeros is not None:
-        extra_zeros.to(config.device)
-    c_t_1.to(config.device)
+        extra_zeros = extra_zeros.to(config.device)
+    c_t_1 = c_t_1.to(config.device)
 
     return (
         enc_batch,

@@ -378,7 +378,7 @@ class MultiExpertMultiHeadAttention(nn.Module):
 
         if mask is not None:
             mask = mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, 1, T_values]
-            logits = logits.masked_fill(mask, -1e18)
+            logits = logits.masked_fill(mask, -1e4)
 
         ## attention weights
         # attetion_weights = logits.sum(dim=1)/self.num_heads
@@ -509,7 +509,7 @@ class MultiHeadAttention(nn.Module):
 
         if mask is not None:
             mask = mask.unsqueeze(1)  # [B, 1, 1, T_values]
-            logits = logits.masked_fill(mask, -1e18)
+            logits = logits.masked_fill(mask, -1e4)
 
         ## attention weights
         attetion_weights = logits.sum(dim=1) / self.num_heads
@@ -659,7 +659,7 @@ def _gen_timing_signal(length, channels, min_timescale=1.0, max_timescale=1.0e4)
         float(num_timescales) - 1
     )
     inv_timescales = min_timescale * np.exp(
-        np.arange(num_timescales).astype(np.float) * -log_timescale_increment
+        np.arange(num_timescales).astype(float) * -log_timescale_increment
     )
     scaled_time = np.expand_dims(position, 1) * np.expand_dims(inv_timescales, 0)
 
@@ -749,7 +749,7 @@ def gen_embeddings(vocab):
     if config.emb_file is not None:
         print("Loading embedding file: %s" % config.emb_file)
         pre_trained = 0
-        for line in open(config.emb_file).readlines():
+        for line in open(config.emb_file, encoding="utf-8").readlines():
             sp = line.split()
             if len(sp) == config.emb_dim + 1:
                 if sp[0] in vocab.word2index:
