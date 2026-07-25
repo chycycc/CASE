@@ -93,6 +93,14 @@ def get_args():
     parser.add_argument("--fine_weight", type=float, default=0.2)
     parser.add_argument("--coarse_weight", type=float, default=1.0)
     
+    # EPCL 超参数（从 CEM-EPCL v6.4 移植的验证值）
+    parser.add_argument("--lambda_epcl", type=float, default=0.07,
+                        help="EPCL 对比损失权重")
+    parser.add_argument("--epcl_warmup", type=int, default=3000,
+                        help="EPCL λ 线性预热步数")
+    parser.add_argument("--epcl_freeze_step", type=int, default=14000,
+                        help="分类头冻结时间点")
+    
     parser.add_argument("--test", default=False, action="store_true")
     parser.add_argument("--large_decoder", action="store_true")
     parser.add_argument("--multitask", action="store_true")

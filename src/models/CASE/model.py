@@ -30,6 +30,65 @@ from src.utils.constants import ESC_MAP_EMO, ESC_MAP_STRATEGY, ED_MAP_EMO
 
 from sklearn.metrics import accuracy_score
 
+
+# ================= EPCL: 情感原型对比学习模块 =================
+# 从 CEM-EPCL v6.2 移植，经 6 轮实验迭代验证
+# 核心思想: 非线性投影头隔离"对比学习空间"和"语言生成空间"
+class PrototypeContrastiveLoss(nn.Module):
+    def __init__(self, num_prototypes, input_dim, temperature=0.3,
+                 t_uniform=2.0, alpha_uni=1.0):
+        super(PrototypeContrastiveLoss, self).__init__()
+        self.temperature = temperature
+        self.t_uniform = t_uniform
+        self.alpha_uni = alpha_uni
+
+        # 投影层: input_dim → 128(瓶颈) → input_dim
+        # 128 维瓶颈强制信息压缩，ReLU 切断部分负梯度形成减震器
+        proj_hidden = 128
+        self.projection_head = nn.Sequential(
+            nn.Linear(input_dim, proj_hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(proj_hidden, input_dim)
+        )
+
+        # 可学习的情感原型，初始化在超球面上
+        self.prototypes = nn.Parameter(torch.empty(num_prototypes, input_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+        self.prototypes.data = F.normalize(self.prototypes.data, p=2, dim=1)
+
+    def uniformity_loss(self, normalized_prototypes):
+        """原型间排斥力：梯度仅流向 self.prototypes"""
+        sq_pdist = 2.0 - 2.0 * torch.matmul(
+            normalized_prototypes, normalized_prototypes.T
+        )
+        mask = torch.eye(
+            normalized_prototypes.size(0),
+            device=normalized_prototypes.device
+        ).bool()
+        sq_pdist = sq_pdist.masked_fill(mask, float('inf'))
+        return torch.logsumexp(-self.t_uniform * sq_pdist, dim=1).mean()
+
+    def forward(self, features, labels, tau=None):
+        current_tau = tau if tau is not None else self.temperature
+
+        # 投影至对比子空间（不截断主干计算图）
+        projected_features = self.projection_head(features)
+
+        # 超球面归一化
+        proj_norm = F.normalize(projected_features, p=2, dim=1)
+        proto_norm = F.normalize(self.prototypes, p=2, dim=1)
+
+        # Alignment: 拉近样本与目标原型
+        logits = torch.matmul(proj_norm, proto_norm.T) / current_tau
+        loss_align = F.cross_entropy(logits, labels)
+
+        # Uniformity: 原型间排斥力
+        loss_uni = self.uniformity_loss(proto_norm)
+
+        return loss_align + self.alpha_uni * loss_uni
+# ==============================================================
+
+
 class Encoder(nn.Module):
     """
     A Transformer Encoder module.
@@ -581,6 +640,12 @@ class CASE(nn.Module):
         else:
             self.emotion_num = len(ED_MAP_EMO)
         self.emotion_linear = nn.Linear(config.emb_dim, self.emotion_num)
+        
+        # === EPCL 模块初始化（从 CEM-EPCL v6.4 移植） ===
+        self.epcl_criterion = PrototypeContrastiveLoss(
+            self.emotion_num, config.emb_dim  # 32 类, 300 维
+        )
+        self.emo_dropout = nn.Dropout(0.3)  # 分类头正则化
         self.concept_prior_attn = Attention(query_size=config.emb_dim,
                                             memory_size=config.emb_dim,
                                             hidden_size=config.emb_dim,
@@ -988,7 +1053,11 @@ class CASE(nn.Module):
             commonsense_fake_outputs = torch.cat((commonsense_outputs[-1].unsqueeze(0), commonsense_outputs[:-1]), dim=0)
             fine_mim_loss = self.fine_grained_infomax_score(commonsense_outputs, commonsense_fake_outputs, react_enc, react_fake_enc, commonsense_mask)
         
-            mim_loss = config.coarse_weight * coarse_mim_loss + config.fine_weight * fine_mim_loss
+            # === v2 Step2: 冻结后同步关闭 MIM，释放特征空间给 EPCL ===
+            if train and iter >= config.epcl_freeze_step:
+                mim_loss = torch.tensor(0.0, device=config.device)
+            else:
+                mim_loss = config.coarse_weight * coarse_mim_loss + config.fine_weight * fine_mim_loss
         
             # uttr_split_react_mask = batch["uttr_split_react_mask"]
             # fine_mask = torch.cat((torch.ones((bsz, 1)).long().to(config.device), uttr_split_react_mask), dim=1)
@@ -1000,10 +1069,32 @@ class CASE(nn.Module):
             emo_gate = torch.sigmoid(self.emotion_gate(emotion_emb))
             emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
         
-            # emotion prediction
+            # === EPCL: 原型对比学习损失计算 ===
+            # [v2 Step3] 锚点前移至门控前的 fine_emotion，绕过 emo_gate 自适应吸收
+            if self.dataset == "ED" and train:
+                epcl_loss = self.epcl_criterion(fine_emotion, batch["program_label"])
+            else:
+                epcl_loss = torch.tensor(0.0, device=config.device)
+
+            # === EPCL: 分类头冻结调度（复刻 CEM-EPCL v6.4 策略） ===
+            emo_head_active = (not train) or (iter < config.epcl_freeze_step)
+            if train and iter == config.epcl_freeze_step and self.dataset == "ED":
+                for p in self.emotion_linear.parameters():
+                    p.requires_grad = False
+                print(f"[EPCL] Step {iter}: 分类头 emotion_linear 已冻结")
+
+            # === EPCL: λ_epcl 线性预热调度 ===
+            if iter < config.epcl_warmup and train:
+                lambda_epcl = config.lambda_epcl * (iter / config.epcl_warmup)
+            else:
+                lambda_epcl = config.lambda_epcl
+
+            # emotion prediction（加入 Dropout 正则化）
             if self.dataset == "ED":
-                emotion_logits = self.emotion_linear(emotion_enc)
-                emotion_loss = self.criterion_ce(emotion_logits, batch["program_label"])
+                emotion_logits = self.emotion_linear(self.emo_dropout(emotion_enc))
+                emotion_loss_raw = self.criterion_ce(emotion_logits, batch["program_label"])
+                # 冻结后 emo_loss 置零，仅由 EPCL 锚定特征空间
+                emotion_loss = emotion_loss_raw if emo_head_active else torch.tensor(0.0, device=config.device)
                 pred_emotion = np.argmax(emotion_logits.detach().cpu().numpy(), axis=1)
                 emotion_acc = accuracy_score(batch["program_label"].detach().cpu().numpy(), pred_emotion)
         
@@ -1079,7 +1170,7 @@ class CASE(nn.Module):
             div_loss /= target_tokens
         
             if self.dataset == "ED":
-                loss = bow_loss + kl_loss + mim_loss + ctx_loss + 1.5 * div_loss + emotion_loss
+                loss = bow_loss + kl_loss + mim_loss + ctx_loss + 1.5 * div_loss + emotion_loss + lambda_epcl * epcl_loss
             else:
                 loss = bow_loss + kl_loss + mim_loss + ctx_loss + 1.5 * div_loss + str_loss
             
@@ -1098,7 +1189,8 @@ class CASE(nn.Module):
             str_loss.item() if self.dataset=="ESConv" else 0,
             strategy_acc.item() if self.dataset=="ESConv" else 0,
             emotion_loss.item() if self.dataset=="ED" else 0,
-            emotion_acc.item() if self.dataset=="ED" else 0
+            emotion_acc.item() if self.dataset=="ED" else 0,
+            epcl_loss.item() if self.dataset=="ED" else 0
         )
     
     def decoder_greedy(self, batch, max_dec_step=30):

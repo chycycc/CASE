@@ -70,7 +70,7 @@ def train(model, train_set, dev_set):
         weights_best = deepcopy(model.state_dict())
         data_iter = make_infinite(train_set)
         for n_iter in tqdm(range(1000000)):
-            bow_loss, kl_loss, mim_loss, ctx_loss, ppl, str_loss, str_acc, emo_loss, emo_acc = model.train_one_batch(next(data_iter), n_iter)
+            bow_loss, kl_loss, mim_loss, ctx_loss, ppl, str_loss, str_acc, emo_loss, emo_acc, epcl_loss = model.train_one_batch(next(data_iter), n_iter)
             writer.add_scalars("bow_loss", {"loss_train": bow_loss}, n_iter)
             writer.add_scalars("kl_loss", {"loss_train": kl_loss}, n_iter)
             writer.add_scalars("mim_loss", {"loss_train": mim_loss}, n_iter)
@@ -82,6 +82,7 @@ def train(model, train_set, dev_set):
             else:
                 writer.add_scalars("emo_loss", {"loss_train": emo_loss}, n_iter)
                 writer.add_scalars("emo_acc", {"emo_acc_train": emo_acc}, n_iter)
+                writer.add_scalars("epcl_loss", {"loss_train": epcl_loss}, n_iter)
             if config.noam:
                 writer.add_scalars(
                     "lr", {"learning_rata": model.optimizer._rate}, n_iter
@@ -135,8 +136,8 @@ def test(model, test_set):
     with open(file_summary, "w", encoding="utf-8") as f:
         f.write("EVAL\tBOW_Loss\tKL_Loss\tMIM_Loss\tCTX_Loss\tPPL\tSTR_loss\tSTR_acc\tEMO_loss\tEMO_acc\n")
         f.write(
-            "{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\n".format(
-                bow_loss_test, kl_loss_test, mim_loss_test, ctx_loss_test, ppl_test, str_loss_test, str_acc_test, emo_loss_test, emo_acc_test
+            "{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\n".format(
+                "test", bow_loss_test, kl_loss_test, mim_loss_test, ctx_loss_test, ppl_test, str_loss_test, str_acc_test, emo_loss_test, emo_acc_test
             )
         )
         for r in results:

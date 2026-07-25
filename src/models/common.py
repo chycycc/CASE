@@ -980,6 +980,7 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
     str_acc = []
     emo_loss = []
     emo_acc = []
+    epcl_loss_list = []
     
     pbar = tqdm(enumerate(data), total=len(data))
 
@@ -988,7 +989,7 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
             t = Translator(model, model.vocab)
         for j, batch in pbar:
             if config.model == "case":
-                bow, kl, mim, ctx, ppl, str, acc, emotion, emotion_acc = model.train_one_batch(
+                bow, kl, mim, ctx, ppl, str, acc, emotion, emotion_acc, epcl = model.train_one_batch(
                     batch, 0, train=False
                 )
             else:
@@ -1007,6 +1008,7 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
             str_acc.append(acc)
             emo_loss.append(emotion)
             emo_acc.append(emotion_acc)
+            epcl_loss_list.append(epcl)
             if ty == "test":
                 sent_g = model.decoder_greedy(batch, max_dec_step=max_dec_step)
                 if config.model != "empdg":
@@ -1038,9 +1040,10 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
     str_acc = np.mean(str_acc)
     emo_loss = np.mean(emo_loss)
     emo_acc = np.mean(emo_acc)
+    epcl_loss_val = np.mean(epcl_loss_list)
 
-    print("EVAL\tBOW_Loss\tKL_Loss\tMIM_Loss\tCTX_Loss\tPPL\tSTR_loss\tSTR_acc\tEMO_loss\tEMO_acc\n")
-    print("{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\n".format(ty, bow_loss, kl_loss, mim_loss, ctx_loss, math.exp(ctx_loss), str_loss, str_acc, emo_loss, emo_acc))
+    print("EVAL\tBOW_Loss\tKL_Loss\tMIM_Loss\tCTX_Loss\tPPL\tSTR_loss\tSTR_acc\tEMO_loss\tEMO_acc\tEPCL_loss\n")
+    print("{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\n".format(ty, bow_loss, kl_loss, mim_loss, ctx_loss, math.exp(ctx_loss), str_loss, str_acc, emo_loss, emo_acc, epcl_loss_val))
     
     return bow_loss, kl_loss, mim_loss, ctx_loss, math.exp(ctx_loss), str_loss, str_acc, emo_loss, emo_acc, results
 
