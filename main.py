@@ -60,7 +60,7 @@ def pretrain(model, train_set):
 
 def train(model, train_set, dev_set):
     check_iter = 2000
-    iters = 13000 if config.dataset=="ED" else 6000
+    iters = 20000 if config.dataset=="ED" else 6000
     # check_iter = 1
     try:
         model.train()
@@ -115,7 +115,7 @@ def train(model, train_set, dev_set):
                     weights_best = deepcopy(model.state_dict())
                 else:
                     patient += 1
-                if patient > 2:
+                if patient > 4:
                     break
 
     except KeyboardInterrupt:

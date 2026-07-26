@@ -1,9 +1,9 @@
-from nltk.tokenize import word_tokenize
-
+from nltk import word_tokenize
 
 def calc_distinct_n(n, candidates, print_score: bool = True):
     dict = {}
     total = 0
+    # 使用 nltk.word_tokenize 对齐原论文的 Distinct 评测口径
     candidates = [word_tokenize(candidate) for candidate in candidates]
     for sentence in candidates:
         for i in range(len(sentence) - n + 1):

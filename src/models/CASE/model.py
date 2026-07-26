@@ -1070,9 +1070,15 @@ class CASE(nn.Module):
             emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
         
             # === EPCL: 原型对比学习损失计算 ===
-            # [v2 Step3] 锚点前移至门控前的 fine_emotion，绕过 emo_gate 自适应吸收
+            # [v3 P3] Temperature Annealing (余弦退火: 0.3 -> 0.1, 回滚单锚点)
+            tau_max = 0.3
+            tau_min = 0.1
+            max_epcl_step = 20000  # 对应 main.py 的 iters
+            current_tau = tau_min + (tau_max - tau_min) * (1 + math.cos(math.pi * min(iter, max_epcl_step) / max_epcl_step)) / 2
+
+            # [v3 P3] 单锚点 EPCL 回滚
             if self.dataset == "ED" and train:
-                epcl_loss = self.epcl_criterion(fine_emotion, batch["program_label"])
+                epcl_loss = self.epcl_criterion(fine_emotion, batch["program_label"], tau=current_tau)
             else:
                 epcl_loss = torch.tensor(0.0, device=config.device)
 
@@ -1091,7 +1097,8 @@ class CASE(nn.Module):
 
             # emotion prediction（加入 Dropout 正则化）
             if self.dataset == "ED":
-                emotion_logits = self.emotion_linear(self.emo_dropout(emotion_enc))
+                # 【V3-P4 架构解耦】仅将 fine_emotion 送入分类器，切断 CE 损失向 concept_enc 的回传
+                emotion_logits = self.emotion_linear(self.emo_dropout(fine_emotion))
                 emotion_loss_raw = self.criterion_ce(emotion_logits, batch["program_label"])
                 # 冻结后 emo_loss 置零，仅由 EPCL 锚定特征空间
                 emotion_loss = emotion_loss_raw if emo_head_active else torch.tensor(0.0, device=config.device)
@@ -1369,6 +1376,330 @@ class CASE(nn.Module):
                 out, attn_dist, enc_batch_extend_vocab, extra_zeros, attn_dist_db=None
             )
             _, next_word = torch.max(prob[:, -1], dim=1)
+            decoded_words.append(
+                [
+                    "<EOS>"
+                    if ni.item() == config.EOS_idx
+                    else self.vocab.index2word[ni.item()]
+                    for ni in next_word.view(-1)
+                ]
+            )
+            next_word = next_word.data[0]
+
+            ys = torch.cat(
+                [ys, torch.ones(1, 1).long().fill_(next_word).to(config.device)],
+                dim=1,
+            ).to(config.device)
+            mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
+
+        sent = []
+        for _, row in enumerate(np.transpose(decoded_words)):
+            st = ""
+            for e in row:
+                if e == "<EOS>":
+                    break
+                else:
+                    st += e + " "
+            sent.append(st)
+        return sent
+
+    def decoder_topk(self, batch, max_dec_step=30):
+        (
+            enc_batch,
+            _,
+            _,
+            enc_batch_extend_vocab,
+            extra_zeros,
+            _,
+            _,
+            _,
+        ) = get_input_from_batch(batch)
+        src_mask, ctx_output, _ = self.forward(batch)
+
+        ys = torch.ones(1, 1).fill_(config.SOS_idx).long().to(config.device)
+        mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
+        decoded_words = []
+        for i in range(max_dec_step + 1):
+            if config.project:
+                out, attn_dist = self.decoder(
+                    self.embedding_proj_in(self.embedding(ys)),
+                    self.embedding_proj_in(ctx_output),
+                    (src_mask, mask_trg),
+                )
+            else:
+                out, attn_dist = self.decoder(
+                    self.embedding(ys), ctx_output, (src_mask, mask_trg)
+                )
+
+            logit = self.generator(
+                out, attn_dist, enc_batch_extend_vocab, extra_zeros, attn_dist_db=None
+            )
+            filtered_logit = top_k_top_p_filtering(
+                logit[0, -1] / 0.7, top_k=0, top_p=0.9, filter_value=-float("Inf")
+            )
+            # Sample from the filtered distribution
+            probs = F.softmax(filtered_logit, dim=-1)
+
+            next_word = torch.multinomial(probs, 1).squeeze()
+            decoded_words.append(
+                [
+                    "<EOS>"
+                    if ni.item() == config.EOS_idx
+                    else self.vocab.index2word[ni.item()]
+                    for ni in next_word.view(-1)
+                ]
+            )
+            # _, next_word = torch.max(logit[:, -1], dim=1)
+            next_word = next_word.item()
+
+            ys = torch.cat(
+                [ys, torch.ones(1, 1).long().fill_(next_word).to(config.device)],
+                dim=1,
+            ).to(config.device)
+            mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
+
+        sent = []
+        for _, row in enumerate(np.transpose(decoded_words)):
+            st = ""
+            for e in row:
+                if e == "<EOS>":
+                    break
+                else:
+                    st += e + " "
+            sent.append(st)
+        return sent
+
+        # Cognition: Encode Commonsense
+        # bsz = batch["uttr_batch"].size(0)
+        # uttr_batch = batch["uttr_batch"]
+        # uttr_mask = uttr_batch.data.eq(config.PAD_idx).unsqueeze(1)
+        # bsz, uttr_split_num, _ = batch["uttr_split_batch"].size()
+        # uttr_split_batch = batch["uttr_split_batch"].view(bsz*uttr_split_num, -1)
+        # uttr_split_mask = uttr_split_batch.data.eq(config.PAD_idx).unsqueeze(1)
+        # uttr_batch_emb = self.embedding(uttr_batch)
+        # uttr_batch_outputs = self.cognition_encoder(uttr_batch_emb, uttr_mask)[:,0].unsqueeze(1)
+        # uttr_split_batch_emb = self.embedding(uttr_split_batch)
+        # uttr_split_batch_ouptuts = self.cognition_encoder(uttr_split_batch_emb, uttr_split_mask)[:,0].view(bsz, uttr_split_num, -1)
+        
+        # bsz, cs_num, _ = batch["x_intent_batch"].size()
+        # cs_batch = torch.cat((batch["x_intent_batch"].view(bsz*cs_num, -1),
+        #                       batch["x_need_batch"].view(bsz*cs_num, -1),
+        #                       batch["x_want_batch"].view(bsz*cs_num, -1),
+        #                       batch["x_effect_batch"].view(bsz*cs_num, -1),
+        #                       ), dim=0)
+        # cs_batch_mask = cs_batch.data.eq(config.PAD_idx).unsqueeze(1)
+        # cs_mask = torch.cat((batch["x_intent_mask"],
+        #                      batch["x_need_mask"],
+        #                      batch["x_want_mask"],
+        #                      batch["x_effect_mask"]), dim=1)
+        
+        # bsz, split_num, cs_split_num, _ = batch["x_intent_split_batch"].size()
+        # cs_split_batch = torch.cat((batch["x_intent_split_batch"].view(bsz*split_num*cs_split_num, -1),
+        #                       batch["x_need_split_batch"].view(bsz*split_num*cs_split_num, -1),
+        #                       batch["x_want_split_batch"].view(bsz*split_num*cs_split_num, -1),
+        #                       batch["x_effect_split_batch"].view(bsz*split_num*cs_split_num, -1)), dim=0)
+        # cs_split_batch_mask = cs_split_batch.data.eq(config.PAD_idx).unsqueeze(1)
+        # cs_split_mask = torch.cat((batch["x_intent_split_mask"].view(bsz, -1),
+        #                            batch["x_need_split_mask"].view(bsz, -1),
+        #                            batch["x_want_split_mask"].view(bsz, -1),
+        #                            batch["x_effect_split_mask"].view(bsz, -1)))
+        
+        # cs_batch_emb = self.embedding(cs_batch)
+        # cs_batch_outputs = self.cognition_encoder(cs_batch_emb, cs_batch_mask)
+        # cs_split_batch_emb = self.embedding(cs_split_batch)
+        # cs_split_batch_outputs = self.cognition_encoder(cs_split_batch_emb, cs_split_batch_mask)
+        # cs_outputs = torch.cat((cs_batch_outputs[:,0].view(bsz, cs_num, -1), 
+        #                         cs_split_batch_outputs[:,0].view(bsz, split_num*cs_split_num, -1)), dim=1)
+        # src_cs_emb = torch.cat((uttr_batch_outputs, 
+                                # uttr_split_batch_ouptuts,
+                                # cs_outputs), dim=1)
+        
+        # cs_enc = torch.bmm(prior_cs_attn*commonsense_mask, commonsense_outputs)
+        # src_concept_vad = torch.softmax(src_concept_vad, dim=-1)
+    def decoder_sampling(self, batch, max_dec_step=30, top_k=50, top_p=0.9, temperature=0.7):
+        (
+            enc_batch,
+            _,
+            _,
+            enc_batch_extend_vocab,
+            extra_zeros,
+            _,
+            _,
+            _,
+        ) = get_input_from_batch(batch)
+        enc_vad_batch = batch["context_vad"]
+        
+        # Encode Context
+        src_mask = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
+        mask_emb = self.embedding(batch["mask_input"])
+        src_emb = self.embedding(enc_batch) + mask_emb
+        enc_outputs = self.encoder(src_emb, src_mask)  # batch_size * seq_len * 300
+        
+        # Affection: Encode Concept
+        concept_input = batch["concept_batch"]
+        concept_mask = concept_input.data.eq(config.PAD_idx).unsqueeze(1)
+        concept_vad_batch = batch["concept_vad_batch"]
+        mask_concept = batch["mask_concept"]
+        concept_adj_mask = batch["concept_adjacency_mask_batch"]
+        # mask_concept = concept_input.data.eq(config.PAD_idx).unsqueeze(1)  # real mask
+        # concept_mask = self.embedding(mask_concept)  # KG_idx embedding
+        concept_emb = self.embedding(concept_input) + self.embedding(mask_concept)  # KG_idx embedding
+        src_concept_input_emb = torch.cat((src_emb, concept_emb), dim=1)
+        src_concept_outputs = self.concept_graph_encoder(src_concept_input_emb, 
+                                                         src_concept_input_emb,
+                                                         src_concept_input_emb,
+                                                         concept_adj_mask)
+        src_concept_mask = torch.cat((enc_batch, concept_input), dim=1).data.eq(config.PAD_idx)
+        src_concept_vad = torch.cat((enc_vad_batch, concept_vad_batch), dim=1)
+        src_concept_vad = torch.softmax(src_concept_vad, dim=-1).unsqueeze(2).repeat(1, 1, config.emb_dim)
+        src_concept_outputs = self.vad_layernorm(src_concept_vad * src_concept_outputs)
+        
+        # Cognition: Encode Commonsense
+        bsz, uttr_num, uttr_length = batch["uttr_batch_concat"].size()
+        uttr_batch_concat = batch["uttr_batch_concat"].view(bsz*uttr_num, -1)
+        uttr_batch_mask = uttr_batch_concat.data.eq(config.PAD_idx).unsqueeze(1)
+        
+        bsz, cs_num, cs_length = batch["cs_batch"].size()
+        cs_batch = batch["cs_batch"].view(bsz*cs_num, -1)
+        cs_batch_mask = cs_batch.data.eq(config.PAD_idx).unsqueeze(1)
+        cs_mask = batch["cs_mask"] # bsz, cs_num
+        
+        cs_adj_mask = batch["cs_adjacency_mask_batch"]
+        
+        uttr_batch_emb = self.embedding(uttr_batch_concat)
+        uttr_batch_outputs = self.cognition_encoder(uttr_batch_emb, uttr_batch_mask)[:,0].view(bsz, uttr_num, -1)
+        
+        cs_batch_emb = self.embedding(cs_batch)
+        cs_batch_outputs = self.cognition_encoder(cs_batch_emb, cs_batch_mask)[:,0].view(bsz, cs_num, -1)
+        uttr_cs_outputs = torch.cat((uttr_batch_outputs, cs_batch_outputs), dim=1)
+        
+        assert uttr_cs_outputs.size(1) == cs_adj_mask.size(1)
+        relation_emb = self.relation_embedding(cs_adj_mask)
+        uttr_cs_graph_outputs = self.cs_graph_encoder(uttr_cs_outputs,
+                                                  uttr_cs_outputs,
+                                                  uttr_cs_outputs,
+                                                  cs_adj_mask,
+                                                  relation_emb)
+        
+        commonsense_outputs = uttr_cs_graph_outputs[:,-cs_batch_outputs.size(1):,:]
+        commonsense_mask = cs_mask
+        if self.dataset == "ESConv":
+            # Strategy: Encode Strategy Sequence
+            strategy_seqs = batch["strategy_seqs_batch"]
+            mask_strategy = strategy_seqs.data.eq(config.PAD_idx).unsqueeze(1)
+            strategy_seqs_emb = self.strategy_embedding(strategy_seqs)
+            strategy_seqs_emb = self.add_position_embedding(strategy_seqs, strategy_seqs_emb)
+            strategy_enc_outputs = self.strategy_encoder(strategy_seqs_emb, mask_strategy)
+            strategy_enc_outputs = strategy_enc_outputs[:,0,:]
+            
+            prior_query = self.tanh(self.prior_query_linear(torch.cat((enc_outputs[:,0,:], strategy_enc_outputs), dim=-1)))
+        else:
+            prior_query = self.tanh(self.prior_query_linear(enc_outputs[:,0,:]))
+        
+        # concept
+        prior_concept_enc, prior_concept_attn = self.concept_prior_attn(
+            query = prior_query.unsqueeze(1), # enc_outputs[:,0,:].unsqueeze(1),
+            memory = self.tanh(src_concept_outputs),
+            mask = src_concept_mask
+        )
+        prior_concept_attn = prior_concept_attn.squeeze(1)
+        
+        # commonsense
+        prior_cs_enc, prior_cs_attn = self.cs_prior_attn(
+            query = prior_query.unsqueeze(1), # enc_outputs[:,0,:].unsqueeze(1),
+            memory = self.tanh(commonsense_outputs),
+            mask = commonsense_mask.eq(0)
+        )
+        prior_cs_attn = prior_cs_attn.squeeze(1)
+        cs_enc = prior_cs_enc.squeeze(1)
+        concept_enc = prior_concept_enc.squeeze(1)
+        
+        # Fine-grained MIM
+        bsz, react_uttr_num, _ = batch["react_batch"].size()
+        assert uttr_num == react_uttr_num
+        react_batch = batch["react_batch"].view(bsz*react_uttr_num, -1)
+        react_batch_mask = react_batch.data.eq(config.PAD_idx).unsqueeze(1)
+        react_emb = self.embedding(react_batch)
+        react_batch_outputs = self.react_encoder(react_emb, react_batch_mask)
+        # react_batch_enc, _ = self.react_selfattn(react_batch_outputs, react_batch_mask.squeeze(1))
+        react_batch_enc = torch.mean(react_batch_outputs, dim=1)
+        react_batch_enc = react_batch_enc.view(bsz, react_uttr_num, -1)
+        react_batch_enc = self.react_ctx_encoder(torch.cat((react_batch_enc.unsqueeze(2).repeat(1, 1, enc_outputs.size(1), 1),
+                                                        enc_outputs.unsqueeze(1).repeat(1, react_uttr_num, 1, 1)), 
+                                                        dim=-1).view(bsz*react_uttr_num, enc_outputs.size(1), -1), 
+                                                        src_mask.unsqueeze(1).repeat(1, react_uttr_num, 1, 1).view(bsz*react_uttr_num, -1,enc_outputs.size(1)))
+        react_batch_enc = react_batch_enc[:,0,:].view(bsz, react_uttr_num, -1)
+        react_batch_enc = self.react_linear(react_batch_enc)
+        bsz, _, emb = react_batch_enc.size()
+        uttr_emotion = react_batch_enc[:,0].unsqueeze(1).repeat(1, batch["max_uttr_cs_num"], 1)
+        split_intent_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_intent_num"], 1).view(bsz, -1, emb)
+        split_need_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_need_num"], 1).view(bsz, -1, emb)
+        split_want_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_want_num"], 1).view(bsz, -1, emb)
+        split_effect_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_effect_num"], 1).view(bsz, -1, emb)
+        react_enc = torch.cat((uttr_emotion, 
+                               split_intent_emotion,
+                               split_need_emotion,
+                               split_want_emotion,
+                               split_effect_emotion), dim=1)
+        assert react_enc.size(1) == cs_num
+   
+        # uttr_split_react_mask = batch["uttr_split_react_mask"]
+        # fine_mask = torch.cat((torch.ones((bsz, 1)).long().to(config.device), uttr_split_react_mask), dim=1)
+        # assert fine_mask.size(1) == react_batch_enc.size(1)
+        # fine_emotion, _ = self.fine_emotion_selfattn(react_batch_enc, fine_mask.eq(0))
+        
+        fine_emotion = react_batch_enc[:, 0]
+        emotion_emb = self.emotion_norm(torch.cat((concept_enc, fine_emotion), dim=-1))
+        emo_gate = torch.sigmoid(self.emotion_gate(emotion_emb))
+        emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
+        
+        # Merge Context, Cognition-Affection-Strategy Signals
+        if self.dataset == "ESConv":
+            ctx_enc_outputs = self.ctx_merge_lin(torch.cat((
+                enc_outputs, 
+                cs_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
+                concept_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
+                strategy_enc_outputs.unsqueeze(1).repeat(1, enc_outputs.size(1), 1)
+            ), dim=2))
+        else:
+            ctx_enc_outputs = self.ctx_merge_lin(torch.cat((
+                enc_outputs, 
+                cs_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
+                emotion_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
+            ), dim=2))
+
+        ys = torch.ones(1, 1).fill_(config.SOS_idx).long().to(config.device)
+        mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
+        decoded_words = []
+        for i in range(max_dec_step + 1):
+            ys_embed = self.embedding(ys)
+            if config.project:
+                out, attn_dist = self.decoder(
+                    self.embedding_proj_in(ys_embed),
+                    self.embedding_proj_in(ctx_output),
+                    (src_mask, mask_trg),
+                )
+            else:
+                out, attn_dist = self.decoder(
+                    ys_embed, ctx_enc_outputs, (src_mask, mask_trg),
+                    cs_enc_outputs=commonsense_outputs,
+                    cs_enc_mask=commonsense_mask.eq(0).unsqueeze(1),
+                    concept_enc_outputs=src_concept_outputs,
+                    concept_enc_mask=src_concept_mask.unsqueeze(1),
+                )
+
+            prob = self.generator(
+                out, attn_dist, enc_batch_extend_vocab, extra_zeros, attn_dist_db=None
+            )
+            # --- Top-p / Top-k Sampling ---
+            logits = prob[:, -1] / temperature
+            filtered_logits = []
+            for b_idx in range(logits.size(0)):
+                filtered_logits.append(top_k_top_p_filtering(logits[b_idx], top_k=top_k, top_p=top_p))
+            filtered_logits = torch.stack(filtered_logits, dim=0)
+            probs = F.softmax(filtered_logits, dim=-1)
+            next_word = torch.multinomial(probs, 1).squeeze(-1)
+            
             decoded_words.append(
                 [
                     "<EOS>"

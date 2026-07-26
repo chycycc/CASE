@@ -68,7 +68,7 @@ venv.bak/
 # AI Context Files
 .gemini
 .agents/
-docs/
+# docs/ (Un-ignored for tracking academic documentation)
 
 # Data and Weights
 data/
@@ -77,3 +77,6 @@ vectors
 # Outputs
 save/
 results/
+
+# Logs
+logs/
