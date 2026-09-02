@@ -646,6 +646,8 @@ class CASE(nn.Module):
             self.emotion_num, config.emb_dim  # 32 类, 300 维
         )
         self.emo_dropout = nn.Dropout(0.3)  # 分类头正则化
+        # [V4 Trial 8: MoP-DR] 引入原型动态路由探针 (300 维特征级向量路由)
+        self.router_linear = nn.Linear(self.emotion_num, config.emb_dim)
         self.concept_prior_attn = Attention(query_size=config.emb_dim,
                                             memory_size=config.emb_dim,
                                             hidden_size=config.emb_dim,
@@ -1066,7 +1068,23 @@ class CASE(nn.Module):
         
             fine_emotion = react_batch_enc[:, 0]
             emotion_emb = self.emotion_norm(torch.cat((concept_enc, fine_emotion), dim=-1))
-            emo_gate = torch.sigmoid(self.emotion_gate(emotion_emb))
+            static_gate = torch.sigmoid(self.emotion_gate(emotion_emb))
+            
+            # [V4 Trial 8: MoP-DR] 连续原型动态路由特征融合
+            if self.dataset == "ED":
+                projected_features = self.epcl_criterion.projection_head(fine_emotion)
+                proj_norm = F.normalize(projected_features, p=2, dim=1)
+                # 切断从生成损失流向原型的梯度，防止破坏对比空间
+                proto_norm = F.normalize(self.epcl_criterion.prototypes.detach(), p=2, dim=1)
+                proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1
+                
+                P_route = F.softmax(proto_logits, dim=-1)
+                route_gate = torch.sigmoid(self.router_linear(P_route))
+                current_lambda = config.lambda_epcl * (iter / config.epcl_warmup) if (iter < config.epcl_warmup and train) else config.lambda_epcl
+                emo_gate = current_lambda * route_gate + (1 - current_lambda) * static_gate
+            else:
+                emo_gate = static_gate
+            
             emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
         
             # === EPCL: 原型对比学习损失计算 ===
@@ -1176,8 +1194,20 @@ class CASE(nn.Module):
             )
             div_loss /= target_tokens
         
+            # [V4 Trial 8] Decoder MIM Loss (全周期软约束激活，修复分类头冻结后断开的 Bug)
             if self.dataset == "ED":
-                loss = bow_loss + kl_loss + mim_loss + ctx_loss + 1.5 * div_loss + emotion_loss + lambda_epcl * epcl_loss
+                mask_bool = mask_trg.squeeze(1) # [bsz, seq_len]
+                valid_lens = (~mask_bool).sum(dim=-1, keepdim=True).float().clamp(min=1.0)
+                pooled_dec = ((~mask_bool).unsqueeze(-1).float() * pre_logit).sum(dim=1) / valid_lens
+                dec_emo_logits = self.emotion_linear(self.emo_dropout(pooled_dec))
+                dec_emo_loss = self.criterion_ce(dec_emo_logits, batch["program_label"]) if train else torch.tensor(0.0, device=config.device)
+            else:
+                dec_emo_loss = torch.tensor(0.0, device=config.device)
+        
+            if self.dataset == "ED":
+                alpha_mim = 0.1  # [V4 Trial 8] Decoder MIM 权重：从 0.5 降至 0.1 软约束，避免垄断表征容量
+                # [V4 Trial 8] div_loss 设定为 2.0x（温和增强多样性推力），alpha_mim 降至 0.1
+                loss = bow_loss + kl_loss + mim_loss + ctx_loss + 2.0 * div_loss + emotion_loss + lambda_epcl * epcl_loss + alpha_mim * dec_emo_loss
             else:
                 loss = bow_loss + kl_loss + mim_loss + ctx_loss + 1.5 * div_loss + str_loss
             
@@ -1186,6 +1216,17 @@ class CASE(nn.Module):
             if (iter + 1) % accum_steps == 0:
                 self.scaler.step(self.optimizer.optimizer if config.noam else self.optimizer)
                 self.scaler.update()
+            
+            # [V4 Trial 8] 28k 步后线性 LR 衰减：从当前 LR (~3.125e-4) 线性衰减至 ~1e-5
+            # 主训练阶段 scaler.step() 绕过了 NoamOpt，LR 恒定不变，此处手动干预衰减
+            if config.noam and iter > config.epcl_freeze_step:
+                total_decay_steps = 22000.0  # 从 28k 到 ~50k
+                progress = min((iter - config.epcl_freeze_step) / total_decay_steps, 1.0)
+                decay_factor = 1.0 - 0.97 * progress
+                base_lr = self.optimizer._rate if self.optimizer._rate > 0 else 3.125e-4
+                decayed_lr = base_lr * decay_factor
+                for pg in self.optimizer.optimizer.param_groups:
+                    pg["lr"] = decayed_lr
         
         return (
             bow_loss.item(),
@@ -1197,7 +1238,8 @@ class CASE(nn.Module):
             strategy_acc.item() if self.dataset=="ESConv" else 0,
             emotion_loss.item() if self.dataset=="ED" else 0,
             emotion_acc.item() if self.dataset=="ED" else 0,
-            epcl_loss.item() if self.dataset=="ED" else 0
+            epcl_loss.item() if self.dataset=="ED" else 0,
+            dec_emo_loss.item() if self.dataset=="ED" else 0  # [V4 Trial 8] Decoder MIM 损失可观测性
         )
     
     def decoder_greedy(self, batch, max_dec_step=30):
@@ -1334,7 +1376,21 @@ class CASE(nn.Module):
         
         fine_emotion = react_batch_enc[:, 0]
         emotion_emb = self.emotion_norm(torch.cat((concept_enc, fine_emotion), dim=-1))
-        emo_gate = torch.sigmoid(self.emotion_gate(emotion_emb))
+        static_gate = torch.sigmoid(self.emotion_gate(emotion_emb))
+        
+        if self.dataset == "ED":
+            projected_features = self.epcl_criterion.projection_head(fine_emotion)
+            proj_norm = F.normalize(projected_features, p=2, dim=1)
+            proto_norm = F.normalize(self.epcl_criterion.prototypes, p=2, dim=1)
+            proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1
+            # [V4 Trial 8: MoP-DR] 贪婪解码动态路由融合
+            P_route = F.softmax(proto_logits, dim=-1)
+            
+            route_gate = torch.sigmoid(self.router_linear(P_route))
+            emo_gate = config.lambda_epcl * route_gate + (1 - config.lambda_epcl) * static_gate
+        else:
+            emo_gate = static_gate
+            
         emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
         
         # Merge Context, Cognition-Affection-Strategy Signals
@@ -1650,7 +1706,21 @@ class CASE(nn.Module):
         
         fine_emotion = react_batch_enc[:, 0]
         emotion_emb = self.emotion_norm(torch.cat((concept_enc, fine_emotion), dim=-1))
-        emo_gate = torch.sigmoid(self.emotion_gate(emotion_emb))
+        static_gate = torch.sigmoid(self.emotion_gate(emotion_emb))
+        
+        if self.dataset == "ED":
+            projected_features = self.epcl_criterion.projection_head(fine_emotion)
+            proj_norm = F.normalize(projected_features, p=2, dim=1)
+            proto_norm = F.normalize(self.epcl_criterion.prototypes, p=2, dim=1)
+            proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1
+            
+            # [V4 Trial 8: MoP-DR] 采样解码动态路由融合
+            P_route = F.softmax(proto_logits, dim=-1)
+            route_gate = torch.sigmoid(self.router_linear(P_route))
+            emo_gate = config.lambda_epcl * route_gate + (1 - config.lambda_epcl) * static_gate
+        else:
+            emo_gate = static_gate
+            
         emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
         
         # Merge Context, Cognition-Affection-Strategy Signals

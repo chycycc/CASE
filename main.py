@@ -70,7 +70,7 @@ def train(model, train_set, dev_set):
         weights_best = deepcopy(model.state_dict())
         data_iter = make_infinite(train_set)
         for n_iter in tqdm(range(1000000)):
-            bow_loss, kl_loss, mim_loss, ctx_loss, ppl, str_loss, str_acc, emo_loss, emo_acc, epcl_loss = model.train_one_batch(next(data_iter), n_iter)
+            bow_loss, kl_loss, mim_loss, ctx_loss, ppl, str_loss, str_acc, emo_loss, emo_acc, epcl_loss, dec_emo_loss = model.train_one_batch(next(data_iter), n_iter)
             writer.add_scalars("bow_loss", {"loss_train": bow_loss}, n_iter)
             writer.add_scalars("kl_loss", {"loss_train": kl_loss}, n_iter)
             writer.add_scalars("mim_loss", {"loss_train": mim_loss}, n_iter)
@@ -83,9 +83,12 @@ def train(model, train_set, dev_set):
                 writer.add_scalars("emo_loss", {"loss_train": emo_loss}, n_iter)
                 writer.add_scalars("emo_acc", {"emo_acc_train": emo_acc}, n_iter)
                 writer.add_scalars("epcl_loss", {"loss_train": epcl_loss}, n_iter)
+                writer.add_scalars("dec_emo_loss", {"loss_train": dec_emo_loss}, n_iter)  # [V4 Trial 8] 记录 Decoder MIM 损失
             if config.noam:
+                # [V4 Trial 8] 记录实际生效的 LR（含后半程线性衰减），而非 NoamOpt 中停滞的 _rate
+                actual_lr = model.optimizer.optimizer.param_groups[0]["lr"]
                 writer.add_scalars(
-                    "lr", {"learning_rata": model.optimizer._rate}, n_iter
+                    "lr", {"learning_rata": actual_lr}, n_iter
                 )
 
             if (n_iter + 1) % check_iter == 0:

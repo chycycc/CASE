@@ -36,7 +36,11 @@ def read_file(file_name, dec_type="Greedy"):
 
     for i, line in enumerate(f.readlines()):
         if i == 1:
-            _, _, _, _, ppl, _, acc, _, emo_acc = line.strip("EVAL	BOW_Loss	KL_Loss	MIM_Loss	CTX_Loss	PPL	STR_loss	STR_acc EMO_loss    EMO_acc").split()
+            parts = line.strip("EVAL\tBOW_Loss\tKL_Loss\tMIM_Loss\tCTX_Loss\tPPL\tSTR_loss\tSTR_acc\tEMO_loss\tEMO_acc\tEPCL_loss").split()
+            if len(parts) == 10:
+                _, _, _, _, ppl, _, acc, _, emo_acc, _ = parts
+            else:
+                _, _, _, _, ppl, _, acc, _, emo_acc = parts
             print(f"PPL: {ppl}\tStr Accuracy: {float(acc)*100}%\tEmo Acc: {float(emo_acc)*100}%")
         if line.startswith(dec_str):
             exp = line.strip(dec_str).strip("\n")

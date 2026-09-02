@@ -989,7 +989,7 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
             t = Translator(model, model.vocab)
         for j, batch in pbar:
             if config.model == "case":
-                bow, kl, mim, ctx, ppl, str, acc, emotion, emotion_acc, epcl = model.train_one_batch(
+                bow, kl, mim, ctx, ppl, str, acc, emotion, emotion_acc, epcl, dec_emo = model.train_one_batch(
                     batch, 0, train=False
                 )
             else:
