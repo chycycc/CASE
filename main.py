@@ -66,6 +66,11 @@ def train(model, train_set, dev_set):
         model.train()
         best_ppl = 1000
         patient = 0
+        # [V5 Trial 4 / Trial 4b] 自适应分类头冻结监控与最佳状态缓存 (BCF)
+        best_freeze_metric = -1.0 if config.freeze_metric == "emo_acc" else 1e9
+        freeze_patient = 0
+        best_emo_head_state = deepcopy(model.emotion_linear.state_dict())
+        best_freeze_step = 0
         writer = SummaryWriter(log_dir=config.save_path)
         weights_best = deepcopy(model.state_dict())
         data_iter = make_infinite(train_set)
@@ -108,6 +113,41 @@ def train(model, train_set, dev_set):
                 else:
                     writer.add_scalars("emo_loss", {"emo_loss_valid": emo_loss_val}, n_iter)
                     writer.add_scalars("emo_acc", {"emo_acc_valid": emo_acc_val}, n_iter)
+                
+                # [V5 Trial 4 / Trial 4b] 自适应分类头冻结逻辑监控与黄金回滚 (BCF)
+                if config.adaptive_freeze and not model.is_frozen and config.dataset == "ED":
+                    curr_step = n_iter + 1
+                    cur_metric = emo_acc_val if config.freeze_metric == "emo_acc" else emo_loss_val
+                    
+                    if curr_step >= config.min_freeze_step:
+                        is_improved = (cur_metric > best_freeze_metric) if config.freeze_metric == "emo_acc" else (cur_metric < best_freeze_metric)
+                        if is_improved:
+                            best_freeze_metric = cur_metric
+                            best_emo_head_state = deepcopy(model.emotion_linear.state_dict())
+                            best_freeze_step = curr_step
+                            freeze_patient = 0
+                            print(f"[Adaptive Freeze Monitor] Step {curr_step}: {config.freeze_metric} 创新高至 {best_freeze_metric:.4f}，缓存黄金分类头权重，重置耐心计数器。")
+                        else:
+                            freeze_patient += 1
+                            print(f"[Adaptive Freeze Monitor] Step {curr_step}: {config.freeze_metric}={cur_metric:.4f} (历史最优={best_freeze_metric:.4f} at Step {best_freeze_step})，未创新高！Patience: {freeze_patient}/{config.freeze_patience}")
+                            
+                        if freeze_patient >= config.freeze_patience or curr_step >= config.max_freeze_step:
+                            trigger_reason = f"验证集平台期触发 (Patience耗尽: {freeze_patient}/{config.freeze_patience})" if freeze_patient >= config.freeze_patience else f"达到最大步数兜底上限 ({curr_step}>={config.max_freeze_step})"
+                            print(f"[Adaptive Freeze] 触发原因: {trigger_reason}")
+                            model.freeze_emo_head(
+                                curr_step,
+                                best_state=best_emo_head_state if config.rollback_best_freeze else None,
+                                best_step=best_freeze_step
+                            )
+                    else:
+                        # 处于冷启动防抖期，更新当前最优值并缓存权重，不消耗耐心
+                        is_cold_improved = (cur_metric > best_freeze_metric) if config.freeze_metric == "emo_acc" else (cur_metric < best_freeze_metric)
+                        if is_cold_improved:
+                            best_freeze_metric = cur_metric
+                            best_emo_head_state = deepcopy(model.emotion_linear.state_dict())
+                            best_freeze_step = curr_step
+                        print(f"[Adaptive Freeze Monitor] Step {curr_step} < min_freeze_step({config.min_freeze_step})，处于冷启动防抖保护期，记录当前最优 {config.freeze_metric}={best_freeze_metric:.4f}")
+
                 model.train()
                 if n_iter < iters:
                     continue

@@ -80,3 +80,8 @@ results/
 
 # Logs
 logs/
+*.log
+
+# Temp and Archives
+temp_log.json
+*.7z

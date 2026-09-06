@@ -100,6 +100,28 @@ def get_args():
                         help="EPCL λ 线性预热步数")
     parser.add_argument("--epcl_freeze_step", type=int, default=14000,
                         help="分类头冻结时间点")
+    parser.add_argument("--alpha_mim", type=float, default=0.1,
+                        help="Decoder MIM 损失权重（V4 Trial 8 基线=0.1）")
+    parser.add_argument("--div_weight", type=float, default=2.0,
+                        help="多样性损失 div_loss 权重系数（V4 Trial 8 基线=2.0）")
+    parser.add_argument("--lr_schedule", type=str, default="linear",
+                        choices=["linear", "cosine"],
+                        help="冻结后 LR 衰减策略: linear(线性) / cosine(余弦退火)")
+    
+    # V5 Trial 4: 自适应分类头冻结机制 (Adaptive Classifier Freezing, ACF)
+    parser.add_argument("--adaptive_freeze", action="store_true", default=False,
+                        help="是否启用基于验证集收敛平台期的数据驱动自适应分类头冻结机制")
+    parser.add_argument("--freeze_patience", type=int, default=3,
+                        help="验证集指标未改善的容忍次数（默认3次，每2000步一次共6000步）")
+    parser.add_argument("--min_freeze_step", type=int, default=16000,
+                        help="自适应冻结评估的最早步数下界（防止冷启动欠拟合）")
+    parser.add_argument("--max_freeze_step", type=int, default=32000,
+                        help="自适应冻结评估的最晚兜底步数上界（防范极端情况未触发）")
+    parser.add_argument("--freeze_metric", type=str, default="emo_acc",
+                        choices=["emo_acc", "emo_loss"],
+                        help="自适应冻结监控指标: emo_acc(准确率提升) / emo_loss(损失下降)")
+    parser.add_argument("--rollback_best_freeze", action="store_true", default=False,
+                        help="自适应冻结触发时是否将分类头回滚至验证集历史最高泛化状态 (BCF)")
     
     parser.add_argument("--test", default=False, action="store_true")
     parser.add_argument("--large_decoder", action="store_true")

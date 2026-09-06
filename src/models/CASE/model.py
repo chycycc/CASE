@@ -742,6 +742,23 @@ class CASE(nn.Module):
         self.best_path = ""
         
         self.scaler = torch.cuda.amp.GradScaler()
+        
+        # [V5 Trial 4: 自适应分类头冻结状态]
+        self.is_frozen = False
+        self.actual_freeze_step = config.epcl_freeze_step
+
+    def freeze_emo_head(self, step, best_state=None, best_step=None):
+        """[V5 Trial 4b: ACF-BCF] 冻结情感分类头，支持回滚至验证集历史最佳泛化权重并将退火起点锚定至 step"""
+        if not self.is_frozen and self.dataset == "ED":
+            if best_state is not None:
+                self.emotion_linear.load_state_dict(best_state)
+                print(f"[Adaptive Freeze + BCF] 成功将分类头 emotion_linear 权重回滚至历史最佳状态 (Step {best_step})！")
+            for p in self.emotion_linear.parameters():
+                p.requires_grad = False
+            self.is_frozen = True
+            self.actual_freeze_step = step
+            print(f"[Adaptive Freeze] Step {step}: 分类头 emotion_linear 已物理冻结，退火起点更新为 Step {step}！")
+
     def make_encoder(self, emb_dim):
         return Encoder(
             emb_dim,
@@ -879,6 +896,22 @@ class CASE(nn.Module):
         ) = get_input_from_batch(batch)
         enc_vad_batch = batch["context_vad"]
         dec_batch, _, _, _, _ = get_output_from_batch(batch)
+        
+        # [V5 Trial 4] 确定当前是否已处于冻结期（支持自适应 ACF 机制与固定步数回退）
+        if config.adaptive_freeze:
+            is_currently_frozen = self.is_frozen
+            # 若开启自适应，但步数已达 max_freeze_step 且仍未冻结，强制自适应冻结兜底
+            if train and not self.is_frozen and iter >= config.max_freeze_step and self.dataset == "ED":
+                self.freeze_emo_head(iter)
+                is_currently_frozen = True
+        else:
+            is_currently_frozen = (iter >= config.epcl_freeze_step)
+            if train and iter == config.epcl_freeze_step and self.dataset == "ED":
+                for p in self.emotion_linear.parameters():
+                    p.requires_grad = False
+                self.is_frozen = True
+                self.actual_freeze_step = config.epcl_freeze_step
+                print(f"[EPCL] Step {iter}: 分类头 emotion_linear 已冻结")
         
         if iter % accum_steps == 0:
             if config.noam:
@@ -1056,7 +1089,7 @@ class CASE(nn.Module):
             fine_mim_loss = self.fine_grained_infomax_score(commonsense_outputs, commonsense_fake_outputs, react_enc, react_fake_enc, commonsense_mask)
         
             # === v2 Step2: 冻结后同步关闭 MIM，释放特征空间给 EPCL ===
-            if train and iter >= config.epcl_freeze_step:
+            if train and is_currently_frozen:
                 mim_loss = torch.tensor(0.0, device=config.device)
             else:
                 mim_loss = config.coarse_weight * coarse_mim_loss + config.fine_weight * fine_mim_loss
@@ -1100,12 +1133,8 @@ class CASE(nn.Module):
             else:
                 epcl_loss = torch.tensor(0.0, device=config.device)
 
-            # === EPCL: 分类头冻结调度（复刻 CEM-EPCL v6.4 策略） ===
-            emo_head_active = (not train) or (iter < config.epcl_freeze_step)
-            if train and iter == config.epcl_freeze_step and self.dataset == "ED":
-                for p in self.emotion_linear.parameters():
-                    p.requires_grad = False
-                print(f"[EPCL] Step {iter}: 分类头 emotion_linear 已冻结")
+            # === EPCL: 分类头活性控制（冻结后关闭 CE 损失） ===
+            emo_head_active = (not train) or (not is_currently_frozen)
 
             # === EPCL: λ_epcl 线性预热调度 ===
             if iter < config.epcl_warmup and train:
@@ -1205,9 +1234,9 @@ class CASE(nn.Module):
                 dec_emo_loss = torch.tensor(0.0, device=config.device)
         
             if self.dataset == "ED":
-                alpha_mim = 0.1  # [V4 Trial 8] Decoder MIM 权重：从 0.5 降至 0.1 软约束，避免垄断表征容量
-                # [V4 Trial 8] div_loss 设定为 2.0x（温和增强多样性推力），alpha_mim 降至 0.1
-                loss = bow_loss + kl_loss + mim_loss + ctx_loss + 2.0 * div_loss + emotion_loss + lambda_epcl * epcl_loss + alpha_mim * dec_emo_loss
+                alpha_mim = config.alpha_mim  # [V5] 从命令行读取，默认 0.1（V4 Trial 8 基线值）
+                # [V5 Trial 3] div_weight 可通过 --div_weight 调节（默认 2.0x，V4 Trial 8 基线值）
+                loss = bow_loss + kl_loss + mim_loss + ctx_loss + config.div_weight * div_loss + emotion_loss + lambda_epcl * epcl_loss + alpha_mim * dec_emo_loss
             else:
                 loss = bow_loss + kl_loss + mim_loss + ctx_loss + 1.5 * div_loss + str_loss
             
@@ -1217,14 +1246,25 @@ class CASE(nn.Module):
                 self.scaler.step(self.optimizer.optimizer if config.noam else self.optimizer)
                 self.scaler.update()
             
-            # [V4 Trial 8] 28k 步后线性 LR 衰减：从当前 LR (~3.125e-4) 线性衰减至 ~1e-5
+            # [V4 Trial 8 / V5 Trial 4] 冻结后 LR 衰减：从当前 LR (~3.125e-4) 衰减至 ~1e-5
             # 主训练阶段 scaler.step() 绕过了 NoamOpt，LR 恒定不变，此处手动干预衰减
-            if config.noam and iter > config.epcl_freeze_step:
-                total_decay_steps = 22000.0  # 从 28k 到 ~50k
-                progress = min((iter - config.epcl_freeze_step) / total_decay_steps, 1.0)
-                decay_factor = 1.0 - 0.97 * progress
+            # [V5 Trial 1] 支持 linear(线性) / cosine(余弦退火) 两种衰减策略
+            # [V5 Trial 4] 自适应冻结动态对齐退火起点 freeze_anchor
+            freeze_anchor = self.actual_freeze_step if config.adaptive_freeze else config.epcl_freeze_step
+            if config.noam and is_currently_frozen and iter > freeze_anchor:
+                total_decay_steps = 22000.0  # 退火跨度（约 22k 步平滑衰减至 1e-5）
+                progress = min((iter - freeze_anchor) / total_decay_steps, 1.0)
                 base_lr = self.optimizer._rate if self.optimizer._rate > 0 else 3.125e-4
-                decayed_lr = base_lr * decay_factor
+                lr_min = base_lr * 0.03  # 最低 LR ≈ 1e-5
+
+                if config.lr_schedule == "cosine":
+                    # 余弦退火：前期保持较高 LR 充分探索，后期快速精细收敛
+                    decayed_lr = lr_min + 0.5 * (base_lr - lr_min) * (1.0 + math.cos(math.pi * progress))
+                else:
+                    # 线性衰减（V4 Trial 8 默认行为）
+                    decay_factor = 1.0 - 0.97 * progress
+                    decayed_lr = base_lr * decay_factor
+
                 for pg in self.optimizer.optimizer.param_groups:
                     pg["lr"] = decayed_lr
         
