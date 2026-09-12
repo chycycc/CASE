@@ -15,8 +15,10 @@ class Translator(object):
         self.beam_size = config.beam_size
         self.device = config.device
 
-    def beam_search(self, src_seq, max_dec_step):
+    def beam_search(self, src_seq, max_dec_step, no_repeat_ngram_size=None):
         """ Translation work in one batch """
+        if no_repeat_ngram_size is None:
+            no_repeat_ngram_size = getattr(config, "no_repeat_ngram_size", 0)
 
         def get_inst_idx_to_tensor_position_map(inst_idx_list):
             """ Indicate the position of an instance in a tensor. """
@@ -88,6 +90,7 @@ class Translator(object):
             cs_enc_mask=None,
             concept_enc_outputs=None,
             concept_enc_mask=None,
+            no_repeat_ngram_size=0,
         ):
             """ Decode and update beam status, and then return active beam idx """
 
@@ -137,6 +140,10 @@ class Translator(object):
                     concept_enc_mask=concept_enc_mask,
                 )
 
+                # [V6 Trial 3: PCAM] 原型交叉记忆注意力注入
+                if hasattr(self.model, "apply_pcam"):
+                    dec_output = self.model.apply_pcam(dec_output)
+
                 db_dist = None
 
                 prob = self.model.generator(
@@ -154,12 +161,12 @@ class Translator(object):
                 return word_prob
 
             def collect_active_inst_idx_list(
-                inst_beams, word_prob, inst_idx_to_position_map
+                inst_beams, word_prob, inst_idx_to_position_map, no_repeat_ngram_size=0
             ):
                 active_inst_idx_list = []
                 for inst_idx, inst_position in inst_idx_to_position_map.items():
                     is_inst_complete = inst_beams[inst_idx].advance(
-                        word_prob[inst_position]
+                        word_prob[inst_position], no_repeat_ngram_size=no_repeat_ngram_size
                     )
                     if not is_inst_complete:
                         active_inst_idx_list += [inst_idx]
@@ -190,7 +197,7 @@ class Translator(object):
 
             # Update the beam with predicted word prob information and collect incomplete instances
             active_inst_idx_list = collect_active_inst_idx_list(
-                inst_dec_beams, word_prob, inst_idx_to_position_map
+                inst_dec_beams, word_prob, inst_idx_to_position_map, no_repeat_ngram_size=no_repeat_ngram_size
             )
 
             return active_inst_idx_list
@@ -404,6 +411,7 @@ class Translator(object):
                     cs_enc_mask=commonsense_mask.eq(0).unsqueeze(1),
                     concept_enc_outputs=src_concept_outputs,
                     concept_enc_mask=src_concept_mask.unsqueeze(1),
+                    no_repeat_ngram_size=no_repeat_ngram_size,
                 )
 
                 if not active_inst_idx_list:

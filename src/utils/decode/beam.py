@@ -42,9 +42,23 @@ class Beam:
     def done(self):
         return self._done
 
-    def advance(self, word_prob):
+    def advance(self, word_prob, no_repeat_ngram_size=0):
         "Update beam status and check if finished or not."
         num_words = word_prob.size(1)
+
+        # [路线 A] n-gram 重复阻塞 (No-Repeat n-gram Filtering)
+        if no_repeat_ngram_size > 0 and len(self.prev_ks) >= no_repeat_ngram_size - 1:
+            for k in range(self.size):
+                hyp = self.get_hypothesis(k)
+                if len(hyp) >= no_repeat_ngram_size - 1:
+                    prefix = tuple(hyp[-(no_repeat_ngram_size - 1):])
+                    banned_tokens = [
+                        hyp[i + no_repeat_ngram_size - 1]
+                        for i in range(len(hyp) - no_repeat_ngram_size + 1)
+                        if tuple(hyp[i : i + no_repeat_ngram_size - 1]) == prefix
+                    ]
+                    if banned_tokens:
+                        word_prob[k, banned_tokens] = -1e9
 
         # Sum the previous scores.
         if len(self.prev_ks) > 0:

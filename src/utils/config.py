@@ -123,6 +123,31 @@ def get_args():
     parser.add_argument("--rollback_best_freeze", action="store_true", default=False,
                         help="自适应冻结触发时是否将分类头回滚至验证集历史最高泛化状态 (BCF)")
     
+    # V6 Trial 1: 双层非线性残差分类头 (Residual Emotion Head)
+    parser.add_argument("--emotion_head_type", type=str, default="linear",
+                        choices=["linear", "residual_mlp"],
+                        help="情感分类头类型: linear(原单层线性) / residual_mlp(V6双层非线性残差头)")
+    parser.add_argument("--mlp_hidden_dim", type=int, default=300,
+                        help="残差分类头隐藏层维度 (默认300)")
+    parser.add_argument("--mlp_dropout", type=float, default=0.1,
+                        help="残差分类头 Dropout 比率 (默认0.1)")
+    
+    # V6 Trial 2: 类内多原型解耦 (Multi-Prototype EPCL)
+    parser.add_argument("--num_prototypes_per_class", type=int, default=1,
+                        help="每个情感类别的子原型数量 (默认1为单原型，V6 Trial 2设为2，共64个原型)")
+    parser.add_argument("--alpha_uni", type=float, default=1.0,
+                        help="EPCL 均匀性损失权重 (默认1.0, Trial 2b设为0.3以放松子原型排斥约束)")
+    
+    # V6 Trial 3: 原型交叉记忆注意力 (PCAM)
+    parser.add_argument("--use_pcam", action="store_true", default=False,
+                        help="是否在解码器输出端启用原型交叉记忆注意力模块 (PCAM)")
+    parser.add_argument("--pcam_heads", type=int, default=2,
+                        help="PCAM 交叉注意力的多头数量 (默认2)")
+    parser.add_argument("--pcam_dropout", type=float, default=0.1,
+                        help="PCAM 交叉注意力的 Dropout 概率 (默认0.1)")
+    parser.add_argument("--pcam_gate_bias", type=float, default=-1.0,
+                        help="PCAM 自适应门控的初始偏置 (默认-1.0，实现平滑暖启动)")
+    
     parser.add_argument("--test", default=False, action="store_true")
     parser.add_argument("--large_decoder", action="store_true")
     parser.add_argument("--multitask", action="store_true")
@@ -137,7 +162,7 @@ def get_args():
     parser.add_argument("--act_loss_weight", type=float, default=0.001)
     parser.add_argument('--dropout', dest='dropout', type=float, default=0.1, help='dropout')
     
-    args = parser.parse_args()
+    args, _ = parser.parse_known_args()
     cuda_id = "cuda:" + str(args.gpu)
     args.device = torch.device(cuda_id) if torch.cuda.is_available() else 'cpu'
     args.emb_file = args.emb_file or "vectors/glove.6B.{}d.txt".format(str(args.emb_dim))

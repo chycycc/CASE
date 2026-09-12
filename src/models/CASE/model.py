@@ -35,15 +35,23 @@ from sklearn.metrics import accuracy_score
 # 从 CEM-EPCL v6.2 移植，经 6 轮实验迭代验证
 # 核心思想: 非线性投影头隔离"对比学习空间"和"语言生成空间"
 class PrototypeContrastiveLoss(nn.Module):
-    def __init__(self, num_prototypes, input_dim, temperature=0.3,
-                 t_uniform=2.0, alpha_uni=1.0):
+    """
+    [V6 Trial 2] Multi-Prototype EPCL (Emotion Prototype Contrastive Loss)
+    
+    K=1: 32 prototypes, backward-compatible with original single-prototype mode.
+    K=2: 64 prototypes (2 sub-prototypes per class), Max-Cosine dynamic assignment.
+    """
+    def __init__(self, num_classes, input_dim, num_prototypes_per_class=1,
+                 temperature=0.3, t_uniform=2.0, alpha_uni=1.0):
         super(PrototypeContrastiveLoss, self).__init__()
+        self.num_classes = num_classes
+        self.num_prototypes_per_class = num_prototypes_per_class
+        self.total_prototypes = num_classes * num_prototypes_per_class
         self.temperature = temperature
         self.t_uniform = t_uniform
         self.alpha_uni = alpha_uni
 
-        # 投影层: input_dim → 128(瓶颈) → input_dim
-        # 128 维瓶颈强制信息压缩，ReLU 切断部分负梯度形成减震器
+        # Projection Head: input_dim -> 128 (bottleneck) -> input_dim
         proj_hidden = 128
         self.projection_head = nn.Sequential(
             nn.Linear(input_dim, proj_hidden),
@@ -51,13 +59,13 @@ class PrototypeContrastiveLoss(nn.Module):
             nn.Linear(proj_hidden, input_dim)
         )
 
-        # 可学习的情感原型，初始化在超球面上
-        self.prototypes = nn.Parameter(torch.empty(num_prototypes, input_dim))
+        # Learnable prototypes on hypersphere: [K*C, input_dim]
+        self.prototypes = nn.Parameter(torch.empty(self.total_prototypes, input_dim))
         nn.init.xavier_uniform_(self.prototypes)
         self.prototypes.data = F.normalize(self.prototypes.data, p=2, dim=1)
 
     def uniformity_loss(self, normalized_prototypes):
-        """原型间排斥力：梯度仅流向 self.prototypes"""
+        """K*C prototypes repulsion on hypersphere"""
         sq_pdist = 2.0 - 2.0 * torch.matmul(
             normalized_prototypes, normalized_prototypes.T
         )
@@ -71,22 +79,183 @@ class PrototypeContrastiveLoss(nn.Module):
     def forward(self, features, labels, tau=None):
         current_tau = tau if tau is not None else self.temperature
 
-        # 投影至对比子空间（不截断主干计算图）
         projected_features = self.projection_head(features)
 
-        # 超球面归一化
-        proj_norm = F.normalize(projected_features, p=2, dim=1)
-        proto_norm = F.normalize(self.prototypes, p=2, dim=1)
+        proj_norm = F.normalize(projected_features, p=2, dim=1)  # [B, D]
+        proto_norm = F.normalize(self.prototypes, p=2, dim=1)    # [K*C, D]
 
-        # Alignment: 拉近样本与目标原型
-        logits = torch.matmul(proj_norm, proto_norm.T) / current_tau
-        loss_align = F.cross_entropy(logits, labels)
+        if self.num_prototypes_per_class == 1:
+            # === K=1: backward-compatible single-prototype mode ===
+            logits = torch.matmul(proj_norm, proto_norm.T) / current_tau
+            loss_align = F.cross_entropy(logits, labels)
+        else:
+            # === [V6 Trial 2] 多原型 Max-Cosine 动态指派与对比对齐 ===
+            K = self.num_prototypes_per_class
+            C = self.num_classes
+            B = proj_norm.size(0)
+            batch_idx = torch.arange(B, device=labels.device)
 
-        # Uniformity: 原型间排斥力
+            # 计算样本与全部 K*C 个原型的余弦相似度: [B, C*K] -> 重构为 [B, C, K]
+            all_cosine = torch.matmul(proj_norm, proto_norm.T).view(B, C, K)
+
+            # 正样本候选: 从目标真实类别的 K 个子原型中选取余弦相似度最大的子原型 (Max-Cosine 动态指派)
+            # m* = argmax_m cos(z_i, p_{y_i, m}),  p+ = p_{y_i, m*}
+            target_cosines = all_cosine[batch_idx, labels]  # [B, K]
+            best_pos_cosine, _ = target_cosines.max(dim=-1, keepdim=True)  # [B, 1]
+
+            # 负样本: 所有非目标真实类别的子原型 (共 (C - 1) * K 个)
+            neg_mask = torch.ones(B, C, dtype=torch.bool, device=labels.device)
+            neg_mask[batch_idx, labels] = False
+            neg_cosines = all_cosine[neg_mask].view(B, (C - 1) * K)  # [B, (C - 1) * K]
+
+            # 拼接正负样本构建对比 Logits 矩阵: [B, 1 + (C - 1) * K]，其中第 0 列恒为正样本
+            comp_logits = torch.cat([best_pos_cosine, neg_cosines], dim=-1) / current_tau
+
+            # 利用 PyTorch 原生 cross_entropy 的 Log-Sum-Exp 稳定性计算 InfoNCE 损失
+            target_zeros = torch.zeros(B, dtype=torch.long, device=labels.device)
+            loss_align = F.cross_entropy(comp_logits, target_zeros)
+
+        # Uniformity: all K*C prototypes repel each other
         loss_uni = self.uniformity_loss(proto_norm)
 
         return loss_align + self.alpha_uni * loss_uni
 # ==============================================================
+
+
+# ================= V6 Trial 1: 双层非线性残差情感分类头 =================
+class ResidualEmotionHead(nn.Module):
+    """
+    双层非线性残差情感分类头 (Residual Emotion Head):
+    结构: LayerNorm -> Linear(d_in, d_hid) -> GELU -> Dropout -> Linear(d_hid, num_classes)
+          + Linear(d_in, num_classes) 残差直连捷径 (Shortcut)
+    核心功能: 突破单层线性分类头 (nn.Linear) 在 32 类高维超球面上的几何分割容量天花板。
+    """
+    def __init__(self, input_dim, hidden_dim, num_classes, dropout=0.1):
+        super(ResidualEmotionHead, self).__init__()
+        self.norm = nn.LayerNorm(input_dim)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        self.fc2 = nn.Linear(hidden_dim, num_classes)
+        # 残差直连投影捷径 (Residual Shortcut)
+        self.res_proj = nn.Linear(input_dim, num_classes)
+
+        # 显式参数正交/均匀初始化
+        nn.init.xavier_uniform_(self.fc1.weight)
+        nn.init.zeros_(self.fc1.bias)
+        nn.init.xavier_uniform_(self.fc2.weight)
+        nn.init.zeros_(self.fc2.bias)
+        nn.init.xavier_uniform_(self.res_proj.weight)
+        nn.init.zeros_(self.res_proj.bias)
+
+    def forward(self, x):
+        """
+        前向传播:
+        x: [batch_size, input_dim] 细粒度情感表征向量
+        返回: logits [batch_size, num_classes] 未归一化概率得分
+        """
+        norm_x = self.norm(x)
+        h = self.fc2(self.dropout(self.act(self.fc1(norm_x))))
+        res = self.res_proj(x)
+        return h + res
+# =======================================================================
+
+
+# ================= V6 Trial 3: 原型交叉记忆注意力模块 (PCAM) =================
+class PrototypeConditionedAttentionModule(nn.Module):
+    """
+    原型交叉记忆注意力模块 (Prototype-Conditioned Attention Module, PCAM):
+    定位: 解码器隐状态输出端与生成器 (Generator) 之间的自适应门控残差跨注意力桥梁。
+    核心目标: 打破 EPCL 训练出的全局原型矩阵与自回归解码器的“物理绝缘”，
+             使解码隐状态在自回归预测下一个词时能够动态 Query 原型流形，解决 Beam Search 多样性雪崩。
+    数学机制:
+        Q = H_dec * W_q,  K = P * W_k,  V = P * W_v
+        Attn = Softmax(Q K^T / sqrt(d_k))
+        H_proto = Attn * V * W_o
+        g = sigmoid(W_gate [H_dec; H_proto] + b_gate)  (b_gate 初始置为 -1.0 实现平滑暖启动)
+        H_out = LayerNorm(H_dec + g * H_proto)
+    """
+    def __init__(self, d_model=300, num_heads=2, dropout=0.1, gate_bias=-1.0):
+        super(PrototypeConditionedAttentionModule, self).__init__()
+        self.d_model = d_model
+        self.num_heads = num_heads
+        assert d_model % num_heads == 0, f"d_model ({d_model}) 必须能被 num_heads ({num_heads}) 整除"
+        self.head_dim = d_model // num_heads
+        self.scaling = self.head_dim ** -0.5
+
+        # 线性投影矩阵 Q, K, V, O
+        self.q_proj = nn.Linear(d_model, d_model)
+        self.k_proj = nn.Linear(d_model, d_model)
+        self.v_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.attn_dropout = nn.Dropout(dropout)
+        self.out_dropout = nn.Dropout(dropout)
+
+        # 自适应可学习通道门控融合层 (输入为 [H_dec; H_proto]，维度 2*d_model -> d_model)
+        self.gate_linear = nn.Linear(2 * d_model, d_model)
+        # 初始化门控偏置为负值 (默认 -1.0)，实现平滑暖启动，初期原型影响平缓，不冲垮自回归 PPL
+        nn.init.constant_(self.gate_linear.bias, gate_bias)
+        nn.init.xavier_uniform_(self.gate_linear.weight, gain=0.1)
+
+        # 层归一化
+        self.layer_norm = nn.LayerNorm(d_model)
+
+        # 投影参数正交/均匀初始化
+        nn.init.xavier_uniform_(self.q_proj.weight)
+        nn.init.zeros_(self.q_proj.bias)
+        nn.init.xavier_uniform_(self.k_proj.weight)
+        nn.init.zeros_(self.k_proj.bias)
+        nn.init.xavier_uniform_(self.v_proj.weight)
+        nn.init.zeros_(self.v_proj.bias)
+        nn.init.xavier_uniform_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
+
+    def forward(self, dec_output, prototypes):
+        """
+        前向传播:
+        dec_output: [batch_size, seq_len, d_model] 解码器输出隐状态
+        prototypes: [total_protos, d_model] 全局原型矩阵 (例如 64x300 或 32x300)
+        返回:
+        enhanced_output: [batch_size, seq_len, d_model] 经原型记忆强化的解码隐状态
+        """
+        bsz, seq_len, _ = dec_output.size()
+        k_protos, _ = prototypes.size()
+
+        # 1. 计算 Query (来自解码隐状态)
+        q = self.q_proj(dec_output) * self.scaling  # [bsz, seq_len, d_model]
+        # 2. 计算 Key, Value (来自原型矩阵)
+        k = self.k_proj(prototypes)                 # [k_protos, d_model]
+        v = self.v_proj(prototypes)                 # [k_protos, d_model]
+
+        # 3. 维度展开为多头形式
+        # q: [bsz, num_heads, seq_len, head_dim]
+        q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # k, v: [num_heads, k_protos, head_dim] -> 广播到 [bsz, num_heads, k_protos, head_dim]
+        k = k.view(k_protos, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0).expand(bsz, -1, -1, -1)
+        v = v.view(k_protos, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0).expand(bsz, -1, -1, -1)
+
+        # 4. 计算注意力分数
+        # attn_weights: [bsz, num_heads, seq_len, k_protos]
+        attn_weights = torch.matmul(q, k.transpose(-2, -1))
+        attn_probs = F.softmax(attn_weights, dim=-1)
+        attn_probs = self.attn_dropout(attn_probs)
+
+        # 5. 计算原型上下文表征
+        # context: [bsz, num_heads, seq_len, head_dim]
+        context = torch.matmul(attn_probs, v)
+        # 转置并合并多头: [bsz, seq_len, d_model]
+        context = context.transpose(1, 2).contiguous().view(bsz, seq_len, self.d_model)
+        h_proto = self.out_dropout(self.out_proj(context))
+
+        # 6. 自适应通道门控与残差融合 (使用 torch.sigmoid，杜绝 F.sigmoid)
+        gate_input = torch.cat([dec_output, h_proto], dim=-1)  # [bsz, seq_len, 2*d_model]
+        gate = torch.sigmoid(self.gate_linear(gate_input))     # [bsz, seq_len, d_model]
+
+        # 7. 残差连接与层归一化 (严禁原地操作，纯 out-of-place 计算)
+        enhanced_output = self.layer_norm(dec_output + gate * h_proto)
+        return enhanced_output
+# ==============================================================================
 
 
 class Encoder(nn.Module):
@@ -639,15 +808,33 @@ class CASE(nn.Module):
             self.emotion_num = len(ESC_MAP_EMO)
         else:
             self.emotion_num = len(ED_MAP_EMO)
-        self.emotion_linear = nn.Linear(config.emb_dim, self.emotion_num)
         
-        # === EPCL 模块初始化（从 CEM-EPCL v6.4 移植） ===
+        # [V6 Trial 1] 情感分类头支持原版 linear 与全新 residual_mlp 双层非线性残差头
+        if getattr(config, "emotion_head_type", "linear") == "residual_mlp":
+            self.emotion_linear = ResidualEmotionHead(
+                input_dim=config.emb_dim,
+                hidden_dim=getattr(config, "mlp_hidden_dim", 300),
+                num_classes=self.emotion_num,
+                dropout=getattr(config, "mlp_dropout", 0.1)
+            )
+            print(f"[V6 Architecture] 成功启用双层非线性残差分类头 (ResidualEmotionHead): in={config.emb_dim}, hid={getattr(config, 'mlp_hidden_dim', 300)}, out={self.emotion_num}, dropout={getattr(config, 'mlp_dropout', 0.1)}")
+        else:
+            self.emotion_linear = nn.Linear(config.emb_dim, self.emotion_num)
+        
+        # === EPCL Module Init ===
+        # [V6 Trial 2] Multi-Prototype: K sub-prototypes per class
+        self.num_prototypes_per_class = getattr(config, 'num_prototypes_per_class', 1)
+        total_protos = self.emotion_num * self.num_prototypes_per_class
         self.epcl_criterion = PrototypeContrastiveLoss(
-            self.emotion_num, config.emb_dim  # 32 类, 300 维
+            self.emotion_num, config.emb_dim,
+            num_prototypes_per_class=self.num_prototypes_per_class,
+            alpha_uni=getattr(config, 'alpha_uni', 1.0)
         )
-        self.emo_dropout = nn.Dropout(0.3)  # 分类头正则化
-        # [V4 Trial 8: MoP-DR] 引入原型动态路由探针 (300 维特征级向量路由)
-        self.router_linear = nn.Linear(self.emotion_num, config.emb_dim)
+        if self.num_prototypes_per_class > 1:
+            print(f"[V6 Trial 2] Multi-Prototype EPCL: {self.emotion_num} classes x {self.num_prototypes_per_class} sub-protos = {total_protos} total prototypes")
+        self.emo_dropout = nn.Dropout(0.3)
+        # [V4 Trial 8: MoP-DR] Router input dim = total_protos (32 when K=1, 64 when K=2)
+        self.router_linear = nn.Linear(total_protos, config.emb_dim)
         self.concept_prior_attn = Attention(query_size=config.emb_dim,
                                             memory_size=config.emb_dim,
                                             hidden_size=config.emb_dim,
@@ -700,6 +887,17 @@ class CASE(nn.Module):
             filter_size=config.filter,
         )
         
+        # [V6 Trial 3] 原型交叉记忆注意力 (PCAM) 模块初始化
+        self.use_pcam = getattr(config, 'use_pcam', False)
+        if self.use_pcam:
+            self.pcam = PrototypeConditionedAttentionModule(
+                d_model=config.hidden_dim,
+                num_heads=getattr(config, 'pcam_heads', 2),
+                dropout=getattr(config, 'pcam_dropout', 0.1),
+                gate_bias=getattr(config, 'pcam_gate_bias', -1.0)
+            )
+            print(f"[V6 Architecture] 成功启用原型交叉记忆注意力模块 (PCAM): heads={getattr(config, 'pcam_heads', 2)}, dropout={getattr(config, 'pcam_dropout', 0.1)}, gate_bias={getattr(config, 'pcam_gate_bias', -1.0)}")
+
         self.generator = Generator(config.hidden_dim, self.vocab_size)
         self.activation = nn.Softmax(dim=1)
         self.tanh = nn.Tanh()
@@ -770,6 +968,16 @@ class CASE(nn.Module):
             filter_size=config.filter,
             universal=config.universal,
         )
+
+    def apply_pcam(self, dec_output):
+        """
+        [V6 Trial 3: PCAM] 统一对解码器输出隐状态注入原型交叉记忆
+        dec_output: [bsz, seq_len, d_model] 解码器输出隐状态
+        返回: 经 PCAM 增强后的隐状态 (若未启用 PCAM 则返回原张量)
+        """
+        if getattr(self, "use_pcam", False) and hasattr(self, "pcam") and hasattr(self, "epcl_criterion"):
+            return self.pcam(dec_output, self.epcl_criterion.prototypes)
+        return dec_output
 
     def save_model(self, running_avg_ppl, iter):
         state = {
@@ -1103,15 +1311,14 @@ class CASE(nn.Module):
             emotion_emb = self.emotion_norm(torch.cat((concept_enc, fine_emotion), dim=-1))
             static_gate = torch.sigmoid(self.emotion_gate(emotion_emb))
             
-            # [V4 Trial 8: MoP-DR] 连续原型动态路由特征融合
+            # [MoP-DR] Prototype dynamic routing (compatible with K*C prototypes)
             if self.dataset == "ED":
                 projected_features = self.epcl_criterion.projection_head(fine_emotion)
                 proj_norm = F.normalize(projected_features, p=2, dim=1)
-                # 切断从生成损失流向原型的梯度，防止破坏对比空间
                 proto_norm = F.normalize(self.epcl_criterion.prototypes.detach(), p=2, dim=1)
-                proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1
+                proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1  # [B, K*C]
                 
-                P_route = F.softmax(proto_logits, dim=-1)
+                P_route = F.softmax(proto_logits, dim=-1)  # [B, K*C]
                 route_gate = torch.sigmoid(self.router_linear(P_route))
                 current_lambda = config.lambda_epcl * (iter / config.epcl_warmup) if (iter < config.epcl_warmup and train) else config.lambda_epcl
                 emo_gate = current_lambda * route_gate + (1 - current_lambda) * static_gate
@@ -1196,6 +1403,9 @@ class CASE(nn.Module):
                 concept_enc_mask=src_concept_mask.unsqueeze(1),
             )
         
+            # [V6 Trial 3: PCAM] 原型交叉记忆注意力注入
+            pre_logit = self.apply_pcam(pre_logit)
+
             ## compute output dist
             logit = self.generator(
                 pre_logit,
@@ -1422,9 +1632,9 @@ class CASE(nn.Module):
             projected_features = self.epcl_criterion.projection_head(fine_emotion)
             proj_norm = F.normalize(projected_features, p=2, dim=1)
             proto_norm = F.normalize(self.epcl_criterion.prototypes, p=2, dim=1)
-            proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1
-            # [V4 Trial 8: MoP-DR] 贪婪解码动态路由融合
-            P_route = F.softmax(proto_logits, dim=-1)
+            proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1  # [B, K*C]
+            # [MoP-DR] Greedy decode routing (K*C compatible)
+            P_route = F.softmax(proto_logits, dim=-1)  # [B, K*C]
             
             route_gate = torch.sigmoid(self.router_linear(P_route))
             emo_gate = config.lambda_epcl * route_gate + (1 - config.lambda_epcl) * static_gate
@@ -1468,6 +1678,9 @@ class CASE(nn.Module):
                     concept_enc_mask=src_concept_mask.unsqueeze(1),
                 )
 
+            # [V6 Trial 3: PCAM] 原型交叉记忆注意力注入
+            out = self.apply_pcam(out)
+
             prob = self.generator(
                 out, attn_dist, enc_batch_extend_vocab, extra_zeros, attn_dist_db=None
             )
@@ -1499,7 +1712,14 @@ class CASE(nn.Module):
             sent.append(st)
         return sent
 
-    def decoder_topk(self, batch, max_dec_step=30):
+    def decoder_sampling(self, batch, max_dec_step=30, temp=0.7, top_p=0.9, top_k=0):
+        """
+        [路线 A: 多样性自适应采样解码 (Nucleus / Top-p Sampling)]
+        机制: 
+        1. 完整复用 CASE 前端常识认知编码、概念情感图编码、MoP-DR 原型路由与 PCAM 原型交叉记忆强化；
+        2. 自回归单步中，使用对数概率除以温度系数 temp，通过 top_k_top_p_filtering 截断尾部低概率噪词；
+        3. 采用 torch.multinomial 随机多项式采样，彻底打破确定性 Beam Search 在尖锐分布下的死板套话循环。
+        """
         (
             enc_batch,
             _,
@@ -1510,33 +1730,182 @@ class CASE(nn.Module):
             _,
             _,
         ) = get_input_from_batch(batch)
-        src_mask, ctx_output, _ = self.forward(batch)
+        enc_vad_batch = batch["context_vad"]
+        
+        # 1. 编码对话上下文 (Context)
+        src_mask = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
+        mask_emb = self.embedding(batch["mask_input"])
+        src_emb = self.embedding(enc_batch) + mask_emb
+        enc_outputs = self.encoder(src_emb, src_mask)
+        
+        # 2. 情感流: 编码 ConceptNet 概念图 (Affection)
+        concept_input = batch["concept_batch"]
+        concept_mask = concept_input.data.eq(config.PAD_idx).unsqueeze(1)
+        concept_vad_batch = batch["concept_vad_batch"]
+        mask_concept = batch["mask_concept"]
+        concept_adj_mask = batch["concept_adjacency_mask_batch"]
+        concept_emb = self.embedding(concept_input) + self.embedding(mask_concept)
+        src_concept_input_emb = torch.cat((src_emb, concept_emb), dim=1)
+        src_concept_outputs = self.concept_graph_encoder(src_concept_input_emb, 
+                                                         src_concept_input_emb,
+                                                         src_concept_input_emb,
+                                                         concept_adj_mask)
+        src_concept_mask = torch.cat((enc_batch, concept_input), dim=1).data.eq(config.PAD_idx)
+        src_concept_vad = torch.cat((enc_vad_batch, concept_vad_batch), dim=1)
+        src_concept_vad = torch.softmax(src_concept_vad, dim=-1).unsqueeze(2).repeat(1, 1, config.emb_dim)
+        src_concept_outputs = self.vad_layernorm(src_concept_vad * src_concept_outputs)
+        
+        # 3. 认知流: 编码 COMET 常识知识 (Cognition)
+        bsz, uttr_num, uttr_length = batch["uttr_batch_concat"].size()
+        uttr_batch_concat = batch["uttr_batch_concat"].view(bsz*uttr_num, -1)
+        uttr_batch_mask = uttr_batch_concat.data.eq(config.PAD_idx).unsqueeze(1)
+        
+        bsz, cs_num, cs_length = batch["cs_batch"].size()
+        cs_batch = batch["cs_batch"].view(bsz*cs_num, -1)
+        cs_batch_mask = cs_batch.data.eq(config.PAD_idx).unsqueeze(1)
+        cs_mask = batch["cs_mask"]
+        cs_adj_mask = batch["cs_adjacency_mask_batch"]
+        
+        uttr_batch_emb = self.embedding(uttr_batch_concat)
+        uttr_batch_outputs = self.cognition_encoder(uttr_batch_emb, uttr_batch_mask)[:,0].view(bsz, uttr_num, -1)
+        
+        cs_batch_emb = self.embedding(cs_batch)
+        cs_batch_outputs = self.cognition_encoder(cs_batch_emb, cs_batch_mask)[:,0].view(bsz, cs_num, -1)
+        uttr_cs_outputs = torch.cat((uttr_batch_outputs, cs_batch_outputs), dim=1)
+        relation_emb = self.relation_embedding(cs_adj_mask)
+        uttr_cs_graph_outputs = self.cs_graph_encoder(uttr_cs_outputs,
+                                                  uttr_cs_outputs,
+                                                  uttr_cs_outputs,
+                                                  cs_adj_mask,
+                                                  relation_emb)
+        
+        commonsense_outputs = uttr_cs_graph_outputs[:,-cs_batch_outputs.size(1):,:]
+        commonsense_mask = cs_mask
+        if self.dataset == "ESConv":
+            strategy_seqs = batch["strategy_seqs_batch"]
+            mask_strategy = strategy_seqs.data.eq(config.PAD_idx).unsqueeze(1)
+            strategy_seqs_emb = self.strategy_embedding(strategy_seqs)
+            strategy_seqs_emb = self.add_position_embedding(strategy_seqs, strategy_seqs_emb)
+            strategy_enc_outputs = self.strategy_encoder(strategy_seqs_emb, mask_strategy)
+            strategy_enc_outputs = strategy_enc_outputs[:,0,:]
+            prior_query = self.tanh(self.prior_query_linear(torch.cat((enc_outputs[:,0,:], strategy_enc_outputs), dim=-1)))
+        else:
+            prior_query = self.tanh(self.prior_query_linear(enc_outputs[:,0,:]))
+        
+        prior_concept_enc, prior_concept_attn = self.concept_prior_attn(
+            query = prior_query.unsqueeze(1),
+            memory = self.tanh(src_concept_outputs),
+            mask = src_concept_mask
+        )
+        
+        # commonsense
+        prior_cs_enc, prior_cs_attn = self.cs_prior_attn(
+            query = prior_query.unsqueeze(1),
+            memory = self.tanh(commonsense_outputs),
+            mask = commonsense_mask.eq(0)
+        )
+        prior_cs_attn = prior_cs_attn.squeeze(1)
+        cs_enc = prior_cs_enc.squeeze(1)
+        concept_enc = prior_concept_enc.squeeze(1)
+        
+        # Fine-grained MIM
+        bsz, react_uttr_num, _ = batch["react_batch"].size()
+        assert uttr_num == react_uttr_num
+        react_batch = batch["react_batch"].view(bsz*react_uttr_num, -1)
+        react_batch_mask = react_batch.data.eq(config.PAD_idx).unsqueeze(1)
+        react_emb = self.embedding(react_batch)
+        react_batch_outputs = self.react_encoder(react_emb, react_batch_mask)
+        react_batch_enc = torch.mean(react_batch_outputs, dim=1)
+        react_batch_enc = react_batch_enc.view(bsz, react_uttr_num, -1)
+        react_batch_enc = self.react_ctx_encoder(torch.cat((react_batch_enc.unsqueeze(2).repeat(1, 1, enc_outputs.size(1), 1),
+                                                        enc_outputs.unsqueeze(1).repeat(1, react_uttr_num, 1, 1)), 
+                                                        dim=-1).view(bsz*react_uttr_num, enc_outputs.size(1), -1), 
+                                                        src_mask.unsqueeze(1).repeat(1, react_uttr_num, 1, 1).view(bsz*react_uttr_num, -1,enc_outputs.size(1)))
+        react_batch_enc = react_batch_enc[:,0,:].view(bsz, react_uttr_num, -1)
+        react_batch_enc = self.react_linear(react_batch_enc)
+        bsz, _, emb = react_batch_enc.size()
+        uttr_emotion = react_batch_enc[:,0].unsqueeze(1).repeat(1, batch["max_uttr_cs_num"], 1)
+        split_intent_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_intent_num"], 1).view(bsz, -1, emb)
+        split_need_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_need_num"], 1).view(bsz, -1, emb)
+        split_want_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_want_num"], 1).view(bsz, -1, emb)
+        split_effect_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_effect_num"], 1).view(bsz, -1, emb)
+        react_enc = torch.cat((uttr_emotion, 
+                               split_intent_emotion,
+                               split_need_emotion,
+                               split_want_emotion,
+                               split_effect_emotion), dim=1)
+        assert react_enc.size(1) == cs_num
+        fine_emotion = react_batch_enc[:, 0]
+        emotion_emb = self.emotion_norm(torch.cat((concept_enc, fine_emotion), dim=-1))
+        static_gate = torch.sigmoid(self.emotion_gate(emotion_emb))
+        
+        # 4. 原型路由 (MoP-DR)
+        if self.dataset == "ED":
+            projected_features = self.epcl_criterion.projection_head(fine_emotion)
+            proj_norm = F.normalize(projected_features, p=2, dim=1)
+            proto_norm = F.normalize(self.epcl_criterion.prototypes, p=2, dim=1)
+            proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1
+            P_route = F.softmax(proto_logits, dim=-1)
+            route_gate = torch.sigmoid(self.router_linear(P_route))
+            emo_gate = config.lambda_epcl * route_gate + (1 - config.lambda_epcl) * static_gate
+        else:
+            emo_gate = static_gate
+            
+        emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
+        
+        # 5. 上下文融合 (Context Merge)
+        if self.dataset == "ESConv":
+            ctx_enc_outputs = self.ctx_merge_lin(torch.cat((
+                enc_outputs, 
+                cs_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
+                concept_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
+                strategy_enc_outputs.unsqueeze(1).repeat(1, enc_outputs.size(1), 1)
+            ), dim=2))
+        else:
+            ctx_enc_outputs = self.ctx_merge_lin(torch.cat((
+                enc_outputs, 
+                cs_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
+                emotion_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
+            ), dim=2))
 
+        # 6. 自回归采样生成循环
         ys = torch.ones(1, 1).fill_(config.SOS_idx).long().to(config.device)
         mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
         decoded_words = []
         for i in range(max_dec_step + 1):
+            ys_embed = self.embedding(ys)
             if config.project:
                 out, attn_dist = self.decoder(
-                    self.embedding_proj_in(self.embedding(ys)),
+                    self.embedding_proj_in(ys_embed),
                     self.embedding_proj_in(ctx_output),
                     (src_mask, mask_trg),
                 )
             else:
                 out, attn_dist = self.decoder(
-                    self.embedding(ys), ctx_output, (src_mask, mask_trg)
+                    ys_embed, ctx_enc_outputs, (src_mask, mask_trg),
+                    cs_enc_outputs=commonsense_outputs,
+                    cs_enc_mask=commonsense_mask.eq(0).unsqueeze(1),
+                    concept_enc_outputs=src_concept_outputs,
+                    concept_enc_mask=src_concept_mask.unsqueeze(1),
                 )
 
-            logit = self.generator(
+            # [V6 Trial 3: PCAM] 原型交叉记忆注意力注入
+            out = self.apply_pcam(out)
+
+            prob = self.generator(
                 out, attn_dist, enc_batch_extend_vocab, extra_zeros, attn_dist_db=None
             )
-            filtered_logit = top_k_top_p_filtering(
-                logit[0, -1] / 0.7, top_k=0, top_p=0.9, filter_value=-float("Inf")
-            )
-            # Sample from the filtered distribution
-            probs = F.softmax(filtered_logit, dim=-1)
+            
+            logits_step = prob[:, -1]  # [1, vocab_size] (log probabilities)
+            if temp > 0:
+                scaled_logits = logits_step / max(temp, 1e-4)
+                filtered_logits = top_k_top_p_filtering(scaled_logits.squeeze(0), top_k=top_k, top_p=top_p)
+                sample_probs = F.softmax(filtered_logits, dim=-1)
+                next_word = torch.multinomial(sample_probs, 1)
+            else:
+                _, next_word = torch.max(logits_step, dim=-1)
+                next_word = next_word.unsqueeze(0)
 
-            next_word = torch.multinomial(probs, 1).squeeze()
             decoded_words.append(
                 [
                     "<EOS>"
@@ -1545,11 +1914,10 @@ class CASE(nn.Module):
                     for ni in next_word.view(-1)
                 ]
             )
-            # _, next_word = torch.max(logit[:, -1], dim=1)
-            next_word = next_word.item()
+            next_word_idx = next_word.item()
 
             ys = torch.cat(
-                [ys, torch.ones(1, 1).long().fill_(next_word).to(config.device)],
+                [ys, torch.ones(1, 1).long().fill_(next_word_idx).to(config.device)],
                 dim=1,
             ).to(config.device)
             mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
@@ -1612,230 +1980,6 @@ class CASE(nn.Module):
         
         # cs_enc = torch.bmm(prior_cs_attn*commonsense_mask, commonsense_outputs)
         # src_concept_vad = torch.softmax(src_concept_vad, dim=-1)
-    def decoder_sampling(self, batch, max_dec_step=30, top_k=50, top_p=0.9, temperature=0.7):
-        (
-            enc_batch,
-            _,
-            _,
-            enc_batch_extend_vocab,
-            extra_zeros,
-            _,
-            _,
-            _,
-        ) = get_input_from_batch(batch)
-        enc_vad_batch = batch["context_vad"]
-        
-        # Encode Context
-        src_mask = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
-        mask_emb = self.embedding(batch["mask_input"])
-        src_emb = self.embedding(enc_batch) + mask_emb
-        enc_outputs = self.encoder(src_emb, src_mask)  # batch_size * seq_len * 300
-        
-        # Affection: Encode Concept
-        concept_input = batch["concept_batch"]
-        concept_mask = concept_input.data.eq(config.PAD_idx).unsqueeze(1)
-        concept_vad_batch = batch["concept_vad_batch"]
-        mask_concept = batch["mask_concept"]
-        concept_adj_mask = batch["concept_adjacency_mask_batch"]
-        # mask_concept = concept_input.data.eq(config.PAD_idx).unsqueeze(1)  # real mask
-        # concept_mask = self.embedding(mask_concept)  # KG_idx embedding
-        concept_emb = self.embedding(concept_input) + self.embedding(mask_concept)  # KG_idx embedding
-        src_concept_input_emb = torch.cat((src_emb, concept_emb), dim=1)
-        src_concept_outputs = self.concept_graph_encoder(src_concept_input_emb, 
-                                                         src_concept_input_emb,
-                                                         src_concept_input_emb,
-                                                         concept_adj_mask)
-        src_concept_mask = torch.cat((enc_batch, concept_input), dim=1).data.eq(config.PAD_idx)
-        src_concept_vad = torch.cat((enc_vad_batch, concept_vad_batch), dim=1)
-        src_concept_vad = torch.softmax(src_concept_vad, dim=-1).unsqueeze(2).repeat(1, 1, config.emb_dim)
-        src_concept_outputs = self.vad_layernorm(src_concept_vad * src_concept_outputs)
-        
-        # Cognition: Encode Commonsense
-        bsz, uttr_num, uttr_length = batch["uttr_batch_concat"].size()
-        uttr_batch_concat = batch["uttr_batch_concat"].view(bsz*uttr_num, -1)
-        uttr_batch_mask = uttr_batch_concat.data.eq(config.PAD_idx).unsqueeze(1)
-        
-        bsz, cs_num, cs_length = batch["cs_batch"].size()
-        cs_batch = batch["cs_batch"].view(bsz*cs_num, -1)
-        cs_batch_mask = cs_batch.data.eq(config.PAD_idx).unsqueeze(1)
-        cs_mask = batch["cs_mask"] # bsz, cs_num
-        
-        cs_adj_mask = batch["cs_adjacency_mask_batch"]
-        
-        uttr_batch_emb = self.embedding(uttr_batch_concat)
-        uttr_batch_outputs = self.cognition_encoder(uttr_batch_emb, uttr_batch_mask)[:,0].view(bsz, uttr_num, -1)
-        
-        cs_batch_emb = self.embedding(cs_batch)
-        cs_batch_outputs = self.cognition_encoder(cs_batch_emb, cs_batch_mask)[:,0].view(bsz, cs_num, -1)
-        uttr_cs_outputs = torch.cat((uttr_batch_outputs, cs_batch_outputs), dim=1)
-        
-        assert uttr_cs_outputs.size(1) == cs_adj_mask.size(1)
-        relation_emb = self.relation_embedding(cs_adj_mask)
-        uttr_cs_graph_outputs = self.cs_graph_encoder(uttr_cs_outputs,
-                                                  uttr_cs_outputs,
-                                                  uttr_cs_outputs,
-                                                  cs_adj_mask,
-                                                  relation_emb)
-        
-        commonsense_outputs = uttr_cs_graph_outputs[:,-cs_batch_outputs.size(1):,:]
-        commonsense_mask = cs_mask
-        if self.dataset == "ESConv":
-            # Strategy: Encode Strategy Sequence
-            strategy_seqs = batch["strategy_seqs_batch"]
-            mask_strategy = strategy_seqs.data.eq(config.PAD_idx).unsqueeze(1)
-            strategy_seqs_emb = self.strategy_embedding(strategy_seqs)
-            strategy_seqs_emb = self.add_position_embedding(strategy_seqs, strategy_seqs_emb)
-            strategy_enc_outputs = self.strategy_encoder(strategy_seqs_emb, mask_strategy)
-            strategy_enc_outputs = strategy_enc_outputs[:,0,:]
-            
-            prior_query = self.tanh(self.prior_query_linear(torch.cat((enc_outputs[:,0,:], strategy_enc_outputs), dim=-1)))
-        else:
-            prior_query = self.tanh(self.prior_query_linear(enc_outputs[:,0,:]))
-        
-        # concept
-        prior_concept_enc, prior_concept_attn = self.concept_prior_attn(
-            query = prior_query.unsqueeze(1), # enc_outputs[:,0,:].unsqueeze(1),
-            memory = self.tanh(src_concept_outputs),
-            mask = src_concept_mask
-        )
-        prior_concept_attn = prior_concept_attn.squeeze(1)
-        
-        # commonsense
-        prior_cs_enc, prior_cs_attn = self.cs_prior_attn(
-            query = prior_query.unsqueeze(1), # enc_outputs[:,0,:].unsqueeze(1),
-            memory = self.tanh(commonsense_outputs),
-            mask = commonsense_mask.eq(0)
-        )
-        prior_cs_attn = prior_cs_attn.squeeze(1)
-        cs_enc = prior_cs_enc.squeeze(1)
-        concept_enc = prior_concept_enc.squeeze(1)
-        
-        # Fine-grained MIM
-        bsz, react_uttr_num, _ = batch["react_batch"].size()
-        assert uttr_num == react_uttr_num
-        react_batch = batch["react_batch"].view(bsz*react_uttr_num, -1)
-        react_batch_mask = react_batch.data.eq(config.PAD_idx).unsqueeze(1)
-        react_emb = self.embedding(react_batch)
-        react_batch_outputs = self.react_encoder(react_emb, react_batch_mask)
-        # react_batch_enc, _ = self.react_selfattn(react_batch_outputs, react_batch_mask.squeeze(1))
-        react_batch_enc = torch.mean(react_batch_outputs, dim=1)
-        react_batch_enc = react_batch_enc.view(bsz, react_uttr_num, -1)
-        react_batch_enc = self.react_ctx_encoder(torch.cat((react_batch_enc.unsqueeze(2).repeat(1, 1, enc_outputs.size(1), 1),
-                                                        enc_outputs.unsqueeze(1).repeat(1, react_uttr_num, 1, 1)), 
-                                                        dim=-1).view(bsz*react_uttr_num, enc_outputs.size(1), -1), 
-                                                        src_mask.unsqueeze(1).repeat(1, react_uttr_num, 1, 1).view(bsz*react_uttr_num, -1,enc_outputs.size(1)))
-        react_batch_enc = react_batch_enc[:,0,:].view(bsz, react_uttr_num, -1)
-        react_batch_enc = self.react_linear(react_batch_enc)
-        bsz, _, emb = react_batch_enc.size()
-        uttr_emotion = react_batch_enc[:,0].unsqueeze(1).repeat(1, batch["max_uttr_cs_num"], 1)
-        split_intent_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_intent_num"], 1).view(bsz, -1, emb)
-        split_need_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_need_num"], 1).view(bsz, -1, emb)
-        split_want_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_want_num"], 1).view(bsz, -1, emb)
-        split_effect_emotion = react_batch_enc[:,1:].unsqueeze(2).repeat(1, 1, batch["split_effect_num"], 1).view(bsz, -1, emb)
-        react_enc = torch.cat((uttr_emotion, 
-                               split_intent_emotion,
-                               split_need_emotion,
-                               split_want_emotion,
-                               split_effect_emotion), dim=1)
-        assert react_enc.size(1) == cs_num
-   
-        # uttr_split_react_mask = batch["uttr_split_react_mask"]
-        # fine_mask = torch.cat((torch.ones((bsz, 1)).long().to(config.device), uttr_split_react_mask), dim=1)
-        # assert fine_mask.size(1) == react_batch_enc.size(1)
-        # fine_emotion, _ = self.fine_emotion_selfattn(react_batch_enc, fine_mask.eq(0))
-        
-        fine_emotion = react_batch_enc[:, 0]
-        emotion_emb = self.emotion_norm(torch.cat((concept_enc, fine_emotion), dim=-1))
-        static_gate = torch.sigmoid(self.emotion_gate(emotion_emb))
-        
-        if self.dataset == "ED":
-            projected_features = self.epcl_criterion.projection_head(fine_emotion)
-            proj_norm = F.normalize(projected_features, p=2, dim=1)
-            proto_norm = F.normalize(self.epcl_criterion.prototypes, p=2, dim=1)
-            proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1
-            
-            # [V4 Trial 8: MoP-DR] 采样解码动态路由融合
-            P_route = F.softmax(proto_logits, dim=-1)
-            route_gate = torch.sigmoid(self.router_linear(P_route))
-            emo_gate = config.lambda_epcl * route_gate + (1 - config.lambda_epcl) * static_gate
-        else:
-            emo_gate = static_gate
-            
-        emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
-        
-        # Merge Context, Cognition-Affection-Strategy Signals
-        if self.dataset == "ESConv":
-            ctx_enc_outputs = self.ctx_merge_lin(torch.cat((
-                enc_outputs, 
-                cs_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
-                concept_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
-                strategy_enc_outputs.unsqueeze(1).repeat(1, enc_outputs.size(1), 1)
-            ), dim=2))
-        else:
-            ctx_enc_outputs = self.ctx_merge_lin(torch.cat((
-                enc_outputs, 
-                cs_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
-                emotion_enc.unsqueeze(1).repeat(1, enc_outputs.size(1), 1),
-            ), dim=2))
-
-        ys = torch.ones(1, 1).fill_(config.SOS_idx).long().to(config.device)
-        mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
-        decoded_words = []
-        for i in range(max_dec_step + 1):
-            ys_embed = self.embedding(ys)
-            if config.project:
-                out, attn_dist = self.decoder(
-                    self.embedding_proj_in(ys_embed),
-                    self.embedding_proj_in(ctx_output),
-                    (src_mask, mask_trg),
-                )
-            else:
-                out, attn_dist = self.decoder(
-                    ys_embed, ctx_enc_outputs, (src_mask, mask_trg),
-                    cs_enc_outputs=commonsense_outputs,
-                    cs_enc_mask=commonsense_mask.eq(0).unsqueeze(1),
-                    concept_enc_outputs=src_concept_outputs,
-                    concept_enc_mask=src_concept_mask.unsqueeze(1),
-                )
-
-            prob = self.generator(
-                out, attn_dist, enc_batch_extend_vocab, extra_zeros, attn_dist_db=None
-            )
-            # --- Top-p / Top-k Sampling ---
-            logits = prob[:, -1] / temperature
-            filtered_logits = []
-            for b_idx in range(logits.size(0)):
-                filtered_logits.append(top_k_top_p_filtering(logits[b_idx], top_k=top_k, top_p=top_p))
-            filtered_logits = torch.stack(filtered_logits, dim=0)
-            probs = F.softmax(filtered_logits, dim=-1)
-            next_word = torch.multinomial(probs, 1).squeeze(-1)
-            
-            decoded_words.append(
-                [
-                    "<EOS>"
-                    if ni.item() == config.EOS_idx
-                    else self.vocab.index2word[ni.item()]
-                    for ni in next_word.view(-1)
-                ]
-            )
-            next_word = next_word.data[0]
-
-            ys = torch.cat(
-                [ys, torch.ones(1, 1).long().fill_(next_word).to(config.device)],
-                dim=1,
-            ).to(config.device)
-            mask_trg = ys.data.eq(config.PAD_idx).unsqueeze(1)
-
-        sent = []
-        for _, row in enumerate(np.transpose(decoded_words)):
-            st = ""
-            for e in row:
-                if e == "<EOS>":
-                    break
-                else:
-                    st += e + " "
-            sent.append(st)
-        return sent
 
     def decoder_topk(self, batch, max_dec_step=30):
         (
