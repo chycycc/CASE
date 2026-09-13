@@ -87,6 +87,20 @@ def load_eval_model(checkpoint_path):
     config.beam_size = 5
     config.device = "cuda" if torch.cuda.is_available() else "cpu"
 
+    # [V7 兼容支持]
+    if "v7" in checkpoint_path or "trial" in checkpoint_path:
+        config.use_erp = True
+        config.erp_hidden_dim = 768
+        config.erp_dropout = 0.1
+        if "trial2" in checkpoint_path or "trial3" in checkpoint_path:
+            config.use_cchp = True
+            config.cchp_alpha = 0.1
+            config.cchp_reg_weight = 0.01
+        if "trial3" in checkpoint_path:
+            config.use_unlikelihood = True
+            config.unlikelihood_weight = 0.1
+        print(f"[V7 Model Config] use_erp={getattr(config, 'use_erp', False)}, use_cchp={getattr(config, 'use_cchp', False)}, use_unlikelihood={getattr(config, 'use_unlikelihood', False)}")
+
     set_seed()
 
     print("[*] 正在加载数据与词表 (prepare_data_seq)...")

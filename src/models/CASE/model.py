@@ -31,18 +31,172 @@ from src.utils.constants import ESC_MAP_EMO, ESC_MAP_STRATEGY, ED_MAP_EMO
 from sklearn.metrics import accuracy_score
 
 
-# ================= EPCL: 情感原型对比学习模块 =================
-# 从 CEM-EPCL v6.2 移植，经 6 轮实验迭代验证
-# 核心思想: 非线性投影头隔离"对比学习空间"和"语言生成空间"
+# ================= V7 Architecture: 高维解缠残差投影头 (ERP) =================
+class ExpandedResidualProjector(nn.Module):
+    """
+    [V7 Architecture] 高维解缠残差投影头 (Expanded Residual Projector, ERP)
+    文献依据: SimCLR v2 (深层解耦), Barlow Twins (高维解缠扩张 300->768), SimCSE (残差直连保护语义先验)
+    结构: Linear(300 -> 768) -> LN -> GELU -> Dropout -> Linear(768 -> 768) -> LN -> GELU -> Linear(768 -> 300)
+          + Shortcut(Linear(300 -> 300) + LN) -> LN -> L2_Norm
+    """
+    def __init__(self, input_dim=300, hidden_dim=768, output_dim=300, dropout=0.1):
+        super(ExpandedResidualProjector, self).__init__()
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.ln1 = nn.LayerNorm(hidden_dim)
+        self.act1 = nn.GELU()
+        self.dropout = nn.Dropout(dropout)
+        
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.ln2 = nn.LayerNorm(hidden_dim)
+        self.act2 = nn.GELU()
+        
+        self.fc3 = nn.Linear(hidden_dim, output_dim)
+        
+        # 残差直连捷径 (保护底层词法先验各向同性)
+        self.shortcut = nn.Sequential(
+            nn.Linear(input_dim, output_dim),
+            nn.LayerNorm(output_dim)
+        )
+        self.final_ln = nn.LayerNorm(output_dim)
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        res = self.shortcut(x)
+        h = self.dropout(self.act1(self.ln1(self.fc1(x))))
+        h = self.act2(self.ln2(self.fc2(h)))
+        out = self.fc3(h)
+        return F.normalize(self.final_ln(out + res), p=2, dim=-1)
+
+
+# ================= V7 Architecture: 动态上下文条件超网络原型 (CCHP) =================
+class ContextConditionedHyperPrototypes(nn.Module):
+    """
+    [V7 Architecture] 动态上下文条件超网络原型 (Context-Conditioned Hyper-Prototypes, CCHP)
+    理论依据: HyperNetworks (ICLR'17), Conditional ProtoNet (NeurIPS'17), FiLM (AAAI'18)
+    机制: 保持全局基底原型锚定 32 类情绪宏观超球面几何拓扑，
+          由对话历史上下文向量生成样本专属的语义位移场与通道缩放因子。
+    """
+    def __init__(self, num_classes=32, num_prototypes_per_class=2, input_dim=300,
+                 hyper_dim=256, alpha_dyn=0.1):
+        super(ContextConditionedHyperPrototypes, self).__init__()
+        self.num_classes = num_classes
+        self.num_prototypes_per_class = num_prototypes_per_class
+        self.total_prototypes = num_classes * num_prototypes_per_class
+        self.input_dim = input_dim
+        self.alpha_dyn = alpha_dyn
+
+        # 1. 全局静态基底原型
+        self.prototypes = nn.Parameter(torch.empty(self.total_prototypes, input_dim))
+        nn.init.xavier_uniform_(self.prototypes)
+        self.prototypes.data = F.normalize(self.prototypes.data, p=2, dim=1)
+
+        # 2. 超网络位移场生成器 (双线性特征交互)
+        self.hyper_net = nn.Sequential(
+            nn.Linear(input_dim * 2, hyper_dim),
+            nn.LayerNorm(hyper_dim),
+            nn.GELU(),
+            nn.Linear(hyper_dim, input_dim)
+        )
+        # 3. 门控尺度因子生成器
+        self.scale_net = nn.Sequential(
+            nn.Linear(input_dim * 2, input_dim),
+            nn.Sigmoid()
+        )
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.hyper_net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+        for m in self.scale_net.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+
+    def forward(self, ctx_repr=None):
+        """
+        前向传播:
+        ctx_repr: [B, D] 对话上下文全局表征向量。若为 None，则退化返回全局基底原型。
+        返回:
+        dyn_prototypes: 若 ctx_repr 为 None 则为 [M, D]，否则为 [B, M, D] (M = K*C)
+        reg_loss: 位移场 L2 正则化标量损失 (防止超网络自指作弊与流形漂移)
+        """
+        p_base = F.normalize(self.prototypes, p=2, dim=-1)
+        if ctx_repr is None:
+            return p_base, torch.tensor(0.0, device=p_base.device)
+
+        bsz = ctx_repr.size(0)
+        M, D = p_base.size()
+
+        p_base_exp = p_base.unsqueeze(0).expand(bsz, M, D)
+        ctx_exp = ctx_repr.unsqueeze(1).expand(bsz, M, D)
+        pair_input = torch.cat([p_base_exp, ctx_exp], dim=-1)  # [B, M, 2*D]
+
+        delta_p = torch.tanh(self.hyper_net(pair_input))  # [B, M, D], 严格受限于 [-1, 1]
+        scale = 2.0 * self.scale_net(pair_input)          # [B, M, D], 严格受限于 [0, 2]
+
+        dyn_prototypes = F.normalize(scale * p_base_exp + self.alpha_dyn * delta_p, p=2, dim=-1)
+        reg_loss = torch.mean(delta_p ** 2)
+        return dyn_prototypes, reg_loss
+
+def compute_unlikelihood_loss(log_probs, target_tokens, pad_idx=1):
+    """
+    [V7 Phase 2] 序列级无似然训练损失 (Sequence-level Repetition Unlikelihood Loss)
+    针对自回归生成中高频出现的局部重复与安全套话，在训练端主动惩罚前文历史词元的预测概率。
+    :param log_probs: [B, T, V] 词表对数概率分布 (log_softmax 或 generator 输出)
+    :param target_tokens: [B, T] 真实标签序列
+    :param pad_idx: 填充符号索引 (默认1)
+    :return: 标量损失
+    """
+    B, T = target_tokens.size()
+    if T <= 1:
+        return torch.tensor(0.0, device=log_probs.device)
+
+    # 1. 构造前文候选词元索引 [B, T_curr, T_hist]
+    cand_tokens = target_tokens.unsqueeze(1).expand(B, T, T)
+    # 限制索引在词表范围内
+    cand_tokens_clamped = cand_tokens.clamp(0, log_probs.size(-1) - 1)
+    cand_log_probs = torch.gather(log_probs, dim=-1, index=cand_tokens_clamped)
+
+    # 2. 构造因果与非目标词元负样本掩码
+    causal_mask = torch.tril(torch.ones(T, T, device=log_probs.device), diagonal=-1).bool().unsqueeze(0)
+    not_curr_mask = (target_tokens.unsqueeze(2) != target_tokens.unsqueeze(1))
+    not_pad_curr = target_tokens.ne(pad_idx).unsqueeze(2)
+    not_pad_cand = target_tokens.ne(pad_idx).unsqueeze(1)
+
+    final_mask = causal_mask & not_curr_mask & not_pad_curr & not_pad_cand
+
+    if not final_mask.any():
+        return torch.tensor(0.0, device=log_probs.device)
+
+    selected_log_probs = cand_log_probs[final_mask]
+    selected_probs = torch.clamp(torch.exp(selected_log_probs), max=0.9999)
+    ul_loss = -torch.log(torch.clamp(1.0 - selected_probs, min=1e-7)).mean()
+    return ul_loss
+
+
+# ================= EPCL: 情感原型对比学习损失模块 =================
 class PrototypeContrastiveLoss(nn.Module):
     """
-    [V6 Trial 2] Multi-Prototype EPCL (Emotion Prototype Contrastive Loss)
-    
-    K=1: 32 prototypes, backward-compatible with original single-prototype mode.
-    K=2: 64 prototypes (2 sub-prototypes per class), Max-Cosine dynamic assignment.
+    [V7 Upgraded] Multi-Prototype EPCL
+    集成:
+    1. 高维解缠残差投影头 (ERP)
+    2. 动态上下文条件超网络原型 (CCHP)
     """
-    def __init__(self, num_classes, input_dim, num_prototypes_per_class=1,
-                 temperature=0.3, t_uniform=2.0, alpha_uni=1.0):
+    def __init__(self, num_classes=32, input_dim=300, num_prototypes_per_class=1,
+                 temperature=0.3, t_uniform=2.0, alpha_uni=1.0,
+                 use_erp=False, erp_hidden_dim=768, erp_dropout=0.1,
+                 use_cchp=False, cchp_alpha=0.1):
         super(PrototypeContrastiveLoss, self).__init__()
         self.num_classes = num_classes
         self.num_prototypes_per_class = num_prototypes_per_class
@@ -50,76 +204,117 @@ class PrototypeContrastiveLoss(nn.Module):
         self.temperature = temperature
         self.t_uniform = t_uniform
         self.alpha_uni = alpha_uni
+        self.use_erp = use_erp
+        self.use_cchp = use_cchp
 
-        # Projection Head: input_dim -> 128 (bottleneck) -> input_dim
-        proj_hidden = 128
-        self.projection_head = nn.Sequential(
-            nn.Linear(input_dim, proj_hidden),
-            nn.ReLU(inplace=True),
-            nn.Linear(proj_hidden, input_dim)
-        )
+        # 1. 投影头选择 (ERP vs 原版瓶颈 MLP)
+        if self.use_erp:
+            self.projection_head = ExpandedResidualProjector(
+                input_dim=input_dim,
+                hidden_dim=erp_hidden_dim,
+                output_dim=input_dim,
+                dropout=erp_dropout
+            )
+        else:
+            proj_hidden = 128
+            self.projection_head = nn.Sequential(
+                nn.Linear(input_dim, proj_hidden),
+                nn.ReLU(inplace=True),
+                nn.Linear(proj_hidden, input_dim)
+            )
 
-        # Learnable prototypes on hypersphere: [K*C, input_dim]
-        self.prototypes = nn.Parameter(torch.empty(self.total_prototypes, input_dim))
-        nn.init.xavier_uniform_(self.prototypes)
-        self.prototypes.data = F.normalize(self.prototypes.data, p=2, dim=1)
+        # 2. 原型生成器选择 (CCHP vs 静态 Parameter)
+        if self.use_cchp:
+            self.cchp = ContextConditionedHyperPrototypes(
+                num_classes=num_classes,
+                num_prototypes_per_class=num_prototypes_per_class,
+                input_dim=input_dim,
+                alpha_dyn=cchp_alpha
+            )
+        else:
+            self.prototypes = nn.Parameter(torch.empty(self.total_prototypes, input_dim))
+            nn.init.xavier_uniform_(self.prototypes)
+            self.prototypes.data = F.normalize(self.prototypes.data, p=2, dim=1)
+
+    def __getattr__(self, name):
+        if name == "prototypes":
+            modules = self.__dict__.get('_modules', {})
+            cchp = modules.get('cchp', None)
+            if cchp is not None and hasattr(cchp, 'prototypes'):
+                return cchp.prototypes
+        return super(PrototypeContrastiveLoss, self).__getattr__(name)
+
+    @property
+    def current_prototypes(self):
+        if self.use_cchp:
+            return self.cchp.prototypes
+        return self.prototypes
 
     def uniformity_loss(self, normalized_prototypes):
-        """K*C prototypes repulsion on hypersphere"""
-        sq_pdist = 2.0 - 2.0 * torch.matmul(
-            normalized_prototypes, normalized_prototypes.T
-        )
-        mask = torch.eye(
-            normalized_prototypes.size(0),
-            device=normalized_prototypes.device
-        ).bool()
-        sq_pdist = sq_pdist.masked_fill(mask, float('inf'))
-        return torch.logsumexp(-self.t_uniform * sq_pdist, dim=1).mean()
+        """原型超球面斥力正则"""
+        if normalized_prototypes.dim() == 3:
+            # [B, M, D] 批次动态原型: 在样本维度求平均
+            B, M, D = normalized_prototypes.size()
+            sq_pdist = 2.0 - 2.0 * torch.bmm(normalized_prototypes, normalized_prototypes.transpose(1, 2))
+            mask = torch.eye(M, device=normalized_prototypes.device).unsqueeze(0).expand(B, M, M).bool()
+            sq_pdist = sq_pdist.masked_fill(mask, float('inf'))
+            return torch.logsumexp(-self.t_uniform * sq_pdist, dim=-1).mean()
+        else:
+            # [M, D] 静态原型
+            sq_pdist = 2.0 - 2.0 * torch.matmul(normalized_prototypes, normalized_prototypes.T)
+            mask = torch.eye(normalized_prototypes.size(0), device=normalized_prototypes.device).bool()
+            sq_pdist = sq_pdist.masked_fill(mask, float('inf'))
+            return torch.logsumexp(-self.t_uniform * sq_pdist, dim=1).mean()
 
-    def forward(self, features, labels, tau=None):
+    def forward(self, features, labels, tau=None, ctx_repr=None):
         current_tau = tau if tau is not None else self.temperature
 
-        projected_features = self.projection_head(features)
+        # 1. 投影特征
+        if self.use_erp:
+            proj_norm = self.projection_head(features)  # ERP 输出已 L2 归一化
+        else:
+            projected = self.projection_head(features)
+            proj_norm = F.normalize(projected, p=2, dim=1)
 
-        proj_norm = F.normalize(projected_features, p=2, dim=1)  # [B, D]
-        proto_norm = F.normalize(self.prototypes, p=2, dim=1)    # [K*C, D]
+        # 2. 原型获取 (支持 CCHP 动态语境自适应)
+        reg_loss = torch.tensor(0.0, device=features.device)
+        if self.use_cchp:
+            proto_norm, reg_loss = self.cchp(ctx_repr=ctx_repr)
+        else:
+            proto_norm = F.normalize(self.prototypes, p=2, dim=1)
+
+        B = proj_norm.size(0)
+        batch_idx = torch.arange(B, device=labels.device)
+
+        # 3. 计算余弦相似度
+        if proto_norm.dim() == 3:
+            # [B, 1, D] x [B, D, M] -> [B, M]
+            all_sim = torch.bmm(proj_norm.unsqueeze(1), proto_norm.transpose(1, 2)).squeeze(1)
+        else:
+            # [B, D] x [D, M] -> [B, M]
+            all_sim = torch.matmul(proj_norm, proto_norm.T)
 
         if self.num_prototypes_per_class == 1:
-            # === K=1: backward-compatible single-prototype mode ===
-            logits = torch.matmul(proj_norm, proto_norm.T) / current_tau
+            logits = all_sim / current_tau
             loss_align = F.cross_entropy(logits, labels)
         else:
-            # === [V6 Trial 2] 多原型 Max-Cosine 动态指派与对比对齐 ===
             K = self.num_prototypes_per_class
             C = self.num_classes
-            B = proj_norm.size(0)
-            batch_idx = torch.arange(B, device=labels.device)
+            all_cosine = all_sim.view(B, C, K)
 
-            # 计算样本与全部 K*C 个原型的余弦相似度: [B, C*K] -> 重构为 [B, C, K]
-            all_cosine = torch.matmul(proj_norm, proto_norm.T).view(B, C, K)
+            target_cosines = all_cosine[batch_idx, labels]
+            best_pos_cosine, _ = target_cosines.max(dim=-1, keepdim=True)
 
-            # 正样本候选: 从目标真实类别的 K 个子原型中选取余弦相似度最大的子原型 (Max-Cosine 动态指派)
-            # m* = argmax_m cos(z_i, p_{y_i, m}),  p+ = p_{y_i, m*}
-            target_cosines = all_cosine[batch_idx, labels]  # [B, K]
-            best_pos_cosine, _ = target_cosines.max(dim=-1, keepdim=True)  # [B, 1]
-
-            # 负样本: 所有非目标真实类别的子原型 (共 (C - 1) * K 个)
             neg_mask = torch.ones(B, C, dtype=torch.bool, device=labels.device)
             neg_mask[batch_idx, labels] = False
-            neg_cosines = all_cosine[neg_mask].view(B, (C - 1) * K)  # [B, (C - 1) * K]
+            neg_cosines = all_cosine[neg_mask].view(B, (C - 1) * K)
 
-            # 拼接正负样本构建对比 Logits 矩阵: [B, 1 + (C - 1) * K]，其中第 0 列恒为正样本
             comp_logits = torch.cat([best_pos_cosine, neg_cosines], dim=-1) / current_tau
-
-            # 利用 PyTorch 原生 cross_entropy 的 Log-Sum-Exp 稳定性计算 InfoNCE 损失
             target_zeros = torch.zeros(B, dtype=torch.long, device=labels.device)
             loss_align = F.cross_entropy(comp_logits, target_zeros)
 
-        # Uniformity: all K*C prototypes repel each other
         loss_uni = self.uniformity_loss(proto_norm)
-
-        return loss_align + self.alpha_uni * loss_uni
-# ==============================================================
+        return loss_align + self.alpha_uni * loss_uni, reg_loss
 
 
 # ================= V6 Trial 1: 双层非线性残差情感分类头 =================
@@ -128,7 +323,6 @@ class ResidualEmotionHead(nn.Module):
     双层非线性残差情感分类头 (Residual Emotion Head):
     结构: LayerNorm -> Linear(d_in, d_hid) -> GELU -> Dropout -> Linear(d_hid, num_classes)
           + Linear(d_in, num_classes) 残差直连捷径 (Shortcut)
-    核心功能: 突破单层线性分类头 (nn.Linear) 在 32 类高维超球面上的几何分割容量天花板。
     """
     def __init__(self, input_dim, hidden_dim, num_classes, dropout=0.1):
         super(ResidualEmotionHead, self).__init__()
@@ -137,10 +331,8 @@ class ResidualEmotionHead(nn.Module):
         self.act = nn.GELU()
         self.dropout = nn.Dropout(dropout)
         self.fc2 = nn.Linear(hidden_dim, num_classes)
-        # 残差直连投影捷径 (Residual Shortcut)
         self.res_proj = nn.Linear(input_dim, num_classes)
 
-        # 显式参数正交/均匀初始化
         nn.init.xavier_uniform_(self.fc1.weight)
         nn.init.zeros_(self.fc1.bias)
         nn.init.xavier_uniform_(self.fc2.weight)
@@ -149,31 +341,18 @@ class ResidualEmotionHead(nn.Module):
         nn.init.zeros_(self.res_proj.bias)
 
     def forward(self, x):
-        """
-        前向传播:
-        x: [batch_size, input_dim] 细粒度情感表征向量
-        返回: logits [batch_size, num_classes] 未归一化概率得分
-        """
         norm_x = self.norm(x)
         h = self.fc2(self.dropout(self.act(self.fc1(norm_x))))
         res = self.res_proj(x)
         return h + res
-# =======================================================================
 
 
-# ================= V6 Trial 3: 原型交叉记忆注意力模块 (PCAM) =================
+# ================= PCAM: 原型交叉记忆注意力模块 (支持动态与静态原型) =================
 class PrototypeConditionedAttentionModule(nn.Module):
     """
     原型交叉记忆注意力模块 (Prototype-Conditioned Attention Module, PCAM):
-    定位: 解码器隐状态输出端与生成器 (Generator) 之间的自适应门控残差跨注意力桥梁。
-    核心目标: 打破 EPCL 训练出的全局原型矩阵与自回归解码器的“物理绝缘”，
-             使解码隐状态在自回归预测下一个词时能够动态 Query 原型流形，解决 Beam Search 多样性雪崩。
-    数学机制:
-        Q = H_dec * W_q,  K = P * W_k,  V = P * W_v
-        Attn = Softmax(Q K^T / sqrt(d_k))
-        H_proto = Attn * V * W_o
-        g = sigmoid(W_gate [H_dec; H_proto] + b_gate)  (b_gate 初始置为 -1.0 实现平滑暖启动)
-        H_out = LayerNorm(H_dec + g * H_proto)
+    定位: 解码器隐状态输出端与生成器之间的自适应门控残差跨注意力桥梁。
+    [V7 增强]: 原生兼容 2D 静态原型 [M, D] 与 3D 动态上下文原型 [B, M, D]。
     """
     def __init__(self, d_model=300, num_heads=2, dropout=0.1, gate_bias=-1.0):
         super(PrototypeConditionedAttentionModule, self).__init__()
@@ -183,7 +362,6 @@ class PrototypeConditionedAttentionModule(nn.Module):
         self.head_dim = d_model // num_heads
         self.scaling = self.head_dim ** -0.5
 
-        # 线性投影矩阵 Q, K, V, O
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
         self.v_proj = nn.Linear(d_model, d_model)
@@ -192,16 +370,12 @@ class PrototypeConditionedAttentionModule(nn.Module):
         self.attn_dropout = nn.Dropout(dropout)
         self.out_dropout = nn.Dropout(dropout)
 
-        # 自适应可学习通道门控融合层 (输入为 [H_dec; H_proto]，维度 2*d_model -> d_model)
         self.gate_linear = nn.Linear(2 * d_model, d_model)
-        # 初始化门控偏置为负值 (默认 -1.0)，实现平滑暖启动，初期原型影响平缓，不冲垮自回归 PPL
         nn.init.constant_(self.gate_linear.bias, gate_bias)
         nn.init.xavier_uniform_(self.gate_linear.weight, gain=0.1)
 
-        # 层归一化
         self.layer_norm = nn.LayerNorm(d_model)
 
-        # 投影参数正交/均匀初始化
         nn.init.xavier_uniform_(self.q_proj.weight)
         nn.init.zeros_(self.q_proj.bias)
         nn.init.xavier_uniform_(self.k_proj.weight)
@@ -214,45 +388,39 @@ class PrototypeConditionedAttentionModule(nn.Module):
     def forward(self, dec_output, prototypes):
         """
         前向传播:
-        dec_output: [batch_size, seq_len, d_model] 解码器输出隐状态
-        prototypes: [total_protos, d_model] 全局原型矩阵 (例如 64x300 或 32x300)
-        返回:
-        enhanced_output: [batch_size, seq_len, d_model] 经原型记忆强化的解码隐状态
+        dec_output: [bsz, seq_len, d_model] 解码器输出隐状态
+        prototypes: [k_protos, d_model] 或 [bsz, k_protos, d_model] 原型张量
+        返回: enhanced_output [bsz, seq_len, d_model]
         """
         bsz, seq_len, _ = dec_output.size()
-        k_protos, _ = prototypes.size()
 
-        # 1. 计算 Query (来自解码隐状态)
-        q = self.q_proj(dec_output) * self.scaling  # [bsz, seq_len, d_model]
-        # 2. 计算 Key, Value (来自原型矩阵)
-        k = self.k_proj(prototypes)                 # [k_protos, d_model]
-        v = self.v_proj(prototypes)                 # [k_protos, d_model]
+        # 1. 计算 Query
+        q = self.q_proj(dec_output) * self.scaling
+        q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)  # [bsz, heads, seq_len, head_dim]
 
-        # 3. 维度展开为多头形式
-        # q: [bsz, num_heads, seq_len, head_dim]
-        q = q.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
-        # k, v: [num_heads, k_protos, head_dim] -> 广播到 [bsz, num_heads, k_protos, head_dim]
-        k = k.view(k_protos, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0).expand(bsz, -1, -1, -1)
-        v = v.view(k_protos, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0).expand(bsz, -1, -1, -1)
+        # 2. 计算 Key, Value (自适应 2D / 3D 原型)
+        if prototypes.dim() == 2:
+            k_protos, _ = prototypes.size()
+            k = self.k_proj(prototypes).view(k_protos, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0).expand(bsz, -1, -1, -1)
+            v = self.v_proj(prototypes).view(k_protos, self.num_heads, self.head_dim).transpose(0, 1).unsqueeze(0).expand(bsz, -1, -1, -1)
+        else:
+            _, k_protos, _ = prototypes.size()
+            k = self.k_proj(prototypes).view(bsz, k_protos, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+            v = self.v_proj(prototypes).view(bsz, k_protos, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # 4. 计算注意力分数
-        # attn_weights: [bsz, num_heads, seq_len, k_protos]
+        # 3. 计算注意力权重 [bsz, heads, seq_len, k_protos]
         attn_weights = torch.matmul(q, k.transpose(-2, -1))
         attn_probs = F.softmax(attn_weights, dim=-1)
         attn_probs = self.attn_dropout(attn_probs)
 
-        # 5. 计算原型上下文表征
-        # context: [bsz, num_heads, seq_len, head_dim]
+        # 4. 计算原型上下文表征
         context = torch.matmul(attn_probs, v)
-        # 转置并合并多头: [bsz, seq_len, d_model]
         context = context.transpose(1, 2).contiguous().view(bsz, seq_len, self.d_model)
         h_proto = self.out_dropout(self.out_proj(context))
 
-        # 6. 自适应通道门控与残差融合 (使用 torch.sigmoid，杜绝 F.sigmoid)
-        gate_input = torch.cat([dec_output, h_proto], dim=-1)  # [bsz, seq_len, 2*d_model]
-        gate = torch.sigmoid(self.gate_linear(gate_input))     # [bsz, seq_len, d_model]
-
-        # 7. 残差连接与层归一化 (严禁原地操作，纯 out-of-place 计算)
+        # 5. 通道自适应门控与残差融合
+        gate_input = torch.cat([dec_output, h_proto], dim=-1)
+        gate = torch.sigmoid(self.gate_linear(gate_input))
         enhanced_output = self.layer_norm(dec_output + gate * h_proto)
         return enhanced_output
 # ==============================================================================
@@ -822,16 +990,27 @@ class CASE(nn.Module):
             self.emotion_linear = nn.Linear(config.emb_dim, self.emotion_num)
         
         # === EPCL Module Init ===
-        # [V6 Trial 2] Multi-Prototype: K sub-prototypes per class
+        # [V6 Trial 2 / V7] Multi-Prototype: K sub-prototypes per class
         self.num_prototypes_per_class = getattr(config, 'num_prototypes_per_class', 1)
         total_protos = self.emotion_num * self.num_prototypes_per_class
+        self.use_erp = getattr(config, 'use_erp', False)
+        self.use_cchp = getattr(config, 'use_cchp', False)
         self.epcl_criterion = PrototypeContrastiveLoss(
             self.emotion_num, config.emb_dim,
             num_prototypes_per_class=self.num_prototypes_per_class,
-            alpha_uni=getattr(config, 'alpha_uni', 1.0)
+            alpha_uni=getattr(config, 'alpha_uni', 1.0),
+            use_erp=self.use_erp,
+            erp_hidden_dim=getattr(config, 'erp_hidden_dim', 768),
+            erp_dropout=getattr(config, 'erp_dropout', 0.1),
+            use_cchp=self.use_cchp,
+            cchp_alpha=getattr(config, 'cchp_alpha', 0.1)
         )
+        if self.use_erp:
+            print(f"[V7 Architecture] 成功启用高维解缠残差投影头 (ERP): hidden={getattr(config, 'erp_hidden_dim', 768)}, dropout={getattr(config, 'erp_dropout', 0.1)}")
+        if self.use_cchp:
+            print(f"[V7 Architecture] 成功启用动态上下文条件超网络原型 (CCHP): alpha_dyn={getattr(config, 'cchp_alpha', 0.1)}")
         if self.num_prototypes_per_class > 1:
-            print(f"[V6 Trial 2] Multi-Prototype EPCL: {self.emotion_num} classes x {self.num_prototypes_per_class} sub-protos = {total_protos} total prototypes")
+            print(f"[V6/V7 Multi-Prototype] EPCL: {self.emotion_num} classes x {self.num_prototypes_per_class} sub-protos = {total_protos} total prototypes")
         self.emo_dropout = nn.Dropout(0.3)
         # [V4 Trial 8: MoP-DR] Router input dim = total_protos (32 when K=1, 64 when K=2)
         self.router_linear = nn.Linear(total_protos, config.emb_dim)
@@ -969,14 +1148,19 @@ class CASE(nn.Module):
             universal=config.universal,
         )
 
-    def apply_pcam(self, dec_output):
+    def apply_pcam(self, dec_output, ctx_repr=None):
         """
-        [V6 Trial 3: PCAM] 统一对解码器输出隐状态注入原型交叉记忆
+        [V6/V7 Architecture: PCAM] 统一对解码器输出隐状态注入原型交叉记忆
         dec_output: [bsz, seq_len, d_model] 解码器输出隐状态
+        ctx_repr: [bsz, d_model] 可选上下文表征 (用于 CCHP 动态原型生成)
         返回: 经 PCAM 增强后的隐状态 (若未启用 PCAM 则返回原张量)
         """
         if getattr(self, "use_pcam", False) and hasattr(self, "pcam") and hasattr(self, "epcl_criterion"):
-            return self.pcam(dec_output, self.epcl_criterion.prototypes)
+            if getattr(self.epcl_criterion, "use_cchp", False) and ctx_repr is not None:
+                protos, _ = self.epcl_criterion.cchp(ctx_repr=ctx_repr)
+            else:
+                protos = self.epcl_criterion.current_prototypes
+            return self.pcam(dec_output, protos)
         return dec_output
 
     def save_model(self, running_avg_ppl, iter):
@@ -1314,8 +1498,11 @@ class CASE(nn.Module):
             # [MoP-DR] Prototype dynamic routing (compatible with K*C prototypes)
             if self.dataset == "ED":
                 projected_features = self.epcl_criterion.projection_head(fine_emotion)
-                proj_norm = F.normalize(projected_features, p=2, dim=1)
-                proto_norm = F.normalize(self.epcl_criterion.prototypes.detach(), p=2, dim=1)
+                if getattr(self.epcl_criterion, "use_erp", False):
+                    proj_norm = projected_features
+                else:
+                    proj_norm = F.normalize(projected_features, p=2, dim=1)
+                proto_norm = F.normalize(self.epcl_criterion.current_prototypes.detach(), p=2, dim=1)
                 proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1  # [B, K*C]
                 
                 P_route = F.softmax(proto_logits, dim=-1)  # [B, K*C]
@@ -1334,11 +1521,13 @@ class CASE(nn.Module):
             max_epcl_step = 20000  # 对应 main.py 的 iters
             current_tau = tau_min + (tau_max - tau_min) * (1 + math.cos(math.pi * min(iter, max_epcl_step) / max_epcl_step)) / 2
 
-            # [v3 P3] 单锚点 EPCL 回滚
+            # [v3 P3 / V7] 单锚点 EPCL 与 CCHP 位移正则项计算
             if self.dataset == "ED" and train:
-                epcl_loss = self.epcl_criterion(fine_emotion, batch["program_label"], tau=current_tau)
+                ctx_repr_for_cchp = enc_outputs[:, 0, :] if getattr(self.epcl_criterion, 'use_cchp', False) else None
+                epcl_loss, cchp_reg_loss = self.epcl_criterion(fine_emotion, batch["program_label"], tau=current_tau, ctx_repr=ctx_repr_for_cchp)
             else:
                 epcl_loss = torch.tensor(0.0, device=config.device)
+                cchp_reg_loss = torch.tensor(0.0, device=config.device)
 
             # === EPCL: 分类头活性控制（冻结后关闭 CE 损失） ===
             emo_head_active = (not train) or (not is_currently_frozen)
@@ -1403,8 +1592,9 @@ class CASE(nn.Module):
                 concept_enc_mask=src_concept_mask.unsqueeze(1),
             )
         
-            # [V6 Trial 3: PCAM] 原型交叉记忆注意力注入
-            pre_logit = self.apply_pcam(pre_logit)
+            # [V6/V7 PCAM] 原型交叉记忆注意力注入
+            ctx_repr_for_pcam = enc_outputs[:, 0, :] if getattr(self.epcl_criterion, 'use_cchp', False) else None
+            pre_logit = self.apply_pcam(pre_logit, ctx_repr=ctx_repr_for_pcam)
 
             ## compute output dist
             logit = self.generator(
@@ -1443,10 +1633,22 @@ class CASE(nn.Module):
             else:
                 dec_emo_loss = torch.tensor(0.0, device=config.device)
         
+            # [V7 Phase 2] 序列级无似然训练损失 (Unlikelihood Training)
+            if getattr(config, 'use_unlikelihood', False) and train and self.dataset == "ED":
+                ul_loss = compute_unlikelihood_loss(logit, dec_batch, pad_idx=config.PAD_idx)
+            else:
+                ul_loss = torch.tensor(0.0, device=config.device)
+
             if self.dataset == "ED":
                 alpha_mim = config.alpha_mim  # [V5] 从命令行读取，默认 0.1（V4 Trial 8 基线值）
                 # [V5 Trial 3] div_weight 可通过 --div_weight 调节（默认 2.0x，V4 Trial 8 基线值）
-                loss = bow_loss + kl_loss + mim_loss + ctx_loss + config.div_weight * div_loss + emotion_loss + lambda_epcl * epcl_loss + alpha_mim * dec_emo_loss
+                cchp_reg_w = getattr(config, 'cchp_reg_weight', 0.01)
+                ul_weight = getattr(config, 'unlikelihood_weight', 0.1)
+                loss = (bow_loss + kl_loss + mim_loss + ctx_loss +
+                        config.div_weight * div_loss + emotion_loss +
+                        lambda_epcl * epcl_loss + alpha_mim * dec_emo_loss +
+                        cchp_reg_w * cchp_reg_loss +
+                        ul_weight * ul_loss)
             else:
                 loss = bow_loss + kl_loss + mim_loss + ctx_loss + 1.5 * div_loss + str_loss
             
@@ -1678,8 +1880,8 @@ class CASE(nn.Module):
                     concept_enc_mask=src_concept_mask.unsqueeze(1),
                 )
 
-            # [V6 Trial 3: PCAM] 原型交叉记忆注意力注入
-            out = self.apply_pcam(out)
+            # [V6/V7 PCAM] 原型交叉记忆注意力注入
+            out = self.apply_pcam(out, ctx_repr=enc_outputs[:, 0, :] if getattr(self.epcl_criterion, 'use_cchp', False) else None)
 
             prob = self.generator(
                 out, attn_dist, enc_batch_extend_vocab, extra_zeros, attn_dist_db=None
@@ -1889,8 +2091,8 @@ class CASE(nn.Module):
                     concept_enc_mask=src_concept_mask.unsqueeze(1),
                 )
 
-            # [V6 Trial 3: PCAM] 原型交叉记忆注意力注入
-            out = self.apply_pcam(out)
+            # [V6/V7 PCAM] 原型交叉记忆注意力注入
+            out = self.apply_pcam(out, ctx_repr=enc_outputs[:, 0, :] if getattr(self.epcl_criterion, 'use_cchp', False) else None)
 
             prob = self.generator(
                 out, attn_dist, enc_batch_extend_vocab, extra_zeros, attn_dist_db=None

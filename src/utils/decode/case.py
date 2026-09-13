@@ -140,9 +140,10 @@ class Translator(object):
                     concept_enc_mask=concept_enc_mask,
                 )
 
-                # [V6 Trial 3: PCAM] 原型交叉记忆注意力注入
+                # [V6/V7 PCAM] 原型交叉记忆注意力注入
                 if hasattr(self.model, "apply_pcam"):
-                    dec_output = self.model.apply_pcam(dec_output)
+                    ctx_repr = enc_output[:, 0, :] if enc_output is not None else None
+                    dec_output = self.model.apply_pcam(dec_output, ctx_repr=ctx_repr)
 
                 db_dist = None
 

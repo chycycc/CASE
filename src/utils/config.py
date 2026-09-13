@@ -82,7 +82,7 @@ def get_args():
     parser.add_argument("--seed", type=int, default=13)
     parser.add_argument("--model", type=str, default="case")
     parser.add_argument("--cuda", default=True, action="store_true")
-    parser.add_argument("--gpu", type=int, default=1)
+    parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--split_data_seed", type=int, default=13)
     
     parser.add_argument("--pretrain", default=True, action="store_true")
@@ -147,6 +147,24 @@ def get_args():
                         help="PCAM 交叉注意力的 Dropout 概率 (默认0.1)")
     parser.add_argument("--pcam_gate_bias", type=float, default=-1.0,
                         help="PCAM 自适应门控的初始偏置 (默认-1.0，实现平滑暖启动)")
+    
+    # V7 架构超参数: 高维解缠残差投影头 (ERP) 与动态超网络原型 (CCHP)
+    parser.add_argument("--use_erp", action="store_true", default=False,
+                        help="[V7] 是否启用高维解缠残差投影头 (Expanded Residual Projector)")
+    parser.add_argument("--erp_hidden_dim", type=int, default=768,
+                        help="[V7] ERP 高维解缠扩张隐藏层维度 (默认768)")
+    parser.add_argument("--erp_dropout", type=float, default=0.1,
+                        help="[V7] ERP 投影头 Dropout 比率")
+    parser.add_argument("--use_cchp", action="store_true", default=False,
+                        help="[V7] 是否启用动态上下文条件超网络原型 (Context-Conditioned Hyper-Prototypes)")
+    parser.add_argument("--cchp_alpha", type=float, default=0.1,
+                        help="[V7] CCHP 语境自适应残差位移幅度系数 (默认0.1)")
+    parser.add_argument("--cchp_reg_weight", type=float, default=0.01,
+                        help="[V7] CCHP 动态位移 L2 正则化惩罚权重 (防止平凡解与表征崩塌)")
+    parser.add_argument("--use_unlikelihood", action="store_true", default=False,
+                        help="[V7] 是否在训练端启用序列级无似然训练损失 (Unlikelihood Training)")
+    parser.add_argument("--unlikelihood_weight", type=float, default=0.1,
+                        help="[V7] 无似然训练损失权重 (默认0.1)")
     
     parser.add_argument("--test", default=False, action="store_true")
     parser.add_argument("--large_decoder", action="store_true")
