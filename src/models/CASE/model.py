@@ -188,15 +188,18 @@ def compute_unlikelihood_loss(log_probs, target_tokens, pad_idx=1):
 # ================= EPCL: 情感原型对比学习损失模块 =================
 class PrototypeContrastiveLoss(nn.Module):
     """
-    [V7 Upgraded] Multi-Prototype EPCL
+    [V8 Upgraded] Multi-Prototype / MCP EPCL
     集成:
     1. 高维解缠残差投影头 (ERP)
     2. 动态上下文条件超网络原型 (CCHP)
+    3. 动量样本中心原型 (MCP, Momentum Centroid Prototypes) [V8 核心]
     """
     def __init__(self, num_classes=32, input_dim=300, num_prototypes_per_class=1,
                  temperature=0.3, t_uniform=2.0, alpha_uni=1.0,
                  use_erp=False, erp_hidden_dim=768, erp_dropout=0.1,
-                 use_cchp=False, cchp_alpha=0.1):
+                 use_cchp=False, cchp_alpha=0.1,
+                 use_mcp=False, mcp_momentum=0.99,
+                 use_arc_margin=False, arc_margin=0.30, arc_mode='cos'):
         super(PrototypeContrastiveLoss, self).__init__()
         self.num_classes = num_classes
         self.num_prototypes_per_class = num_prototypes_per_class
@@ -205,7 +208,12 @@ class PrototypeContrastiveLoss(nn.Module):
         self.t_uniform = t_uniform
         self.alpha_uni = alpha_uni
         self.use_erp = use_erp
-        self.use_cchp = use_cchp
+        self.use_cchp = use_cchp and not use_mcp
+        self.use_mcp = use_mcp
+        self.mcp_momentum = mcp_momentum
+        self.use_arc_margin = use_arc_margin
+        self.arc_margin = arc_margin
+        self.arc_mode = arc_mode
 
         # 1. 投影头选择 (ERP vs 原版瓶颈 MLP)
         if self.use_erp:
@@ -223,8 +231,14 @@ class PrototypeContrastiveLoss(nn.Module):
                 nn.Linear(proj_hidden, input_dim)
             )
 
-        # 2. 原型生成器选择 (CCHP vs 静态 Parameter)
-        if self.use_cchp:
+        # 2. 原型生成器选择 (MCP vs CCHP vs 静态 Parameter)
+        if self.use_mcp:
+            # [V8 手术 1] 动量样本中心原型 (MCP)：注册为不可导 Buffer，完全由样本几何重心驱动
+            self.register_buffer("prototypes", torch.empty(self.total_prototypes, input_dim))
+            nn.init.normal_(self.prototypes, mean=0.0, std=1.0)
+            self.prototypes.data = F.normalize(self.prototypes.data, p=2, dim=1)
+            self.register_buffer("class_initialized", torch.zeros(self.total_prototypes, dtype=torch.bool))
+        elif self.use_cchp:
             self.cchp = ContextConditionedHyperPrototypes(
                 num_classes=num_classes,
                 num_prototypes_per_class=num_prototypes_per_class,
@@ -246,9 +260,42 @@ class PrototypeContrastiveLoss(nn.Module):
 
     @property
     def current_prototypes(self):
+        if self.use_mcp:
+            return self.prototypes
         if self.use_cchp:
             return self.cchp.prototypes
         return self.prototypes
+
+    def _update_mcp_prototypes(self, z, labels):
+        """
+        [V8 MCP] 动量样本中心原型 EMA 滚动更新
+        z: [B, D] 经过投影头并已 L2 归一化的特征向量
+        labels: [B] 真实情感类别标签
+        """
+        unique_labels = torch.unique(labels)
+        new_prototypes = self.prototypes.clone()
+        new_initialized = self.class_initialized.clone()
+
+        for c in unique_labels:
+            c_idx = c.item()
+            if c_idx >= self.total_prototypes:
+                continue
+            mask_c = (labels == c)
+            z_c = z[mask_c]  # [N_c, D]
+            v_c = z_c.mean(dim=0)  # [D] 当前批次样本几何重心
+            v_c_norm = F.normalize(v_c, p=2, dim=0)
+
+            if not new_initialized[c_idx]:
+                # 冷启动：首次捕获样本，直接赋给真实样本质心
+                new_prototypes[c_idx] = v_c_norm
+                new_initialized[c_idx] = True
+            else:
+                # EMA 指数平滑滚动更新: P_c = Normalize(μ * P_c + (1 - μ) * v_c)
+                updated_p = self.mcp_momentum * new_prototypes[c_idx] + (1.0 - self.mcp_momentum) * v_c_norm
+                new_prototypes[c_idx] = F.normalize(updated_p, p=2, dim=0)
+
+        self.prototypes.copy_(new_prototypes)
+        self.class_initialized.copy_(new_initialized)
 
     def uniformity_loss(self, normalized_prototypes):
         """原型超球面斥力正则"""
@@ -276,9 +323,14 @@ class PrototypeContrastiveLoss(nn.Module):
             projected = self.projection_head(features)
             proj_norm = F.normalize(projected, p=2, dim=1)
 
-        # 2. 原型获取 (支持 CCHP 动态语境自适应)
+        # 2. 原型获取与 [V8 MCP] 样本质心更新
         reg_loss = torch.tensor(0.0, device=features.device)
-        if self.use_cchp:
+        if self.use_mcp:
+            if self.training and labels is not None:
+                with torch.no_grad():
+                    self._update_mcp_prototypes(proj_norm, labels)
+            proto_norm = F.normalize(self.prototypes, p=2, dim=1)
+        elif self.use_cchp:
             proto_norm, reg_loss = self.cchp(ctx_repr=ctx_repr)
         else:
             proto_norm = F.normalize(self.prototypes, p=2, dim=1)
@@ -295,7 +347,31 @@ class PrototypeContrastiveLoss(nn.Module):
             all_sim = torch.matmul(proj_norm, proto_norm.T)
 
         if self.num_prototypes_per_class == 1:
-            logits = all_sim / current_tau
+            if getattr(self, "use_arc_margin", False) and self.arc_margin > 0.0 and self.training:
+                # [V8 手术 3] 加性硬边际 Arc-EPCL：仅在训练期对目标正类别施加加性硬间隔惩罚
+                margin_sim = all_sim.clone()
+                target_sim = margin_sim[batch_idx, labels]
+                if getattr(self, "arc_mode", "cos") == "angle":
+                    # 角域加性硬边际: cos(θ + m) = cos(θ)cos(m) - sin(θ)sin(m)
+                    cos_theta = target_sim.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+                    sin_theta = torch.sqrt((1.0 - cos_theta * cos_theta).clamp(min=1e-7))
+                    m = self.arc_margin
+                    cos_m = math.cos(m)
+                    sin_m = math.sin(m)
+                    cos_theta_m = cos_theta * cos_m - sin_theta * sin_m
+                    # 阈值防反转保护 (cos_theta > cos(pi - m) = -cos(m))
+                    threshold = math.cos(math.pi - m)
+                    margin_sim[batch_idx, labels] = torch.where(
+                        cos_theta > threshold,
+                        cos_theta_m,
+                        cos_theta - math.sin(m) * m
+                    )
+                else:
+                    # 余弦加性硬边际 (CosFace 形式): cos(θ) - m，平滑且极度数值稳定
+                    margin_sim[batch_idx, labels] = target_sim - self.arc_margin
+                logits = margin_sim / current_tau
+            else:
+                logits = all_sim / current_tau
             loss_align = F.cross_entropy(logits, labels)
         else:
             K = self.num_prototypes_per_class
@@ -308,6 +384,23 @@ class PrototypeContrastiveLoss(nn.Module):
             neg_mask = torch.ones(B, C, dtype=torch.bool, device=labels.device)
             neg_mask[batch_idx, labels] = False
             neg_cosines = all_cosine[neg_mask].view(B, (C - 1) * K)
+
+            if getattr(self, "use_arc_margin", False) and self.arc_margin > 0.0 and self.training:
+                if getattr(self, "arc_mode", "cos") == "angle":
+                    cos_theta = best_pos_cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
+                    sin_theta = torch.sqrt((1.0 - cos_theta * cos_theta).clamp(min=1e-7))
+                    m = self.arc_margin
+                    cos_m = math.cos(m)
+                    sin_m = math.sin(m)
+                    cos_theta_m = cos_theta * cos_m - sin_theta * sin_m
+                    threshold = math.cos(math.pi - m)
+                    best_pos_cosine = torch.where(
+                        cos_theta > threshold,
+                        cos_theta_m,
+                        cos_theta - math.sin(m) * m
+                    )
+                else:
+                    best_pos_cosine = best_pos_cosine - self.arc_margin
 
             comp_logits = torch.cat([best_pos_cosine, neg_cosines], dim=-1) / current_tau
             target_zeros = torch.zeros(B, dtype=torch.long, device=labels.device)
@@ -995,6 +1088,12 @@ class CASE(nn.Module):
         total_protos = self.emotion_num * self.num_prototypes_per_class
         self.use_erp = getattr(config, 'use_erp', False)
         self.use_cchp = getattr(config, 'use_cchp', False)
+        self.use_mcp = getattr(config, 'use_mcp', False)
+        self.mcp_momentum = getattr(config, 'mcp_momentum', 0.99)
+        self.use_arc_margin = getattr(config, 'use_arc_margin', False)
+        self.arc_margin = getattr(config, 'arc_margin', 0.30)
+        self.arc_mode = getattr(config, 'arc_mode', 'cos')
+        self.epcl_anchor = getattr(config, 'epcl_anchor', 'fine_emotion')
         self.epcl_criterion = PrototypeContrastiveLoss(
             self.emotion_num, config.emb_dim,
             num_prototypes_per_class=self.num_prototypes_per_class,
@@ -1002,13 +1101,30 @@ class CASE(nn.Module):
             use_erp=self.use_erp,
             erp_hidden_dim=getattr(config, 'erp_hidden_dim', 768),
             erp_dropout=getattr(config, 'erp_dropout', 0.1),
-            use_cchp=self.use_cchp,
-            cchp_alpha=getattr(config, 'cchp_alpha', 0.1)
+            use_cchp=self.use_cchp and not self.use_mcp,
+            cchp_alpha=getattr(config, 'cchp_alpha', 0.1),
+            use_mcp=self.use_mcp,
+            mcp_momentum=self.mcp_momentum,
+            use_arc_margin=self.use_arc_margin,
+            arc_margin=self.arc_margin,
+            arc_mode=self.arc_mode
         )
+        if self.use_mcp:
+            print(f"[V8 Architecture] 成功启用动量样本中心原型 (MCP): momentum={self.mcp_momentum}")
+        elif self.use_cchp:
+            print(f"[V7 Architecture] 成功启用动态上下文条件超网络原型 (CCHP): alpha_dyn={getattr(config, 'cchp_alpha', 0.1)}")
+        if self.use_arc_margin:
+            print(f"[V8 Architecture] 成功启用加性角度硬边际对比损失 (Arc-EPCL): margin={self.arc_margin}, mode={self.arc_mode}")
+        self.cls_anchor = getattr(config, 'cls_anchor', 'default')
+        if self.cls_anchor == 'default':
+            self.cls_anchor = self.epcl_anchor
+        self.soft_freeze = getattr(config, 'soft_freeze', False)
+        self.freeze_decay_weight = getattr(config, 'freeze_decay_weight', 0.05)
+        if self.soft_freeze:
+            print(f"[V8 Trial 4] 成功启用分类头时序软退火 (Soft Freeze): decay_weight={self.freeze_decay_weight}")
+        print(f"[V8 Trial 4] 情感分类头特征锚点: {self.cls_anchor} | EPCL 对比学习特征锚点: {self.epcl_anchor}")
         if self.use_erp:
             print(f"[V7 Architecture] 成功启用高维解缠残差投影头 (ERP): hidden={getattr(config, 'erp_hidden_dim', 768)}, dropout={getattr(config, 'erp_dropout', 0.1)}")
-        if self.use_cchp:
-            print(f"[V7 Architecture] 成功启用动态上下文条件超网络原型 (CCHP): alpha_dyn={getattr(config, 'cchp_alpha', 0.1)}")
         if self.num_prototypes_per_class > 1:
             print(f"[V6/V7 Multi-Prototype] EPCL: {self.emotion_num} classes x {self.num_prototypes_per_class} sub-protos = {total_protos} total prototypes")
         self.emo_dropout = nn.Dropout(0.3)
@@ -1125,16 +1241,21 @@ class CASE(nn.Module):
         self.actual_freeze_step = config.epcl_freeze_step
 
     def freeze_emo_head(self, step, best_state=None, best_step=None):
-        """[V5 Trial 4b: ACF-BCF] 冻结情感分类头，支持回滚至验证集历史最佳泛化权重并将退火起点锚定至 step"""
+        """[V5 Trial 4b / V8 Trial 4: ACF-BCF] 冻结/软退火情感分类头，支持回滚至验证集历史最佳泛化权重并将退火起点锚定至 step"""
         if not self.is_frozen and self.dataset == "ED":
             if best_state is not None:
                 self.emotion_linear.load_state_dict(best_state)
                 print(f"[Adaptive Freeze + BCF] 成功将分类头 emotion_linear 权重回滚至历史最佳状态 (Step {best_step})！")
-            for p in self.emotion_linear.parameters():
-                p.requires_grad = False
+            if not getattr(config, 'soft_freeze', False):
+                for p in self.emotion_linear.parameters():
+                    p.requires_grad = False
+                print(f"[Adaptive Freeze] Step {step}: 分类头 emotion_linear 已物理硬冻结，退火起点更新为 Step {step}！")
+            else:
+                for p in self.emotion_linear.parameters():
+                    p.requires_grad = True
+                print(f"[Adaptive Soft Freeze] Step {step}: 启用分类头时序软退火 (Soft Freeze, decay={getattr(config, 'freeze_decay_weight', 0.05)})，分类头参数保持温和微调更新！")
             self.is_frozen = True
             self.actual_freeze_step = step
-            print(f"[Adaptive Freeze] Step {step}: 分类头 emotion_linear 已物理冻结，退火起点更新为 Step {step}！")
 
     def make_encoder(self, emb_dim):
         return Encoder(
@@ -1514,6 +1635,29 @@ class CASE(nn.Module):
             
             emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
         
+            # [V8 手术 2 & 4] 特征挂载锚点选择 (Unified vs Decoupled Feature Anchors)
+            if getattr(self, "epcl_anchor", "fine_emotion") == "emotion_enc":
+                target_emotion_feat = emotion_enc
+            else:
+                target_emotion_feat = fine_emotion
+
+            cls_anchor = getattr(self, "cls_anchor", getattr(self, "epcl_anchor", "fine_emotion"))
+            if cls_anchor == "fine_emotion":
+                cls_emotion_feat = fine_emotion
+            elif cls_anchor == "emotion_enc":
+                cls_emotion_feat = emotion_enc
+            else:
+                cls_emotion_feat = target_emotion_feat
+
+            # 显式记录 target 表征投影 (供流形几何度量与可视化直接读取)
+            if hasattr(self, "epcl_criterion") and hasattr(self.epcl_criterion, "projection_head"):
+                with torch.no_grad():
+                    proj_temp = self.epcl_criterion.projection_head(target_emotion_feat)
+                    if getattr(self.epcl_criterion, "use_erp", False):
+                        self.current_projected_emotion = proj_temp
+                    else:
+                        self.current_projected_emotion = F.normalize(proj_temp, p=2, dim=1)
+
             # === EPCL: 原型对比学习损失计算 ===
             # [v3 P3] Temperature Annealing (余弦退火: 0.3 -> 0.1, 回滚单锚点)
             tau_max = 0.3
@@ -1521,15 +1665,15 @@ class CASE(nn.Module):
             max_epcl_step = 20000  # 对应 main.py 的 iters
             current_tau = tau_min + (tau_max - tau_min) * (1 + math.cos(math.pi * min(iter, max_epcl_step) / max_epcl_step)) / 2
 
-            # [v3 P3 / V7] 单锚点 EPCL 与 CCHP 位移正则项计算
+            # [v3 P3 / V7 / V8] 单锚点 EPCL 与 CCHP 位移正则项计算 (输入 target_emotion_feat)
             if self.dataset == "ED" and train:
                 ctx_repr_for_cchp = enc_outputs[:, 0, :] if getattr(self.epcl_criterion, 'use_cchp', False) else None
-                epcl_loss, cchp_reg_loss = self.epcl_criterion(fine_emotion, batch["program_label"], tau=current_tau, ctx_repr=ctx_repr_for_cchp)
+                epcl_loss, cchp_reg_loss = self.epcl_criterion(target_emotion_feat, batch["program_label"], tau=current_tau, ctx_repr=ctx_repr_for_cchp)
             else:
                 epcl_loss = torch.tensor(0.0, device=config.device)
                 cchp_reg_loss = torch.tensor(0.0, device=config.device)
 
-            # === EPCL: 分类头活性控制（冻结后关闭 CE 损失） ===
+            # === EPCL: 分类头活性控制（冻结后关闭或软退火 CE 损失） ===
             emo_head_active = (not train) or (not is_currently_frozen)
 
             # === EPCL: λ_epcl 线性预热调度 ===
@@ -1540,11 +1684,21 @@ class CASE(nn.Module):
 
             # emotion prediction（加入 Dropout 正则化）
             if self.dataset == "ED":
-                # 【V3-P4 架构解耦】仅将 fine_emotion 送入分类器，切断 CE 损失向 concept_enc 的回传
-                emotion_logits = self.emotion_linear(self.emo_dropout(fine_emotion))
+                # [V8 Trial 4] 分类头挂载至 cls_emotion_feat（支持与生成端双锚点解耦）
+                emotion_logits = self.emotion_linear(self.emo_dropout(cls_emotion_feat))
                 emotion_loss_raw = self.criterion_ce(emotion_logits, batch["program_label"])
-                # 冻结后 emo_loss 置零，仅由 EPCL 锚定特征空间
-                emotion_loss = emotion_loss_raw if emo_head_active else torch.tensor(0.0, device=config.device)
+                
+                if emo_head_active:
+                    emotion_loss = emotion_loss_raw
+                else:
+                    if getattr(config, 'soft_freeze', False):
+                        # [V8 Trial 4] 软退火：以超小衰减权重持续优化，消除后半程特征漂移
+                        decay_w = getattr(config, 'freeze_decay_weight', 0.05)
+                        emotion_loss = decay_w * emotion_loss_raw
+                    else:
+                        # 传统硬冻结：损失置零
+                        emotion_loss = torch.tensor(0.0, device=config.device)
+
                 pred_emotion = np.argmax(emotion_logits.detach().cpu().numpy(), axis=1)
                 emotion_acc = accuracy_score(batch["program_label"].detach().cpu().numpy(), pred_emotion)
         
@@ -1832,8 +1986,11 @@ class CASE(nn.Module):
         
         if self.dataset == "ED":
             projected_features = self.epcl_criterion.projection_head(fine_emotion)
-            proj_norm = F.normalize(projected_features, p=2, dim=1)
-            proto_norm = F.normalize(self.epcl_criterion.prototypes, p=2, dim=1)
+            if getattr(self.epcl_criterion, "use_erp", False):
+                proj_norm = projected_features
+            else:
+                proj_norm = F.normalize(projected_features, p=2, dim=1)
+            proto_norm = F.normalize(self.epcl_criterion.current_prototypes, p=2, dim=1)
             proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1  # [B, K*C]
             # [MoP-DR] Greedy decode routing (K*C compatible)
             P_route = F.softmax(proto_logits, dim=-1)  # [B, K*C]
@@ -2044,8 +2201,11 @@ class CASE(nn.Module):
         # 4. 原型路由 (MoP-DR)
         if self.dataset == "ED":
             projected_features = self.epcl_criterion.projection_head(fine_emotion)
-            proj_norm = F.normalize(projected_features, p=2, dim=1)
-            proto_norm = F.normalize(self.epcl_criterion.prototypes, p=2, dim=1)
+            if getattr(self.epcl_criterion, "use_erp", False):
+                proj_norm = projected_features
+            else:
+                proj_norm = F.normalize(projected_features, p=2, dim=1)
+            proto_norm = F.normalize(self.epcl_criterion.current_prototypes, p=2, dim=1)
             proto_logits = torch.matmul(proj_norm, proto_norm.T) / 0.1
             P_route = F.softmax(proto_logits, dim=-1)
             route_gate = torch.sigmoid(self.router_linear(P_route))

@@ -163,8 +163,25 @@ def get_args():
                         help="[V7] CCHP 动态位移 L2 正则化惩罚权重 (防止平凡解与表征崩塌)")
     parser.add_argument("--use_unlikelihood", action="store_true", default=False,
                         help="[V7] 是否在训练端启用序列级无似然训练损失 (Unlikelihood Training)")
-    parser.add_argument("--unlikelihood_weight", type=float, default=0.1,
-                        help="[V7] 无似然训练损失权重 (默认0.1)")
+    # V8 架构超参数: 动量样本中心原型 (MCP) 与加性角度硬边际 (Arc-EPCL)
+    parser.add_argument("--use_mcp", action="store_true", default=False,
+                        help="[V8] 是否启用动量样本中心原型 (Momentum Centroid Prototypes)")
+    parser.add_argument("--mcp_momentum", type=float, default=0.99,
+                        help="[V8] MCP 样本质心指数移动平均动量系数 (默认0.99)")
+    parser.add_argument("--use_arc_margin", action="store_true", default=False,
+                        help="[V8] 是否启用加性角度硬边际对比损失 (Arc-EPCL)")
+    parser.add_argument("--arc_margin", type=float, default=0.30,
+                        help="[V8] Arc-EPCL 加性角度硬边际 m (默认0.30)")
+    parser.add_argument("--arc_mode", type=str, default="cos", choices=["cos", "angle"],
+                        help="[V8] Arc-EPCL 硬边际计算模式 (cos: cos(θ)-m, angle: cos(θ+m))")
+    parser.add_argument("--epcl_anchor", type=str, default="fine_emotion", choices=["fine_emotion", "emotion_enc"],
+                        help="[V8] EPCL 对比学习特征挂载锚点 (默认 fine_emotion，支持统一挂载至 emotion_enc)")
+    parser.add_argument("--cls_anchor", type=str, default="default", choices=["default", "fine_emotion", "emotion_enc"],
+                        help="[V8 Trial 4] 情感分类头专属特征锚点 (default: 跟随 epcl_anchor, fine_emotion: 纯净情绪锚点, emotion_enc: 融合锚点)")
+    parser.add_argument("--soft_freeze", action="store_true", default=False,
+                        help="[V8 Trial 4] 是否启用分类头时序软退火 (Soft Freeze, 替代彻底置死为0的硬冻结)")
+    parser.add_argument("--freeze_decay_weight", type=float, default=0.05,
+                        help="[V8 Trial 4] 软退火期间分类损失衰减权重系数 (默认0.05)")
     
     parser.add_argument("--test", default=False, action="store_true")
     parser.add_argument("--large_decoder", action="store_true")
