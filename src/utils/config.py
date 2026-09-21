@@ -163,6 +163,8 @@ def get_args():
                         help="[V7] CCHP 动态位移 L2 正则化惩罚权重 (防止平凡解与表征崩塌)")
     parser.add_argument("--use_unlikelihood", action="store_true", default=False,
                         help="[V7] 是否在训练端启用序列级无似然训练损失 (Unlikelihood Training)")
+    parser.add_argument("--unlikelihood_weight", type=float, default=0.1,
+                        help="[V7 / V8.2 C] 序列级无似然训练损失权重 (默认0.1，V8.2 C 推荐 0.05)")
     # V8 架构超参数: 动量样本中心原型 (MCP) 与加性角度硬边际 (Arc-EPCL)
     parser.add_argument("--use_mcp", action="store_true", default=False,
                         help="[V8] 是否启用动量样本中心原型 (Momentum Centroid Prototypes)")
@@ -182,6 +184,67 @@ def get_args():
                         help="[V8 Trial 4] 是否启用分类头时序软退火 (Soft Freeze, 替代彻底置死为0的硬冻结)")
     parser.add_argument("--freeze_decay_weight", type=float, default=0.05,
                         help="[V8 Trial 4] 软退火期间分类损失衰减权重系数 (默认0.05)")
+    
+    # V8.1 双轨实验超参数: 词表层情感偏置注入 (路线 A) 与时序余弦软退火/复合早停 (路线 B)
+    parser.add_argument("--use_emo_bias", action="store_true", default=False,
+                        help="[V8.1 路线 A] 是否启用基于 KEMP 的词表层显式情感偏置注入 (Emotion-Aware Vocab Bias)")
+    parser.add_argument("--emo_bias_gate_init", type=float, default=-2.0,
+                        help="[V8.1 路线 A] 词表层情感偏置门控标量初始值 (默认 -2.0，对应 sigmoid(-2.0) 约 0.119)")
+    parser.add_argument("--disable_freeze", action="store_true", default=False,
+                        help="[V8.1 路线 A] 显式禁用任何阶段分类头冻结，保持全程联合微调 (requires_grad=True)")
+    parser.add_argument("--use_cosine_anneal", action="store_true", default=False,
+                        help="[V8.1 路线 B] 是否启用多任务辅助损失时序余弦平滑软退火")
+    parser.add_argument("--anneal_start_step", type=int, default=24000,
+                        help="[V8.1 路线 B] 余弦平滑退火起始步数 (默认 24000)")
+    parser.add_argument("--anneal_steps", type=int, default=16000,
+                        help="[V8.1 路线 B] 余弦平滑退火持续步长 (默认 16000，即 24k~40k 步平滑衰减)")
+    parser.add_argument("--anneal_min_weight", type=float, default=0.05,
+                        help="[V8.1 路线 B] 余弦退火最低下限权重 (默认 0.05，保持极微弱微调更新)")
+    # V8.2 破局架构方案超参数: 自适应拓扑稀疏掩码、PCGrad 梯度正交投影与动态门控预热
+    parser.add_argument("--use_sparse_emo_bias", action="store_true", default=False,
+                        help="[V8.2] 是否启用基于原型-词嵌入拓扑亲和度的自适应稀疏情感词表偏置")
+    parser.add_argument("--emo_vocab_topk_ratio", type=float, default=0.15,
+                        help="[V8.2] 自适应稀疏偏置保留的情感亲和词比例 (默认 0.15，即保留前 15% 情感词，85% 功能词零偏置)")
+    parser.add_argument("--use_pcgrad", action="store_true", default=False,
+                        help="[V8.2] 是否启用多任务冲突梯度正交投影器 (PCGrad)")
+    parser.add_argument("--gate_warmup_steps", type=int, default=20000,
+                        help="[V8.2] 情感偏置门控时序预热步数 (默认 20000，前 20k 步门控置冷锁定保护语言模型冷启动)")
+    parser.add_argument("--mask_update_interval", type=int, default=5000,
+                        help="[V8.2] 原型-词向量拓扑亲和度掩码动态刷新步频 (默认 5000 步更新一次)")
+    parser.add_argument("--patience", type=int, default=5,
+                        help="[V8.2 B] 早停最大容忍次数 (默认 5 次，即 10,000 步；V8.2 B 建议设为 12 次以保证退火完整走完)")
+    # V8.2 C 参数: 偏置门控时序余弦退火超参数
+    parser.add_argument("--use_bias_annealing", action="store_true", default=False,
+                        help="[V8.2 C] 是否启用解码端偏置门控时序余弦退火衰减 (后程平滑降噪)")
+    parser.add_argument("--bias_anneal_start", type=int, default=35000,
+                        help="[V8.2 C] 偏置门控余弦退火起始步数 (默认 35000)")
+    parser.add_argument("--bias_anneal_steps", type=int, default=15000,
+                        help="[V8.2 C] 偏置门控余弦退火衰减持续步长 (默认 15000)")
+    parser.add_argument("--bias_min_scale", type=float, default=0.2,
+                        help="[V8.2 C] 偏置门控衰减下限乘子 (默认 0.2，保留 20% 偏置防重复)")
+    
+    # V8.2 D 参数: 后半程动态情感损失权重线性提升与帕累托复合检查点遴选
+    parser.add_argument("--use_emo_loss_ramp", action="store_true", default=False,
+                        help="[V8.2 D] 是否启用后半程动态情感损失权重线性提升 (抵御生成任务梯度支配)")
+    parser.add_argument("--emo_loss_ramp_start", type=int, default=24000,
+                        help="[V8.2 D] 动态情感损失权重提升起始步数 (默认 24000)")
+    parser.add_argument("--emo_loss_ramp_steps", type=int, default=16000,
+                        help="[V8.2 D] 动态情感损失权重提升跨度步数 (默认 16000，24k~40k)")
+    parser.add_argument("--emo_loss_ramp_max", type=float, default=1.5,
+                        help="[V8.2 D] 动态情感损失权重提升上限乘子 (默认 1.5)")
+    parser.add_argument("--emo_loss_ramp_shape", type=str, default="linear",
+                        choices=["linear", "bell"],
+                        help="[V8.2 F] 动态情感损失权重变化形状 (linear: 单调递增, bell: 钟形余弦先升后降)")
+    parser.add_argument("--use_composite_score", action="store_true", default=False,
+                        help="[V8.1/V8.2 D] 是否启用验证集复合评分遴选检查点")
+    parser.add_argument("--composite_acc_weight", type=float, default=20.0,
+                        help="[V8.1] 复合评分中 EMO_acc 权衡权重 (默认 20.0)")
+    parser.add_argument("--composite_mode", type=str, default="acc", choices=["acc", "emo_loss"],
+                        help="[V8.2 D] 复合早停/评分模式 (acc: 传统 PPL-acc, emo_loss: 帕累托 PPL+alpha*EMO_loss)")
+    parser.add_argument("--composite_emo_loss_weight", type=float, default=3.5,
+                        help="[V8.2 D/E] 帕累托复合评分中 EMO_loss 权衡系数 alpha (默认 3.5)")
+    parser.add_argument("--min_save_step", type=int, default=0,
+                        help="[V8.2 E] 退火成熟保护期步数 (默认0，V8.2 E 推荐 32000，保护期内不累加早停耐心)")
     
     parser.add_argument("--test", default=False, action="store_true")
     parser.add_argument("--large_decoder", action="store_true")

@@ -354,6 +354,12 @@ class Translator(object):
             emo_gate = torch.sigmoid(self.model.emotion_gate(emotion_emb))
             emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
             
+            # [V8.1 路线 A] 解码端情感词表偏置投影更新 (基于 KEMP)
+            if getattr(self.model, 'use_emo_bias', False):
+                self.model.current_emo_vocab_bias = torch.sigmoid(self.model.emo_bias_gate) * self.model.emo_to_vocab(emotion_enc).unsqueeze(1)
+            else:
+                self.model.current_emo_vocab_bias = None
+            
             # Merge Context, Cognition-Affection-Strategy Signals
             if self.model.dataset == "ESConv":
                 ctx_enc_outputs = self.model.ctx_merge_lin(torch.cat((

@@ -238,6 +238,23 @@ class PrototypeContrastiveLoss(nn.Module):
             nn.init.normal_(self.prototypes, mean=0.0, std=1.0)
             self.prototypes.data = F.normalize(self.prototypes.data, p=2, dim=1)
             self.register_buffer("class_initialized", torch.zeros(self.total_prototypes, dtype=torch.bool))
+            
+            # [V8.2 架构规范] 梯度断链防御与透明度提示:
+            # MCP (Momentum Centroid Prototypes) 机制下，原型被显式设计为不可导常量 Buffer (register_buffer)，
+            # 严格由训练与测试样本投影点云的几何重心通过 EMA（指数移动平均）客观驱动。
+            # 传统超球面斥力 uniformity_loss 作用于不可导 Buffer 时，由于张量没有梯度计算图 (grad_fn=None)，
+            # 其反向传播梯度严格为 0，仅作为一个无意义的浮点常数加入总损失。
+            # 为避免死代码误导实验者，若配置了 alpha_uni > 0，在此发出明确架构告警并在 forward 中显式置零。
+            if self.alpha_uni > 0.0:
+                warn_msg = (
+                    f"[*] [架构规范警告] 当前启用 MCP 动量质心原型 (use_mcp=True)。"
+                    f"原型完全由样本特征重心驱动（属于不可导 Buffer），传统超球面均匀性损失 (uniformity_loss) "
+                    f"在此模式下无任何反向求导梯度 (grad_fn=None)！"
+                    f"配置的 alpha_uni={self.alpha_uni} 将在 forward 中被显式置零忽略。"
+                    f"若需要可导原型间斥力排斥，请切换至可学习参数原型 (use_mcp=False) 或动态超网络 (use_cchp=True)。"
+                )
+                print(warn_msg)
+                warnings.warn(warn_msg, UserWarning)
         elif self.use_cchp:
             self.cchp = ContextConditionedHyperPrototypes(
                 num_classes=num_classes,
@@ -298,7 +315,20 @@ class PrototypeContrastiveLoss(nn.Module):
         self.class_initialized.copy_(new_initialized)
 
     def uniformity_loss(self, normalized_prototypes):
-        """原型超球面斥力正则"""
+        """
+        超球面原型均匀分布斥力正则 (Uniformity Regularization):
+        参考论文: Wang & Isola, "Understanding Contrastive Representation Learning through Alignment and Uniformity on the Hypersphere", ICML 2020.
+        
+        【数学定义】
+        L_uniformity = log E_{i,j~i.i.d.} [ exp(-t * ||p_i - p_j||_2^2) ]
+        其物理本质是将所有归一化原型视为带电粒子，通过高斯核排斥势能推动原型在超球面上尽可能均匀铺开，
+        防止所有原型聚缩在一个狭窄的子流形区域（维度坍缩/信息熵过低）。
+
+        【工程与求导前提条件】
+        输入 `normalized_prototypes` 必须在 PyTorch 计算图中包含导数轨迹 (requires_grad=True)，
+        即其底层必须为 `nn.Parameter` 或动态超网络 (如 CCHP) 经由前向计算生成的张量。
+        若传入不可导张量 (如 MCP 中的 register_buffer)，由于其 grad_fn 为 None，反向传播求导时梯度恒为 0。
+        """
         if normalized_prototypes.dim() == 3:
             # [B, M, D] 批次动态原型: 在样本维度求平均
             B, M, D = normalized_prototypes.size()
@@ -406,7 +436,38 @@ class PrototypeContrastiveLoss(nn.Module):
             target_zeros = torch.zeros(B, dtype=torch.long, device=labels.device)
             loss_align = F.cross_entropy(comp_logits, target_zeros)
 
-        loss_uni = self.uniformity_loss(proto_norm)
+        # =========================================================================
+        # [V8.2 终局规范改造] 超球面均匀性损失 (uniformity_loss) 的梯度断链防御与显式置零
+        # =========================================================================
+        # 【架构理论复盘与逻辑排查】
+        # 1. 梯度断链的本质原因:
+        #    在 MCP 模式 (use_mcp=True) 下，self.prototypes 被注册为不可导 Buffer (register_buffer, requires_grad=False)。
+        #    其原型位置完全由样本投影特征点云的物理重心通过 EMA (动量累积) 推进。
+        #    如果直接调用 self.uniformity_loss(proto_norm)，返回的标量损失其 grad_fn 为 None。
+        #    将其乘上 self.alpha_uni 加入总损失后，反向传播对其求导得到的梯度严格为 0。
+        #    在 V8 系列早期实验中，该损失实际上仅作为一个无梯度的常数浮点数存在，未产生任何排斥约束力。
+        #
+        # 2. 为什么不宜采用替代方案 (不可行性论证):
+        #    (A) 方案一：为 MCP 原型恢复 requires_grad=True。
+        #        不可行。若既施加基于梯度的斥力更新，又在每个 batch 强行用 EMA 样本重心覆写，两者在流形上
+        #        会发生剧烈的方向拉扯（梯度试图推散，EMA 试图贴合样本），导致原型在超球面上剧烈抖动，
+        #        破坏 MCP 带来的 0.92+ 超高质心重合度 (Alignment)。
+        #    (B) 方案二：用当前 batch 内各类别的临时样本平均中心 z_c 代替原型计算均匀性损失。
+        #        不可行。当前 batch (B=4~8) 极小，单步最多只能覆盖 5~8 个情感类别，绝大多数类别在当前 batch
+        #        中样本数为 0。用局部不完整的样本中心计算斥力，方差极大，且只能提供破碎的局部斥力信号，
+        #        极易引发特征崩溃和训练发散。
+        #
+        # 3. 规范化工程决策 (死代码消除与零开销保障):
+        #    - 当 use_mcp=True 时，显式将 loss_uni 置为 torch.tensor(0.0, device=features.device)。
+        #      这彻底消除了 O(C^2 * D) 的无用矩阵配对计算开销，避免任何隐式死代码误导实验人员。
+        #    - 当 use_mcp=False 时 (如传统 nn.Parameter 静态原型或动态超网络 CCHP)，原型属于完全可导变量，
+        #      正常调用 self.uniformity_loss(proto_norm) 享受完整的超球面均匀排斥正则。
+        # =========================================================================
+        if self.use_mcp:
+            loss_uni = torch.tensor(0.0, device=features.device)
+        else:
+            loss_uni = self.uniformity_loss(proto_norm)
+
         return loss_align + self.alpha_uni * loss_uni, reg_loss
 
 
@@ -760,10 +821,12 @@ class Decoder(nn.Module):
 class Generator(nn.Module):
     "Define standard linear + softmax generation step."
 
-    def __init__(self, d_model, vocab):
+    def __init__(self, d_model, vocab, parent_model=None):
         super(Generator, self).__init__()
         self.proj = nn.Linear(d_model, vocab)
         self.p_gen_linear = nn.Linear(config.hidden_dim, 1)
+        # 使用 object.__setattr__ 避免 parent_model 注册为子模块引起循环引用
+        object.__setattr__(self, 'parent_model', parent_model)
 
     def forward(
         self,
@@ -774,6 +837,7 @@ class Generator(nn.Module):
         temp=1,
         beam_search=False,
         attn_dist_db=None,
+        emo_vocab_bias=None,
     ):
 
         if config.pointer_gen:
@@ -781,6 +845,20 @@ class Generator(nn.Module):
             alpha = torch.sigmoid(p_gen)
 
         logit = self.proj(x)
+
+        # [V8.1 路线 A] 注入基于 KEMP 的词表层情感偏置 (Emotion-Aware Vocab Bias)
+        bias = emo_vocab_bias
+        if bias is None and hasattr(self, 'parent_model') and self.parent_model is not None:
+            if getattr(self.parent_model, 'use_emo_bias', False):
+                bias = getattr(self.parent_model, 'current_emo_vocab_bias', None)
+        if bias is not None:
+            if bias.dim() == 2:
+                bias = bias.unsqueeze(1)
+            # 处理 beam search 时可能存在的 batch 维度不一致 (如 x 为 [B*beam, seq, V], bias 为 [B, 1, V])
+            if bias.size(0) != x.size(0) and bias.size(0) > 0 and x.size(0) % bias.size(0) == 0:
+                ratio = x.size(0) // bias.size(0)
+                bias = bias.repeat_interleave(ratio, dim=0)
+            logit = logit + bias
 
         if config.pointer_gen:
             vocab_dist = F.softmax(logit / temp, dim=2)
@@ -1193,7 +1271,42 @@ class CASE(nn.Module):
             )
             print(f"[V6 Architecture] 成功启用原型交叉记忆注意力模块 (PCAM): heads={getattr(config, 'pcam_heads', 2)}, dropout={getattr(config, 'pcam_dropout', 0.1)}, gate_bias={getattr(config, 'pcam_gate_bias', -1.0)}")
 
-        self.generator = Generator(config.hidden_dim, self.vocab_size)
+        self.generator = Generator(config.hidden_dim, self.vocab_size, parent_model=self)
+        
+        # [V8.1 / V8.2] 解码端情感词表偏置投影层与自适应稀疏掩码
+        self.use_emo_bias = getattr(config, 'use_emo_bias', False)
+        self.use_sparse_emo_bias = getattr(config, 'use_sparse_emo_bias', False)
+        self.emo_vocab_topk_ratio = getattr(config, 'emo_vocab_topk_ratio', 0.15)
+        self.gate_warmup_steps = getattr(config, 'gate_warmup_steps', 20000)
+        self.mask_update_interval = getattr(config, 'mask_update_interval', 5000)
+        self.use_pcgrad = getattr(config, 'use_pcgrad', False)
+        self.current_step = 0
+        
+        # [V8.2 C] 解码端偏置门控时序余弦退火超参数
+        self.use_bias_annealing = getattr(config, 'use_bias_annealing', False)
+        self.bias_anneal_start = getattr(config, 'bias_anneal_start', 35000)
+        self.bias_anneal_steps = getattr(config, 'bias_anneal_steps', 15000)
+        self.bias_min_scale = getattr(config, 'bias_min_scale', 0.2)
+        
+        # [V8.2 D/F] 后半程动态情感损失权重提升超参数
+        self.use_emo_loss_ramp = getattr(config, 'use_emo_loss_ramp', False)
+        self.emo_loss_ramp_start = getattr(config, 'emo_loss_ramp_start', 24000)
+        self.emo_loss_ramp_steps = getattr(config, 'emo_loss_ramp_steps', 16000)
+        self.emo_loss_ramp_max = getattr(config, 'emo_loss_ramp_max', 1.5)
+        self.emo_loss_ramp_shape = getattr(config, 'emo_loss_ramp_shape', 'linear')
+        
+        # 注册稀疏偏置掩码缓冲区 (默认全 1，启用稀疏后由 update_adaptive_vocab_mask 动态校准)
+        self.register_buffer("emo_vocab_mask", torch.ones(self.vocab_size))
+        
+        if self.use_emo_bias:
+            self.emo_to_vocab = nn.Linear(config.hidden_dim, self.vocab_size)
+            gate_init = getattr(config, 'emo_bias_gate_init', -2.0)
+            self.emo_bias_gate = nn.Parameter(torch.tensor(float(gate_init)))
+            self.current_emo_vocab_bias = None
+            print(f"[V8.1/V8.2/V8.2 C] 成功启用解码端情感词表偏置: hidden_dim={config.hidden_dim}, vocab_size={self.vocab_size}, gate_init={gate_init}, sparse={self.use_sparse_emo_bias} (ratio={self.emo_vocab_topk_ratio}), pcgrad={self.use_pcgrad}, bias_anneal={self.use_bias_annealing} (start={self.bias_anneal_start}, span={self.bias_anneal_steps}, min={self.bias_min_scale})")
+        else:
+            self.current_emo_vocab_bias = None
+
         self.activation = nn.Softmax(dim=1)
         self.tanh = nn.Tanh()
         self.dropout = nn.Dropout(config.dropout)
@@ -1295,8 +1408,16 @@ class CASE(nn.Module):
             self.model_dir,
             "CASE_{}_{:.4f}".format(iter, running_avg_ppl),
         )
+        old_path = getattr(self, 'best_path', None)
         self.best_path = model_save_path
         torch.save(state, model_save_path)
+        # 严格遵守单黄金权重保留红线，清理过时旧检查点
+        if old_path and os.path.exists(old_path) and old_path != model_save_path:
+            try:
+                os.remove(old_path)
+                print(f"[Disk Maintenance] 自动物理清除过时旧检查点: {old_path}")
+            except Exception as e:
+                print(f"[Disk Maintenance Warning] 清除旧检查点失败: {e}")
 
     def clean_preds(self, preds):
         res = []
@@ -1395,7 +1516,85 @@ class CASE(nn.Module):
         fine_mim_loss = cs_loss + react_loss
         return fine_mim_loss
     
+    @torch.no_grad()
+    def update_adaptive_vocab_mask(self):
+        """[V8.2 创新机制 1] 原型-词嵌入拓扑亲和度掩码自适应更新
+        无需外部静态词典，基于超球面几何余弦亲和度自动诱导稀疏掩码，使 85% 功能词 Zero-Mask"""
+        if not getattr(self, 'use_sparse_emo_bias', False):
+            return
+        
+        # 1. 提取原型矩阵 P (C, D)
+        prototypes = None
+        if hasattr(self, "epcl_criterion"):
+            prototypes = getattr(self.epcl_criterion, "current_prototypes", None)
+            if prototypes is None:
+                prototypes = getattr(self.epcl_criterion, "prototypes", None)
+        if prototypes is None:
+            if hasattr(self.emotion_linear, "weight"):
+                prototypes = self.emotion_linear.weight
+            elif hasattr(self.emotion_linear, "fc2") and hasattr(self.emotion_linear.fc2, "weight"):
+                prototypes = self.emotion_linear.fc2.weight
+            else:
+                prototypes = torch.randn(getattr(config, 'emotion_num', 32), getattr(config, 'hidden_dim', 300), device=self.embedding.lut.weight.device)
+        
+        # 2. 提取词嵌入矩阵 E (V, D) 并对齐设备
+        emb_weights = self.embedding.lut.weight  # [V, D]
+        if prototypes.device != emb_weights.device:
+            prototypes = prototypes.to(emb_weights.device)
+        
+        # 3. 超球面归一化与亲和力计算
+        emb_norm = F.normalize(emb_weights, p=2, dim=-1)
+        proto_norm = F.normalize(prototypes, p=2, dim=-1)
+        sim_matrix = torch.matmul(emb_norm, proto_norm.t())  # [V, C]
+        max_sim, _ = torch.max(sim_matrix, dim=-1)           # [V]
+        
+        # 4. Top-K 分位数截断
+        k = max(1, int(math.ceil(self.vocab_size * self.emo_vocab_topk_ratio)))
+        topk_vals, _ = torch.topk(max_sim, k=k)
+        threshold = topk_vals[-1]
+        new_mask = (max_sim >= threshold).float()
+        
+        # 5. 特殊保留 token 严格排除保护 (PAD, EOS, SOS, USR, SYS, CLS 等)
+        special_tokens = [
+            getattr(config, 'PAD_idx', 1),
+            getattr(config, 'EOS_idx', 2),
+            getattr(config, 'SOS_idx', 3),
+            getattr(config, 'USR_idx', 4),
+            getattr(config, 'SYS_idx', 5),
+            getattr(config, 'CLS_idx', 6),
+        ]
+        for tok in special_tokens:
+            if tok < self.vocab_size:
+                new_mask[tok] = 0.0
+                
+        self.emo_vocab_mask.copy_(new_mask)
+    
+    def get_bias_scale(self):
+        """[V8.2 C 核心机制] 计算解码端偏置门控的时序平滑余弦退火衰减因子 w_bias
+        当 step <= bias_anneal_start (默认 35000) 时，保持 1.0 全额注入；
+        当 step > bias_anneal_start 时，采用半周期余弦曲线平滑衰减至 bias_min_scale (默认 0.2)。
+        消除自回归生成在后程由于偏置带来的概率底噪扰动，同时保留 20% 偏置下限压制退化短语重复。
+        """
+        if not getattr(self, 'use_bias_annealing', False):
+            return 1.0
+        step = getattr(self, 'current_step', 999999)
+        start_step = getattr(self, 'bias_anneal_start', 35000)
+        span_steps = getattr(self, 'bias_anneal_steps', 15000)
+        min_scale = getattr(self, 'bias_min_scale', 0.2)
+        if step <= start_step:
+            return 1.0
+        progress = min(1.0, float(step - start_step) / float(span_steps))
+        cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+        scale = min_scale + (1.0 - min_scale) * cosine_decay
+        return scale
+    
     def train_one_batch(self, batch, iter, train=True):
+        if train:
+            self.current_step = iter
+        if train and getattr(self, 'use_sparse_emo_bias', False):
+            if iter == 0 or (iter + 1) % getattr(self, 'mask_update_interval', 5000) == 0:
+                self.update_adaptive_vocab_mask()
+
         accum_steps = 4
         (
             enc_batch,
@@ -1410,8 +1609,10 @@ class CASE(nn.Module):
         enc_vad_batch = batch["context_vad"]
         dec_batch, _, _, _, _ = get_output_from_batch(batch)
         
-        # [V5 Trial 4] 确定当前是否已处于冻结期（支持自适应 ACF 机制与固定步数回退）
-        if config.adaptive_freeze:
+        # [V5 Trial 4 / V8.1] 确定当前是否已处于冻结期（路线 A 支持 disable_freeze 彻底禁用冻结）
+        if getattr(config, 'disable_freeze', False):
+            is_currently_frozen = False
+        elif config.adaptive_freeze:
             is_currently_frozen = self.is_frozen
             # 若开启自适应，但步数已达 max_freeze_step 且仍未冻结，强制自适应冻结兜底
             if train and not self.is_frozen and iter >= config.max_freeze_step and self.dataset == "ED":
@@ -1634,6 +1835,25 @@ class CASE(nn.Module):
                 emo_gate = static_gate
             
             emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
+            
+            # [V8.1 / V8.2 / V8.2 C] 解码端情感词表偏置投影更新 (结合动态时序预热门控、自适应拓扑稀疏掩码与后程平滑余弦衰减)
+            if self.use_emo_bias:
+                current_iter = getattr(self, "current_step", 999999)
+                if train and current_iter < getattr(self, "gate_warmup_steps", 20000):
+                    gate_factor = torch.sigmoid(torch.tensor(-5.0, device=emotion_enc.device))
+                else:
+                    gate_factor = torch.sigmoid(self.emo_bias_gate)
+                
+                # [V8.2 C] 融合后程平滑余弦衰减因子
+                bias_scale = self.get_bias_scale()
+                raw_bias = (gate_factor * bias_scale) * self.emo_to_vocab(emotion_enc).unsqueeze(1)
+                if getattr(self, 'use_sparse_emo_bias', False):
+                    # [V8.2 创新 1] 稀疏拓扑亲和度掩码: 仅允许前 15% 情感实词注入偏置，85% 功能词严格 Zero-Mask
+                    self.current_emo_vocab_bias = raw_bias * self.emo_vocab_mask.unsqueeze(0).unsqueeze(0)
+                else:
+                    self.current_emo_vocab_bias = raw_bias
+            else:
+                self.current_emo_vocab_bias = None
         
             # [V8 手术 2 & 4] 特征挂载锚点选择 (Unified vs Decoupled Feature Anchors)
             if getattr(self, "epcl_anchor", "fine_emotion") == "emotion_enc":
@@ -1688,7 +1908,18 @@ class CASE(nn.Module):
                 emotion_logits = self.emotion_linear(self.emo_dropout(cls_emotion_feat))
                 emotion_loss_raw = self.criterion_ce(emotion_logits, batch["program_label"])
                 
-                if emo_head_active:
+                # [V8.1 路线 B] 多任务辅助损失时序平滑余弦退火 (Soft Loss Annealing)
+                if getattr(config, 'use_cosine_anneal', False):
+                    if train and iter >= getattr(config, 'anneal_start_step', 24000):
+                        anneal_steps = getattr(config, 'anneal_steps', 16000)
+                        min_w = getattr(config, 'anneal_min_weight', 0.05)
+                        progress = min((iter - config.anneal_start_step) / float(anneal_steps), 1.0)
+                        soft_w = min_w + (1.0 - min_w) * 0.5 * (1.0 + math.cos(math.pi * progress))
+                    else:
+                        soft_w = 1.0
+                    emotion_loss = soft_w * emotion_loss_raw
+                    lambda_epcl = soft_w * lambda_epcl
+                elif emo_head_active:
                     emotion_loss = emotion_loss_raw
                 else:
                     if getattr(config, 'soft_freeze', False):
@@ -1699,8 +1930,26 @@ class CASE(nn.Module):
                         # 传统硬冻结：损失置零
                         emotion_loss = torch.tensor(0.0, device=config.device)
 
+                # [V8.2 D/F] 后半程动态情感损失权重提升 (支持线性递增与钟形余弦两种形状)
+                if getattr(self, 'use_emo_loss_ramp', False) and train:
+                    ramp_start = getattr(self, 'emo_loss_ramp_start', 24000)
+                    ramp_steps = getattr(self, 'emo_loss_ramp_steps', 16000)
+                    ramp_max = getattr(self, 'emo_loss_ramp_max', 1.5)
+                    ramp_shape = getattr(self, 'emo_loss_ramp_shape', 'linear')
+                    if iter >= ramp_start:
+                        progress = min(1.0, float(iter - ramp_start) / float(ramp_steps))
+                        if ramp_shape == 'bell':
+                            # [V8.2 F] 钟形余弦: 中段(progress=0.5)达峰值ramp_max, 两端回归1.0
+                            # sin(π * progress) 在 0→0.5 攀升, 0.5→1.0 回落
+                            emo_w = 1.0 + (ramp_max - 1.0) * math.sin(math.pi * progress)
+                        else:
+                            # [V8.2 D] 原始线性单调递增
+                            emo_w = 1.0 + (ramp_max - 1.0) * progress
+                        emotion_loss = emo_w * emotion_loss
+
                 pred_emotion = np.argmax(emotion_logits.detach().cpu().numpy(), axis=1)
                 emotion_acc = accuracy_score(batch["program_label"].detach().cpu().numpy(), pred_emotion)
+                self.current_pred_emotion = pred_emotion
         
             # Merge Context, Cognition-Affection-Strategy Signals
             if self.dataset == "ESConv":
@@ -1798,28 +2047,80 @@ class CASE(nn.Module):
                 # [V5 Trial 3] div_weight 可通过 --div_weight 调节（默认 2.0x，V4 Trial 8 基线值）
                 cchp_reg_w = getattr(config, 'cchp_reg_weight', 0.01)
                 ul_weight = getattr(config, 'unlikelihood_weight', 0.1)
-                loss = (bow_loss + kl_loss + mim_loss + ctx_loss +
-                        config.div_weight * div_loss + emotion_loss +
-                        lambda_epcl * epcl_loss + alpha_mim * dec_emo_loss +
-                        cchp_reg_w * cchp_reg_loss +
-                        ul_weight * ul_loss)
+                
+                loss_gen = (bow_loss + kl_loss + mim_loss + ctx_loss +
+                            config.div_weight * div_loss + ul_weight * ul_loss)
+                loss_emo = (emotion_loss + lambda_epcl * epcl_loss +
+                            alpha_mim * dec_emo_loss + cchp_reg_w * cchp_reg_loss)
+                loss = loss_gen + loss_emo
             else:
                 loss = bow_loss + kl_loss + mim_loss + ctx_loss + 1.5 * div_loss + str_loss
             
         if train:
-            self.scaler.scale(loss).backward()
+            if getattr(self, 'use_pcgrad', False) and self.dataset == "ED":
+                # [V8.2 创新机制 2: PCGrad 多任务对抗梯度正交投影]
+                # 1. 计算自回归语言生成核心任务梯度
+                self.scaler.scale(loss_gen).backward(retain_graph=True)
+                grads_gen = {p: p.grad.clone() for p in self.parameters() if p.grad is not None}
+                
+                # 清除当前梯度缓存以隔离第二任务
+                for p in self.parameters():
+                    p.grad = None
+                
+                # 2. 计算辅助情感分类/原型对比学习任务梯度
+                self.scaler.scale(loss_emo).backward()
+                grads_emo = {p: p.grad.clone() for p in self.parameters() if p.grad is not None}
+                
+                # 3. 共有参数上的负内积冲突检测与标准对称双向正交投影 (Symmetric PCGrad)
+                shared_params = [p for p in grads_gen if p in grads_emo]
+                if shared_params:
+                    dot_prod = sum(torch.sum(grads_gen[p] * grads_emo[p]) for p in shared_params)
+                    if dot_prod < 0:
+                        norm_gen_sq = sum(torch.sum(grads_gen[p] * grads_gen[p]) for p in shared_params)
+                        norm_emo_sq = sum(torch.sum(grads_emo[p] * grads_emo[p]) for p in shared_params)
+                        coeff_emo = dot_prod / (norm_gen_sq + 1e-8)
+                        coeff_gen = dot_prod / (norm_emo_sq + 1e-8)
+                        for p in shared_params:
+                            # 相互投影至对方的法平面，Out-of-place 计算避免交叉污染
+                            proj_emo = grads_emo[p] - coeff_emo * grads_gen[p]
+                            proj_gen = grads_gen[p] - coeff_gen * grads_emo[p]
+                            grads_emo[p] = proj_emo
+                            grads_gen[p] = proj_gen
+                
+                # 4. 组装合并正交化后的无冲突梯度
+                all_params = set(grads_gen.keys()).union(set(grads_emo.keys()))
+                for p in all_params:
+                    g_gen = grads_gen.get(p, None)
+                    g_emo = grads_emo.get(p, None)
+                    if g_gen is not None and g_emo is not None:
+                        p.grad = g_gen + g_emo
+                    elif g_gen is not None:
+                        p.grad = g_gen
+                    elif g_emo is not None:
+                        p.grad = g_emo
+            else:
+                self.scaler.scale(loss).backward()
+
             if (iter + 1) % accum_steps == 0:
                 self.scaler.step(self.optimizer.optimizer if config.noam else self.optimizer)
                 self.scaler.update()
             
-            # [V4 Trial 8 / V5 Trial 4] 冻结后 LR 衰减：从当前 LR (~3.125e-4) 衰减至 ~1e-5
-            # 主训练阶段 scaler.step() 绕过了 NoamOpt，LR 恒定不变，此处手动干预衰减
-            # [V5 Trial 1] 支持 linear(线性) / cosine(余弦退火) 两种衰减策略
-            # [V5 Trial 4] 自适应冻结动态对齐退火起点 freeze_anchor
-            freeze_anchor = self.actual_freeze_step if config.adaptive_freeze else config.epcl_freeze_step
-            if config.noam and is_currently_frozen and iter > freeze_anchor:
+            # [V8.2 B 关键修复] 学习率退火与冻结逻辑解绑：
+            # 无论是否冻结分类头，只要达到退火起始点，强制执行余弦/线性学习率衰减 (从 ~3.125e-4 降至 ~1e-5)
+            # 在 --disable_freeze (全程联合微调) 下，以 anneal_start_step (默认 24000) 为退火起点；
+            # 在冻结模式下，以 freeze_anchor 为退火起点。
+            if getattr(config, 'disable_freeze', False):
+                decay_start = getattr(config, 'anneal_start_step', 24000)
+                should_decay = (iter > decay_start)
+                decay_origin = decay_start
+            else:
+                freeze_anchor = self.actual_freeze_step if config.adaptive_freeze else config.epcl_freeze_step
+                should_decay = (is_currently_frozen and iter > freeze_anchor)
+                decay_origin = freeze_anchor
+
+            if config.noam and should_decay:
                 total_decay_steps = 22000.0  # 退火跨度（约 22k 步平滑衰减至 1e-5）
-                progress = min((iter - freeze_anchor) / total_decay_steps, 1.0)
+                progress = min((iter - decay_origin) / total_decay_steps, 1.0)
                 base_lr = self.optimizer._rate if self.optimizer._rate > 0 else 3.125e-4
                 lr_min = base_lr * 0.03  # 最低 LR ≈ 1e-5
 
@@ -2001,6 +2302,17 @@ class CASE(nn.Module):
             emo_gate = static_gate
             
         emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
+        
+        # [V8.1 / V8.2 / V8.2 C] 解码端情感词表偏置投影更新 (基于 KEMP + 拓扑稀疏掩码 + 时序平滑衰减)
+        if self.use_emo_bias:
+            bias_scale = self.get_bias_scale()
+            raw_bias = (torch.sigmoid(self.emo_bias_gate) * bias_scale) * self.emo_to_vocab(emotion_enc).unsqueeze(1)
+            if getattr(self, 'use_sparse_emo_bias', False):
+                self.current_emo_vocab_bias = raw_bias * self.emo_vocab_mask.unsqueeze(0).unsqueeze(0)
+            else:
+                self.current_emo_vocab_bias = raw_bias
+        else:
+            self.current_emo_vocab_bias = None
         
         # Merge Context, Cognition-Affection-Strategy Signals
         if self.dataset == "ESConv":
@@ -2214,6 +2526,17 @@ class CASE(nn.Module):
             emo_gate = static_gate
             
         emotion_enc = emo_gate * concept_enc + (1 - emo_gate) * fine_emotion
+        
+        # [V8.1 / V8.2 / V8.2 C] 解码端情感词表偏置投影更新 (基于 KEMP + 拓扑稀疏掩码 + 时序平滑衰减)
+        if self.use_emo_bias:
+            bias_scale = self.get_bias_scale()
+            raw_bias = (torch.sigmoid(self.emo_bias_gate) * bias_scale) * self.emo_to_vocab(emotion_enc).unsqueeze(1)
+            if getattr(self, 'use_sparse_emo_bias', False):
+                self.current_emo_vocab_bias = raw_bias * self.emo_vocab_mask.unsqueeze(0).unsqueeze(0)
+            else:
+                self.current_emo_vocab_bias = raw_bias
+        else:
+            self.current_emo_vocab_bias = None
         
         # 5. 上下文融合 (Context Merge)
         if self.dataset == "ESConv":

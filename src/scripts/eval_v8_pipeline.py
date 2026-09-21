@@ -131,12 +131,13 @@ def maintain_disk(save_dir, dry_run=False):
 
 
 def load_v8_model(checkpoint_path, batch_size=16, use_mcp=True, use_erp=True, use_unlikelihood=True,
-                  epcl_anchor="fine_emotion", cls_anchor="default", use_arc_margin=False, arc_margin=0.30):
+                  epcl_anchor="fine_emotion", cls_anchor="default", use_arc_margin=False, arc_margin=0.30,
+                  use_emo_bias=False, use_sparse_emo_bias=False, emo_vocab_topk_ratio=0.15, bias_min_scale=0.15):
     """
-    按 V8 架构标准配置加载词表、数据集与黄金权重模型
+    按 V8/V8.1/V8.2 架构标准配置加载词表、数据集与黄金权重模型
     """
     print(f"\n=======================================================")
-    print(f"  [Step 2/5] 载入 V8 架构模型与测试集: {checkpoint_path}")
+    print(f"  [Step 2/5] 载入 V8/V8.1/V8.2 架构模型与测试集: {checkpoint_path}")
     print(f"=======================================================")
 
     config.dataset = "ED"
@@ -164,6 +165,16 @@ def load_v8_model(checkpoint_path, batch_size=16, use_mcp=True, use_erp=True, us
     
     config.use_unlikelihood = use_unlikelihood
     config.unlikelihood_weight = 0.1
+    
+    # [V8.1 / V8.2 / V8.2 C / V8.2 E] 词表层情感偏置注入、自适应稀疏掩码与时序退火
+    config.use_emo_bias = use_emo_bias
+    config.use_sparse_emo_bias = use_sparse_emo_bias
+    config.emo_vocab_topk_ratio = emo_vocab_topk_ratio
+    config.emo_bias_gate_init = -2.0
+    config.use_bias_annealing = True
+    config.bias_anneal_start = 24000
+    config.bias_anneal_steps = 10000
+    config.bias_min_scale = bias_min_scale
     
     config.test = True
     config.model = "case"
@@ -195,6 +206,17 @@ def load_v8_model(checkpoint_path, batch_size=16, use_mcp=True, use_erp=True, us
 
     model.eval()
     model.is_eval = True
+    
+    # [V8.2 C] 从检查点文件名识别训练保存 Step 赋给 model.current_step，对齐偏置衰减
+    fname = os.path.basename(checkpoint_path)
+    parts = fname.split("_")
+    if len(parts) >= 2 and parts[1].isdigit():
+        model.current_step = int(parts[1])
+        print(f"[*] [V8.2 C] 成功恢复模型保存 Step={model.current_step}，对应偏置退火因子 w_bias={model.get_bias_scale():.4f}")
+    
+    if getattr(config, 'use_sparse_emo_bias', False):
+        print(f"[*] [V8.2] 正在依据模型权重刷新原型-词向量自适应稀疏偏置掩码...")
+        model.update_adaptive_vocab_mask()
     print(f"[+] 模型与数据集加载就绪！")
     return model, vocab, test_set
 
@@ -420,6 +442,7 @@ def evaluate_generation_diversity(model, vocab, test_set, num_samples=500):
     greedy_cands = []
     beam_cands = []
     sampling_cands = []
+    sampling_08_cands = []
 
     total_target = num_samples if (num_samples > 0 and num_samples <= len(test_set_single)) else len(test_set_single)
     count = 0
@@ -441,6 +464,10 @@ def evaluate_generation_diversity(model, vocab, test_set, num_samples=500):
             sent_s = model.decoder_sampling(batch, max_dec_step=40, temp=0.7, top_p=0.9)
             sampling_cands.append(sent_s[0])
 
+            # 4. [V8.2 C] Nucleus Sampling (T=0.8, p=0.9)
+            sent_s08 = model.decoder_sampling(batch, max_dec_step=40, temp=0.8, top_p=0.9)
+            sampling_08_cands.append(sent_s08[0])
+
     def summarize_cands(cands):
         d1 = calc_distinct_n(1, cands)
         d2 = calc_distinct_n(2, cands)
@@ -457,16 +484,19 @@ def evaluate_generation_diversity(model, vocab, test_set, num_samples=500):
     greedy_res = summarize_cands(greedy_cands)
     beam_res = summarize_cands(beam_cands)
     sampling_res = summarize_cands(sampling_cands)
+    sampling_08_res = summarize_cands(sampling_08_cands)
 
     print(f"[+] 多样性解码评测完成:")
-    print(f"    - Greedy      : Dist-1={greedy_res['Dist-1']}%, Dist-2={greedy_res['Dist-2']}%, Unique={greedy_res['Unique']}%")
-    print(f"    - Beam (k=5)  : Dist-1={beam_res['Dist-1']}%, Dist-2={beam_res['Dist-2']}%, Unique={beam_res['Unique']}%")
-    print(f"    - Sampling(0.7): Dist-1={sampling_res['Dist-1']}%, Dist-2={sampling_res['Dist-2']}%, Unique={sampling_res['Unique']}%")
+    print(f"    - Greedy        : Dist-1={greedy_res['Dist-1']}%, Dist-2={greedy_res['Dist-2']}%, Unique={greedy_res['Unique']}%")
+    print(f"    - Beam (k=5)    : Dist-1={beam_res['Dist-1']}%, Dist-2={beam_res['Dist-2']}%, Unique={beam_res['Unique']}%")
+    print(f"    - Sampling(0.7) : Dist-1={sampling_res['Dist-1']}%, Dist-2={sampling_res['Dist-2']}%, Unique={sampling_res['Unique']}%")
+    print(f"    - Sampling(0.8) : Dist-1={sampling_08_res['Dist-1']}%, Dist-2={sampling_08_res['Dist-2']}%, Unique={sampling_08_res['Unique']}%")
 
     return {
         "Greedy": greedy_res,
         "Beam": beam_res,
-        "Sampling": sampling_res
+        "Sampling": sampling_res,
+        "Sampling_0.8": sampling_08_res
     }
 
 
@@ -481,6 +511,10 @@ def main():
     parser.add_argument("--cls_anchor", type=str, default="default", help="分类头挂载锚点 (default/fine_emotion/emotion_enc)")
     parser.add_argument("--use_arc_margin", action="store_true", default=False, help="是否启用 Arc-EPCL")
     parser.add_argument("--arc_margin", type=float, default=0.30, help="Arc-EPCL 边际")
+    parser.add_argument("--use_emo_bias", action="store_true", default=False, help="[V8.1 路线 A] 是否启用词表层情感偏置注入")
+    parser.add_argument("--use_sparse_emo_bias", action="store_true", default=False, help="[V8.2] 是否启用自适应稀疏情感词表偏置")
+    parser.add_argument("--emo_vocab_topk_ratio", type=float, default=0.15, help="[V8.2] 稀疏偏置保留前 K% 亲和词比例")
+    parser.add_argument("--bias_min_scale", type=float, default=0.15, help="偏置退火最低下限缩放比")
     parser.add_argument("--plot_path", type=str, default="docs/v8/images/v8_trial_manifold.png", help="流形图保存路径")
     args = parser.parse_args()
 
@@ -496,7 +530,11 @@ def main():
         epcl_anchor=args.epcl_anchor,
         cls_anchor=args.cls_anchor,
         use_arc_margin=args.use_arc_margin,
-        arc_margin=args.arc_margin
+        arc_margin=args.arc_margin,
+        use_emo_bias=args.use_emo_bias,
+        use_sparse_emo_bias=args.use_sparse_emo_bias,
+        emo_vocab_topk_ratio=args.emo_vocab_topk_ratio,
+        bias_min_scale=args.bias_min_scale
     )
 
     # 3. 全量测试集指标度量

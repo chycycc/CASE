@@ -19,7 +19,7 @@ def make_model(vocab, emo_num, strategy_num):
             is_eval=is_eval,
             model_file_path=config.model_file_path if is_eval else None,
         )
-    model.to(config.device)
+    model = model.to(config.device)
     
     # Intialization
     if not is_eval:
@@ -65,12 +65,14 @@ def train(model, train_set, dev_set):
     try:
         model.train()
         best_ppl = 1000
+        best_score = 1000.0
         patient = 0
         # [V5 Trial 4 / Trial 4b] 自适应分类头冻结监控与最佳状态缓存 (BCF)
         best_freeze_metric = -1.0 if config.freeze_metric == "emo_acc" else 1e9
         freeze_patient = 0
         best_emo_head_state = deepcopy(model.emotion_linear.state_dict())
         best_freeze_step = 0
+        entered_mature = False
         writer = SummaryWriter(log_dir=config.save_path)
         weights_best = deepcopy(model.state_dict())
         data_iter = make_infinite(train_set)
@@ -151,15 +153,64 @@ def train(model, train_set, dev_set):
                 model.train()
                 if n_iter < iters:
                     continue
-                if ppl_val <= best_ppl:
-                    best_ppl = ppl_val
-                    patient = 0
-                    model.save_model(best_ppl, n_iter)
-                    weights_best = deepcopy(model.state_dict())
+
+                # [V8.1 路线 B / V8.2 D] 验证集保存判定（支持复合评分：acc 模式或帕累托 emo_loss 模式）
+                if getattr(config, 'use_composite_score', False):
+                    composite_mode = getattr(config, 'composite_mode', 'acc')
+                    if composite_mode == 'emo_loss':
+                        alpha = getattr(config, 'composite_emo_loss_weight', 8.0)
+                        cur_score = ppl_val + alpha * emo_loss_val
+                        score_info = f"Score={cur_score:.4f} (PPL={ppl_val:.4f}, EMO_loss={emo_loss_val:.4f})"
+                    else:
+                        composite_acc_weight = getattr(config, 'composite_acc_weight', 20.0)
+                        cur_score = ppl_val - composite_acc_weight * emo_acc_val
+                        score_info = f"Score={cur_score:.4f} (PPL={ppl_val:.4f}, EMO_acc={emo_acc_val:.4f})"
+                    writer.add_scalars("composite_score", {"score_valid": cur_score}, n_iter)
+                    is_score_better = (cur_score <= best_score)
                 else:
-                    patient += 1
-                if patient > 4:
-                    break
+                    cur_score = ppl_val
+                    is_score_better = (ppl_val <= best_ppl)
+                    score_info = f"PPL={ppl_val:.4f}"
+
+                min_save_step = getattr(config, 'min_save_step', 0)
+                in_protection_period = (min_save_step > 0 and n_iter < min_save_step)
+
+                if in_protection_period:
+                    # [V8.2 E] 处于退火成熟保护期：记录过渡指标，但不消耗早停耐心
+                    patient = 0
+                    if is_score_better:
+                        best_score = cur_score
+                        best_ppl = ppl_val
+                        model.save_model(best_ppl, n_iter)
+                        weights_best = deepcopy(model.state_dict())
+                        print(f"[*] Step {n_iter} < min_save_step({min_save_step}): 保护期刷新过渡权重！{score_info}")
+                    else:
+                        print(f"[-] Step {n_iter} < min_save_step({min_save_step}): 保护期未改善 ({score_info})，早停耐心保持为 0")
+                else:
+                    # [V8.2 E] 进入退火成熟期：若此前处于保护期，首步重置成熟期黄金检查点基线
+                    if min_save_step > 0 and not entered_mature:
+                        entered_mature = True
+                        best_score = cur_score
+                        best_ppl = ppl_val
+                        patient = 0
+                        model.save_model(best_ppl, n_iter)
+                        weights_best = deepcopy(model.state_dict())
+                        print(f"[*] [V8.2 E] Step {n_iter}: 正式进入退火成熟期 (>= min_save_step {min_save_step})，锚定成熟期基线黄金检查点！{score_info}")
+                    else:
+                        if is_score_better:
+                            best_score = cur_score
+                            best_ppl = ppl_val
+                            patient = 0
+                            model.save_model(best_ppl, n_iter)
+                            weights_best = deepcopy(model.state_dict())
+                            print(f"[*] Step {n_iter}: 刷新成熟期黄金权重！{score_info}，已落盘检查点。")
+                        else:
+                            patient += 1
+                            max_patience = getattr(config, "patience", 5)
+                            print(f"[-] Step {n_iter}: 未改善 ({score_info} vs 最优={best_score:.4f})，Patience: {patient}/{max_patience}")
+                        if patient >= getattr(config, "patience", 5):
+                            print(f"[Early Stopping] 连续 {patient} 次评估未刷新最优指标，触发早停机制退出。")
+                            break
 
     except KeyboardInterrupt:
         print("-" * 89)
