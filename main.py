@@ -1,3 +1,5 @@
+import os
+import shutil
 from tqdm import tqdm
 from copy import deepcopy
 from tensorboardX import SummaryWriter
@@ -59,9 +61,9 @@ def pretrain(model, train_set):
 
 
 def train(model, train_set, dev_set):
-    check_iter = 2000
-    iters = 20000 if config.dataset=="ED" else 6000
-    # check_iter = 1
+    # [V9 大批次适配] 采用配置化评估间隔与总步数上限，避免原版硬编码导致跑过多 Epoch
+    check_iter = getattr(config, "check_iter", 500)
+    max_step = getattr(config, "max_step", 10000)
     try:
         model.train()
         best_ppl = 1000
@@ -76,7 +78,7 @@ def train(model, train_set, dev_set):
         writer = SummaryWriter(log_dir=config.save_path)
         weights_best = deepcopy(model.state_dict())
         data_iter = make_infinite(train_set)
-        for n_iter in tqdm(range(1000000)):
+        for n_iter in tqdm(range(max_step)):
             bow_loss, kl_loss, mim_loss, ctx_loss, ppl, str_loss, str_acc, emo_loss, emo_acc, epcl_loss, dec_emo_loss = model.train_one_batch(next(data_iter), n_iter)
             writer.add_scalars("bow_loss", {"loss_train": bow_loss}, n_iter)
             writer.add_scalars("kl_loss", {"loss_train": kl_loss}, n_iter)
@@ -151,8 +153,6 @@ def train(model, train_set, dev_set):
                         print(f"[Adaptive Freeze Monitor] Step {curr_step} < min_freeze_step({config.min_freeze_step})，处于冷启动防抖保护期，记录当前最优 {config.freeze_metric}={best_freeze_metric:.4f}")
 
                 model.train()
-                if n_iter < iters:
-                    continue
 
                 # [V8.1 路线 B / V8.2 D] 验证集保存判定（支持复合评分：acc 模式或帕累托 emo_loss 模式）
                 if getattr(config, 'use_composite_score', False):
@@ -226,7 +226,10 @@ def test(model, test_set):
     bow_loss_test, kl_loss_test, mim_loss_test, ctx_loss_test, ppl_test, str_loss_test, str_acc_test, emo_loss_test, emo_acc_test, results = evaluate(
         model, test_set, ty="test", max_dec_step=50
     )
-    file_summary = config.save_path + "/results.txt"
+    
+    # 1. 写入对应实验的独立权重输出目录 (例如 save/v9_trial2/results.txt)
+    os.makedirs(config.save_path, exist_ok=True)
+    file_summary = os.path.join(config.save_path, "results.txt")
     with open(file_summary, "w", encoding="utf-8") as f:
         f.write("EVAL\tBOW_Loss\tKL_Loss\tMIM_Loss\tCTX_Loss\tPPL\tSTR_loss\tSTR_acc\tEMO_loss\tEMO_acc\n")
         f.write(
@@ -236,6 +239,18 @@ def test(model, test_set):
         )
         for r in results:
             f.write(r)
+    print(f"[*] 实验权重目录测试结果已保存至: {file_summary}")
+
+    # 2. 同步独立存档至 results/v9/ (例如 results/v9/v9_trial2_results.txt)，彻底消除覆盖混淆
+    exp_name = getattr(config, 'exp_name', None) or os.path.basename(os.path.normpath(config.save_path))
+    results_v9_dir = os.path.join("results", "v9")
+    os.makedirs(results_v9_dir, exist_ok=True)
+    exp_results_file = os.path.join(results_v9_dir, f"{exp_name}_results.txt")
+    try:
+        shutil.copyfile(file_summary, exp_results_file)
+        print(f"[*] 实验全量测试生成记录已同步持久化至: {exp_results_file}")
+    except Exception as e:
+        print(f"[!] 同步实验结果文件失败: {e}")
 
 def main():
     set_seed()  # for reproducibility

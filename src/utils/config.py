@@ -245,8 +245,14 @@ def get_args():
                         help="[V8.1] 复合评分中 EMO_acc 权衡权重 (默认 20.0)")
     parser.add_argument("--composite_mode", type=str, default="acc", choices=["acc", "emo_loss"],
                         help="[V8.2 D] 复合早停/评分模式 (acc: 传统 PPL-acc, emo_loss: 帕累托 PPL+alpha*EMO_loss)")
-    parser.add_argument("--composite_emo_loss_weight", type=float, default=3.5,
-                        help="[V8.2 D/E] 帕累托复合评分中 EMO_loss 权衡系数 alpha (默认 3.5)")
+    # V9 大批次训练生命周期与早停步数重标定
+    parser.add_argument("--check_iter", type=int, default=500,
+                        help="[V9] 验证集评估步数间隔 (默认 500 步，适配 Batch 64 密集评估)")
+    parser.add_argument("--max_step", type=int, default=10000,
+                        help="[V9] 正式多任务训练最大总步数上限 (默认 10000 步，约 32 个 Epoch)")
+    parser.add_argument("--exp_name", type=str, default="v9_trial2",
+                        help="[V9] 当前实验标识代号，用于隔离权重与评测产出")
+
     parser.add_argument("--min_save_step", type=int, default=0,
                         help="[V8.2 E] 退火成熟保护期步数 (默认0，V8.2 E 推荐 32000，保护期内不累加早停耐心)")
     

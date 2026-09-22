@@ -242,6 +242,15 @@ class TestBellShapeModelIntegration(unittest.TestCase):
         assert abs(val_from_float - 0.425) < 1e-6
         assert abs(val_from_tensor - 0.425) < 1e-6
 
+    def test_17_v9_large_batch_lifecycle_configs(self):
+        """[Test 17] V9 大批次适配生命周期参数（check_iter, max_step, exp_name）必须正确加载且数值合理"""
+        assert hasattr(config, "check_iter"), "config 必须包含 check_iter 参数"
+        assert hasattr(config, "max_step"), "config 必须包含 max_step 参数"
+        assert hasattr(config, "exp_name"), "config 必须包含 exp_name 参数"
+        assert config.check_iter > 0, "评估间隔必须大于 0"
+        assert config.max_step >= config.check_iter, "最大步数上限必须大于等于单次评估间隔"
+        assert isinstance(config.exp_name, str) and len(config.exp_name) > 0, "exp_name 必须为非空字符串"
+
 
 if __name__ == "__main__":
     if pytest is not None:
