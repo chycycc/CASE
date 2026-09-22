@@ -208,7 +208,7 @@ def get_args():
     parser.add_argument("--use_sparse_emo_bias", action="store_true", default=False,
                         help="[V8.2] 是否启用基于原型-词嵌入拓扑亲和度的自适应稀疏情感词表偏置")
     parser.add_argument("--emo_vocab_topk_ratio", type=float, default=0.15,
-                        help="[V8.2] 自适应稀疏偏置保留的情感亲和词比例 (默认 0.15，即保留前 15% 情感词，85% 功能词零偏置)")
+                        help="[V8.2] 自适应稀疏偏置保留的情感亲和词比例 (默认 0.15，即保留前 15%% 情感词，85%% 功能词零偏置)")
     parser.add_argument("--use_pcgrad", action="store_true", default=False,
                         help="[V8.2] 是否启用多任务冲突梯度正交投影器 (PCGrad)")
     parser.add_argument("--gate_warmup_steps", type=int, default=20000,
@@ -225,7 +225,7 @@ def get_args():
     parser.add_argument("--bias_anneal_steps", type=int, default=15000,
                         help="[V8.2 C] 偏置门控余弦退火衰减持续步长 (默认 15000)")
     parser.add_argument("--bias_min_scale", type=float, default=0.2,
-                        help="[V8.2 C] 偏置门控衰减下限乘子 (默认 0.2，保留 20% 偏置防重复)")
+                        help="[V8.2 C] 偏置门控衰减下限乘子 (默认 0.2，保留 20%% 偏置防重复)")
     
     # V8.2 D 参数: 后半程动态情感损失权重线性提升与帕累托复合检查点遴选
     parser.add_argument("--use_emo_loss_ramp", action="store_true", default=False,

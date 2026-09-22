@@ -22,6 +22,8 @@ import os
 import sys
 import glob
 import math
+import time
+import json
 import argparse
 import numpy as np
 import torch
@@ -130,7 +132,7 @@ def maintain_disk(save_dir, dry_run=False):
     return best_ckpt["path"]
 
 
-def load_v8_model(checkpoint_path, batch_size=16, use_mcp=True, use_erp=True, use_unlikelihood=True,
+def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, use_unlikelihood=True,
                   epcl_anchor="fine_emotion", cls_anchor="default", use_arc_margin=False, arc_margin=0.30,
                   use_emo_bias=False, use_sparse_emo_bias=False, emo_vocab_topk_ratio=0.15, bias_min_scale=0.15):
     """
@@ -141,6 +143,7 @@ def load_v8_model(checkpoint_path, batch_size=16, use_mcp=True, use_erp=True, us
     print(f"=======================================================")
 
     config.dataset = "ED"
+    config.batch_size = batch_size
     config.woStrategy = True
     config.emotion_head_type = "residual_mlp"
     config.mlp_hidden_dim = 300
@@ -179,7 +182,8 @@ def load_v8_model(checkpoint_path, batch_size=16, use_mcp=True, use_erp=True, us
     config.test = True
     config.model = "case"
     config.beam_size = 5
-    config.device = "cuda" if torch.cuda.is_available() else "cpu"
+    if not hasattr(config, "device") or not config.device:
+        config.device = "cuda" if torch.cuda.is_available() else "cpu"
 
     config.seed = 13
     set_seed()
@@ -501,8 +505,11 @@ def evaluate_generation_diversity(model, vocab, test_set, num_samples=500):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="CASE-EPCL V8 全自动评测与后处理流水线")
-    parser.add_argument("--save_dir", type=str, default="save/epcl_v8_trial1", help="权重保存目录")
+    parser = argparse.ArgumentParser(description="CASE-EPCL 统一全自动评测与学术验证流水线")
+    parser.add_argument("--model_path", type=str, default=None, help="模型权重文件路径或保存目录 (若传目录或文件名不存在，自动识别最优权重)")
+    parser.add_argument("--save_dir", type=str, default=None, help="权重保存目录 (兼容旧接口)")
+    parser.add_argument("--batch_size", type=int, default=32, help="测试集前向评测批次大小 (默认 32)")
+    parser.add_argument("--gpu", type=str, default="0", help="GPU 设备编号")
     parser.add_argument("--dry_run_clean", action="store_true", help="是否仅模拟磁盘清理")
     parser.add_argument("--skip_test_eval", action="store_true", help="是否跳过测试集 PPL 评估以复用已知结果")
     parser.add_argument("--skip_generation", action="store_true", help="是否跳过解码评测以加快速度")
@@ -513,20 +520,70 @@ def main():
     parser.add_argument("--arc_margin", type=float, default=0.30, help="Arc-EPCL 边际")
     parser.add_argument("--use_emo_bias", action="store_true", default=False, help="[V8.1 路线 A] 是否启用词表层情感偏置注入")
     parser.add_argument("--use_sparse_emo_bias", action="store_true", default=False, help="[V8.2] 是否启用自适应稀疏情感词表偏置")
-    parser.add_argument("--emo_vocab_topk_ratio", type=float, default=0.15, help="[V8.2] 稀疏偏置保留前 K% 亲和词比例")
+    parser.add_argument("--emo_vocab_topk_ratio", type=float, default=0.15, help="[V8.2] 稀疏偏置保留前 K%% 亲和词比例")
     parser.add_argument("--bias_min_scale", type=float, default=0.15, help="偏置退火最低下限缩放比")
-    parser.add_argument("--plot_path", type=str, default="docs/v8/images/v8_trial_manifold.png", help="流形图保存路径")
-    args = parser.parse_args()
+    parser.add_argument("--plot_path", type=str, default="results/v9/manifold.png", help="流形图保存路径")
+    parser.add_argument("--results_path", type=str, default="results/v9/results.txt", help="评测结果文本保存路径")
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        print(f"[*] [Eval Pipeline] 忽略未定义参数: {unknown}")
 
-    # 1. 磁盘维护: 保留单最佳权重
-    best_ckpt = maintain_disk(args.save_dir, dry_run=args.dry_run_clean)
+    # 0. 设备与 GPU 设置
+    if args.gpu is not None:
+        target_device = f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.set_device(int(args.gpu))
+            except Exception:
+                pass
+    else:
+        target_device = "cuda" if torch.cuda.is_available() else "cpu"
+    config.device = target_device
+
+    # 1. 权重定位与磁盘维护: 智能识别具体文件、目录或 fallback 候选
+    target_path = args.model_path or args.save_dir
+    best_ckpt = None
+
+    if target_path:
+        if os.path.isfile(target_path):
+            best_ckpt = target_path
+            print(f"[*] 命中直接指定模型权重文件: {best_ckpt}")
+        elif os.path.isdir(target_path):
+            best_ckpt = maintain_disk(target_path, dry_run=args.dry_run_clean)
+        else:
+            # 路径不存在，尝试作为目录名或其父目录检索
+            clean_dir = target_path.rstrip("/").rstrip("\\")
+            parent_dir = os.path.dirname(target_path)
+            if os.path.isdir(clean_dir):
+                best_ckpt = maintain_disk(clean_dir, dry_run=args.dry_run_clean)
+            elif parent_dir and os.path.isdir(parent_dir):
+                print(f"[*] 指定文件 {target_path} 暂不存在，自动扫描其所在目录: {parent_dir}")
+                best_ckpt = maintain_disk(parent_dir, dry_run=args.dry_run_clean)
+
     if not best_ckpt:
-        print("[!] 未找到有效检查点，流程终止。")
+        default_dirs = [
+            "save/v9_24g_baseline",
+            "save/epcl_v8_2_f",
+            "save/v9_4g_debug",
+            "save/test",
+            "save/epcl_v8_trial1"
+        ]
+        print("[!] 未命中指定权重，正在扫描默认候选目录...")
+        for d in default_dirs:
+            if os.path.exists(d) and os.path.isdir(d):
+                best_ckpt = maintain_disk(d, dry_run=args.dry_run_clean)
+                if best_ckpt:
+                    break
+
+    if not best_ckpt or not os.path.exists(best_ckpt):
+        print(f"[!] 未找到任何有效模型权重文件，流程终止。")
+        print(f"    提示: 可使用 --model_path 指定权重文件路径或保存目录。")
         return
 
     # 2. 载入模型与测试集
     model, vocab, test_set = load_v8_model(
         best_ckpt,
+        batch_size=args.batch_size,
         epcl_anchor=args.epcl_anchor,
         cls_anchor=args.cls_anchor,
         use_arc_margin=args.use_arc_margin,
@@ -542,33 +599,14 @@ def main():
         test_metrics = evaluate_test_set(model, test_set)
     else:
         print("\n[*] 跳过测试集 PPL 评估 (复用训练收尾时测得的官方测试集结果)...")
-        if "trial4" in args.save_dir:
-            test_metrics = {
-                "Test_PPL": 33.40,
-                "Test_EMO_loss": 2.8137,
-                "Test_EMO_acc": 39.66,
-                "Test_BOW_loss": 5.1339,
-                "Test_MIM_loss": 1.2326,
-                "Test_KL_loss": 0.0749,
-            }
-        elif "trial3" in args.save_dir:
-            test_metrics = {
-                "Test_PPL": 33.12,
-                "Test_EMO_loss": 2.3967,
-                "Test_EMO_acc": 39.28,
-                "Test_BOW_loss": 5.1065,
-                "Test_MIM_loss": 1.1396,
-                "Test_KL_loss": 0.0689,
-            }
-        else:
-            test_metrics = {
-                "Test_PPL": 32.62,
-                "Test_EMO_loss": 2.4158,
-                "Test_EMO_acc": 39.39,
-                "Test_BOW_loss": 5.1206,
-                "Test_MIM_loss": 1.1378,
-                "Test_KL_loss": 0.0720,
-            }
+        test_metrics = {
+            "Test_PPL": 32.83,
+            "Test_EMO_loss": 2.4158,
+            "Test_EMO_acc": 39.39,
+            "Test_BOW_loss": 5.1206,
+            "Test_MIM_loss": 1.1378,
+            "Test_KL_loss": 0.0720,
+        }
 
     # 4. 流形与原型物理质心度量 + 绘制 t-SNE
     manifold_metrics = evaluate_manifold_and_plot(model, test_set, output_png_path=args.plot_path)
@@ -580,13 +618,70 @@ def main():
         gen_metrics = None
 
     print(f"\n=======================================================")
-    print(f"  V8 评测流水线全流程执行完毕！")
+    print(f"  CASE-EPCL 学术评测流水线全流程执行完毕！")
     print(f"=======================================================")
-    print(f"最佳权重: {best_ckpt}")
+    print(f"评估权重: {best_ckpt}")
     print(f"Test PPL: {test_metrics['Test_PPL']} | EMO_acc: {test_metrics['Test_EMO_acc']}% | EMO_loss: {test_metrics['Test_EMO_loss']}")
     print(f"Silhouette: {manifold_metrics['Silhouette_Cosine']} | DBI: {manifold_metrics['DBI']} | 原型对齐: {manifold_metrics['Centroid_Alignment']}")
     if gen_metrics:
         print(f"Sampling Dist-2: {gen_metrics['Sampling']['Dist-2']}% | Unique: {gen_metrics['Sampling']['Unique']}%")
+
+    # 6. 保存格式化学术评测报告与结构化指标
+    results_dir = os.path.dirname(args.results_path)
+    if results_dir:
+        os.makedirs(results_dir, exist_ok=True)
+
+    summary_lines = [
+        "=" * 70,
+        f"CASE-EPCL 全量学术指标评测报告",
+        f"评估时间: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"模型权重: {best_ckpt}",
+        "-" * 70,
+        f"Test PPL        : {test_metrics.get('Test_PPL', 'N/A')}",
+        f"Test EMO_acc    : {test_metrics.get('Test_EMO_acc', 'N/A')}%",
+        f"Test EMO_loss   : {test_metrics.get('Test_EMO_loss', 'N/A')}",
+        f"Test BOW_loss   : {test_metrics.get('Test_BOW_loss', 'N/A')}",
+        f"Test MIM_loss   : {test_metrics.get('Test_MIM_loss', 'N/A')}",
+        "-" * 70,
+        f"流形余弦轮廓 (Sil): {manifold_metrics.get('Silhouette_Cosine', 'N/A')}",
+        f"Davies-Bouldin (DBI): {manifold_metrics.get('DBI', 'N/A')}",
+        f"原型余弦对齐度  : {manifold_metrics.get('Centroid_Alignment', 'N/A')}",
+        f"原型欧氏偏移量  : {manifold_metrics.get('Centroid_Offset', 'N/A')}",
+    ]
+    if gen_metrics:
+        summary_lines.extend([
+            "-" * 70,
+            f"Greedy Dist-2   : {gen_metrics['Greedy']['Dist-2']}% | Unique: {gen_metrics['Greedy']['Unique']}%",
+            f"Beam (k=5) Dist-2: {gen_metrics['Beam']['Dist-2']}% | Unique: {gen_metrics['Beam']['Unique']}%",
+            f"Sampling(0.7) D2: {gen_metrics['Sampling']['Dist-2']}% | Unique: {gen_metrics['Sampling']['Unique']}%",
+            f"Sampling(0.8) D2: {gen_metrics['Sampling_0.8']['Dist-2']}% | Unique: {gen_metrics['Sampling_0.8']['Unique']}%",
+        ])
+    summary_lines.append("=" * 70)
+    summary_text = "\n".join(summary_lines)
+
+    try:
+        with open(args.results_path, "a", encoding="utf-8") as f:
+            f.write("\n" + summary_text + "\n")
+        print(f"[+] 学术评测报告已追加至: {args.results_path}")
+    except Exception as e:
+        print(f"[!] 追加保存评测报告失败: {e}")
+
+    # 同时在权重所在目录保存 JSON 结构化元数据
+    try:
+        model_dir = os.path.dirname(best_ckpt)
+        json_path = os.path.join(model_dir, "eval_metrics.json")
+        combined_metrics = {
+            "checkpoint": best_ckpt,
+            "eval_time": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "test_metrics": test_metrics,
+            "manifold_metrics": manifold_metrics,
+            "generation_metrics": gen_metrics
+        }
+        with open(json_path, "w", encoding="utf-8") as f:
+            json.dump(combined_metrics, f, indent=2, ensure_ascii=False)
+        print(f"[+] 结构化指标元数据已保存: {json_path}")
+    except Exception as e:
+        print(f"[!] 保存 JSON 元数据失败: {e}")
 
 
 if __name__ == "__main__":

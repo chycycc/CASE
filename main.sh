@@ -106,6 +106,6 @@ echo "======================================================================"
 
 # 自动调用统一评测流水线进行测试集度量 (PPL, Dist-2, Unique, Alignment, DBI)
 ${pythonpath} src/scripts/eval_pipeline.py \
-  --model_path ${OUTPUT_DIR}CASE_best.pth \
+  --model_path ${OUTPUT_DIR} \
   --batch_size ${BATCH_SIZE} \
   --gpu ${GPU_ID}

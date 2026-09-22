@@ -7,10 +7,10 @@ set -e
 
 pythonpath='python'
 
-# 待评测的黄金模型权重路径 (默认为 V8 旗舰权重，后续可替换为 V9 产出)
-MODEL_PATH=${1:-"save/epcl_v8_2_f/CASE_39999_37.0876"}
+# 待评测的黄金模型权重路径 (支持传入具体权重文件或保存目录，默认扫描 save/v9_24g_baseline)
+MODEL_PATH=${1:-"save/v9_24g_baseline"}
 GPU_ID=${2:-"0"}
-BATCH_SIZE=${3:-"64"}
+BATCH_SIZE=${3:-"32"}
 
 echo "======================================================================"
 echo "[*] 启动 CASE-EPCL 全量自动化评估体系"
