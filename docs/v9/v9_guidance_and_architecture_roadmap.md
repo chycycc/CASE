@@ -41,7 +41,96 @@
 - **学习率下限与退火跨度**：
   - 维持余弦退火策略，底仓学习率保持在 $1\times 10^{-5}$，退火步数相应按比例缩放。
 
+### 3. 自适应时序超参数体系（摒弃硬编码 Step）
+为了彻底杜绝“换一次 Batch Size 或总轮次就需重新心算绝对步数”的人工调参痛点，V9 正式将所有时序控制超参数由绝对步数（Step）重构为**相对训练进度比例（Ratio $\in [0, 1]$）**。
+
+系统在加载数据后，自动根据数据集样本量 $N$ 与批次大小 $B$ 动态计算出全局总训练步数：
+$$\text{Total\_Steps} = \text{Total\_Epochs} \times \lceil \frac{N_{\text{train}}}{B} \rceil$$
+
+所有时序调度事件统一按进度比例自适应折算：
+
+| 超参数功能 | 旧版绝对步数参数 (V8 硬编码) | V9 自适应比率参数 (Ratio) | 默认推荐比率 | 对应 $B=64$ 时换算步数 | 对应 $B=8$ 时换算步数 | 业务含义与物理目标 |
+| :--- | :--- | :--- | :---: | :---: | :---: | :--- |
+| **学习率预热** | `--warmup 12000` | `--warmup_ratio` | **`0.05`** | $\sim 350$ 步 | $2,000$ 步 | 线性预热防止主干自回归解码器梯度爆炸 |
+| **偏置门控置冷** | `--gate_warmup_steps 20000` | `--gate_warmup_ratio` | **`0.40`** | $\sim 2,800$ 步 | $16,000$ 步 | 前 40% 门控置冷，保护语言模型初始语法学习不受词表偏置扰动 |
+| **多任务钟形加权峰值** | `--emo_loss_ramp_start 24000` | `--emo_ramp_start_ratio` | **`0.45`** | $\sim 3,150$ 步 | $18,000$ 步 | 中期钟形加权启动，助推分类损失进入达标平台期 |
+| **早停成熟保护期** | `--min_save_step 30000` | `--min_save_ratio` | **`0.60`** | $\sim 4,200$ 步 | $24,000$ 步 | 前 60% 进度内禁止早停，防止在语言模型快速下探期误判早停 |
+| **偏置时序余弦退火** | `--bias_anneal_start 35000` | `--bias_anneal_start_ratio` | **`0.70`** | $\sim 4,900$ 步 | $28,000$ 步 | 后 30% 进度启动词表偏置平滑衰减，消除底噪助推 PPL 极值收敛 |
+| **偏置退火持续跨度** | `--bias_anneal_steps 15000` | `--bias_anneal_span_ratio` | **`0.25`** | $\sim 1,750$ 步 | $10,000$ 步 | 持续 25% 进度余弦平滑衰减至 `--bias_min_scale 0.10` 底仓 |
+
 ---
+
+### 4. V9 通用自适应启动脚本规范 (`train_v9_adaptive.sh`)
+
+无论后续在单卡调试（$B=16$）、24GB 单卡（$B=64$）还是多卡大 Batch（$B=128$），均可直接执行以下标准脚本，代码端根据 Batch 自动换算：
+
+```bash
+#!/bin/bash
+# ==============================================================================
+# CASE-EPCL V9 通用自适应训练启动脚本 (支持任意 Batch Size 与 Epochs 自动自适应)
+# ==============================================================================
+set -e
+
+PYTHONPATH="python"
+
+# 1. 基础环境配置 (根据实际机器修改)
+DATASET="ED"
+GPU_ID="1"
+SEED="13"
+BATCH_SIZE="64"       # 24GB 推荐 64；调试时可改 16 或 32
+LR="0.0003"           # 大 Batch 推荐 3e-4 (按平方根定律自动缩放)
+PRETRAIN_EPOCH="4"
+OUTPUT_DIR="save/v9_baseline/"
+
+echo "[*] 启动 CASE-EPCL V9 自适应全生命周期训练..."
+
+${PYTHONPATH} main.py \
+  --dataset ${DATASET} \
+  --gpu ${GPU_ID} \
+  --seed ${SEED} \
+  --batch_size ${BATCH_SIZE} \
+  --lr ${LR} \
+  --pretrain \
+  --pretrain_epoch ${PRETRAIN_EPOCH} \
+  --woStrategy \
+  --fine_weight 0.2 \
+  --coarse_weight 1.0 \
+  --use_mcp \
+  --mcp_momentum 0.96 \
+  --lambda_epcl 0.07 \
+  --arc_margin 0.30 \
+  --arc_mode cos \
+  --epcl_anchor fine_emotion \
+  --cls_anchor default \
+  --use_sparse_emo_bias \
+  --emo_vocab_topk_ratio 0.15 \
+  --emo_bias_gate_init -2.0 \
+  --use_pcgrad \
+  --mask_update_interval 1000 \
+  --warmup_ratio 0.05 \
+  --gate_warmup_ratio 0.40 \
+  --min_save_ratio 0.60 \
+  --bias_anneal_start_ratio 0.70 \
+  --bias_anneal_span_ratio 0.25 \
+  --bias_min_scale 0.10 \
+  --use_emo_loss_ramp \
+  --emo_ramp_start_ratio 0.45 \
+  --emo_loss_ramp_max 1.30 \
+  --emo_loss_ramp_shape bell \
+  --use_composite_score \
+  --composite_mode emo_loss \
+  --composite_emo_loss_weight 5.0 \
+  --patience 10 \
+  --model_file_path ${OUTPUT_DIR}
+
+echo "[*] V9 训练结束，准备执行全量学术指标自动化审计..."
+
+# 2. 一键全量评测测试集 (PPL, Dist-2, Unique, Alignment, DBI)
+${PYTHONPATH} src/scripts/eval_pipeline.py \
+  --model_path ${OUTPUT_DIR}CASE_best.pth \
+  --batch_size ${BATCH_SIZE} \
+  --gpu ${GPU_ID}
+```
 
 ## 三、V9 核心架构革新方案
 

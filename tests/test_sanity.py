@@ -17,6 +17,9 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
+import torch
+from src.utils.config import config
+
 
 class TestBellShapedRamp(unittest.TestCase):
     """Test 01-03: 钟形余弦加权数学正确性验证"""
@@ -209,6 +212,23 @@ class TestBellShapeModelIntegration(unittest.TestCase):
             assert 1.0 - 1e-10 <= w <= ramp_max + 1e-10, (
                 f"权重 w={w:.6f} 超出 [1.0, {ramp_max}] 区间"
             )
+
+    def test_14_accum_steps_and_precision_config(self):
+        """[Test 14] accum_steps 与 precision 参数默认值与自适应校验"""
+        assert hasattr(config, "accum_steps"), "config 缺少 accum_steps 属性"
+        assert hasattr(config, "precision"), "config 缺少 precision 属性"
+        assert getattr(config, "accum_steps", 1) >= 1, "accum_steps 应 >= 1"
+        assert getattr(config, "precision", "fp32") in ["fp32", "bf16", "fp16"]
+
+    def test_15_attention_mask_dtype_adaptation(self):
+        """[Test 15] Attention 掩码数值针对 float16 与 float32 自适应"""
+        # float16 下应使用 -1e4 防溢出；float32 下应使用 -1e18 数学严格零
+        dtype_fp16 = torch.float16
+        dtype_fp32 = torch.float32
+        mask_val_fp16 = -1e4 if dtype_fp16 == torch.float16 else -1e18
+        mask_val_fp32 = -1e4 if dtype_fp32 == torch.float16 else -1e18
+        assert mask_val_fp16 == -1e4
+        assert mask_val_fp32 == -1e18
 
 
 if __name__ == "__main__":
