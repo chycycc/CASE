@@ -378,7 +378,8 @@ class MultiExpertMultiHeadAttention(nn.Module):
 
         if mask is not None:
             mask = mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, 1, T_values]
-            logits = logits.masked_fill(mask, -1e4)
+            mask_val = -1e4 if logits.dtype == torch.float16 else -1e18
+            logits = logits.masked_fill(mask, mask_val)
 
         ## attention weights
         # attetion_weights = logits.sum(dim=1)/self.num_heads
@@ -509,7 +510,8 @@ class MultiHeadAttention(nn.Module):
 
         if mask is not None:
             mask = mask.unsqueeze(1)  # [B, 1, 1, T_values]
-            logits = logits.masked_fill(mask, -1e4)
+            mask_val = -1e4 if logits.dtype == torch.float16 else -1e18
+            logits = logits.masked_fill(mask, mask_val)
 
         ## attention weights
         attetion_weights = logits.sum(dim=1) / self.num_heads

@@ -1,5 +1,6 @@
 ### TAKEN FROM https://github.com/kolloldas/torchnlp
 import os
+import contextlib
 import warnings
 warnings.filterwarnings('ignore')
 import torch
@@ -1345,9 +1346,14 @@ class CASE(nn.Module):
         self.model_dir = config.save_path
         if not os.path.exists(self.model_dir):
             os.makedirs(self.model_dir)
-        self.best_path = ""
-        
-        self.scaler = torch.cuda.amp.GradScaler()
+        # [V9 硬件妥协解绑与精度自适应]
+        # 原版 CASE 采用 FP32 全精度训练；在 4GB 显存复现时曾妥协强制使用 FP16 GradScaler。
+        # 现迁移至 24GB 显存，支持 fp32 全精度与 bf16 原生计算 (无需 scaler)，仅在显式指定 fp16 时启用 GradScaler。
+        self.precision = getattr(config, 'precision', 'fp32')
+        if self.precision == 'fp16':
+            self.scaler = torch.cuda.amp.GradScaler()
+        else:
+            self.scaler = None
         
         # [V5 Trial 4: 自适应分类头冻结状态]
         self.is_frozen = False
@@ -1595,7 +1601,8 @@ class CASE(nn.Module):
             if iter == 0 or (iter + 1) % getattr(self, 'mask_update_interval', 5000) == 0:
                 self.update_adaptive_vocab_mask()
 
-        accum_steps = 4
+        # [V9 解绑妥协] 梯度累加步数解绑: 默认在大 Batch 下为 1 (每步更新)，小显存可配置为 4
+        accum_steps = getattr(config, 'accum_steps', 1)
         (
             enc_batch,
             _,
@@ -1633,7 +1640,16 @@ class CASE(nn.Module):
             else:
                 self.optimizer.zero_grad()
         
-        with torch.cuda.amp.autocast():
+        # [V9 精度上下文自适应]: fp32 为原生无损计算 (nullcontext)；bf16/fp16 为硬件加速
+        precision_mode = getattr(config, 'precision', 'fp32')
+        if precision_mode == 'fp16':
+            amp_ctx = torch.cuda.amp.autocast(dtype=torch.float16)
+        elif precision_mode == 'bf16':
+            amp_ctx = torch.cuda.amp.autocast(dtype=torch.bfloat16)
+        else:
+            amp_ctx = contextlib.nullcontext()
+        
+        with amp_ctx:
             # Encode Context
             src_mask = enc_batch.data.eq(config.PAD_idx).unsqueeze(1)
             mask_emb = self.embedding(batch["mask_input"])
@@ -2060,7 +2076,10 @@ class CASE(nn.Module):
             if getattr(self, 'use_pcgrad', False) and self.dataset == "ED":
                 # [V8.2 创新机制 2: PCGrad 多任务对抗梯度正交投影]
                 # 1. 计算自回归语言生成核心任务梯度
-                self.scaler.scale(loss_gen).backward(retain_graph=True)
+                if self.scaler is not None:
+                    self.scaler.scale(loss_gen).backward(retain_graph=True)
+                else:
+                    loss_gen.backward(retain_graph=True)
                 grads_gen = {p: p.grad.clone() for p in self.parameters() if p.grad is not None}
                 
                 # 清除当前梯度缓存以隔离第二任务
@@ -2068,7 +2087,10 @@ class CASE(nn.Module):
                     p.grad = None
                 
                 # 2. 计算辅助情感分类/原型对比学习任务梯度
-                self.scaler.scale(loss_emo).backward()
+                if self.scaler is not None:
+                    self.scaler.scale(loss_emo).backward()
+                else:
+                    loss_emo.backward()
                 grads_emo = {p: p.grad.clone() for p in self.parameters() if p.grad is not None}
                 
                 # 3. 共有参数上的负内积冲突检测与标准对称双向正交投影 (Symmetric PCGrad)
@@ -2099,11 +2121,18 @@ class CASE(nn.Module):
                     elif g_emo is not None:
                         p.grad = g_emo
             else:
-                self.scaler.scale(loss).backward()
+                if self.scaler is not None:
+                    self.scaler.scale(loss).backward()
+                else:
+                    loss.backward()
 
             if (iter + 1) % accum_steps == 0:
-                self.scaler.step(self.optimizer.optimizer if config.noam else self.optimizer)
-                self.scaler.update()
+                opt = self.optimizer.optimizer if config.noam else self.optimizer
+                if self.scaler is not None:
+                    self.scaler.step(opt)
+                    self.scaler.update()
+                else:
+                    opt.step()
             
             # [V8.2 B 关键修复] 学习率退火与冻结逻辑解绑：
             # 无论是否冻结分类头，只要达到退火起始点，强制执行余弦/线性学习率衰减 (从 ~3.125e-4 降至 ~1e-5)

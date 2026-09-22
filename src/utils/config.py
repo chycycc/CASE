@@ -51,6 +51,10 @@ def get_args():
     
     # Train/Test
     parser.add_argument("--batch_size", type=int, default=16)
+    parser.add_argument("--accum_steps", type=int, default=1,
+                        help="[V9 解绑妥协] 梯度累加步数 (24GB 大 Batch 推荐 1，4GB 显存调试时可设为 4)")
+    parser.add_argument("--precision", type=str, default="fp32", choices=["fp32", "bf16", "fp16"],
+                        help="[V9 解绑妥协] 计算精度 (24GB 推荐 fp32 全精度或 bf16，4GB 推荐 fp16)")
     parser.add_argument("--lr", type=float, default=0.0001)
     parser.add_argument("--hidden_dim", type=int, default=300)
     parser.add_argument("--emb_dim", type=int, default=300)
@@ -261,8 +265,16 @@ def get_args():
     parser.add_argument('--dropout', dest='dropout', type=float, default=0.1, help='dropout')
     
     args, _ = parser.parse_known_args()
-    cuda_id = "cuda:" + str(args.gpu)
-    args.device = torch.device(cuda_id) if torch.cuda.is_available() else 'cpu'
+    if torch.cuda.is_available():
+        gpu_count = torch.cuda.device_count()
+        target_gpu = args.gpu
+        if target_gpu < 0 or target_gpu >= gpu_count:
+            logging.warning("[*] 指定的 GPU 编号 %s 超出系统可用范围 [0, %d)，已自动回退至 cuda:0", target_gpu, gpu_count)
+            target_gpu = 0
+            args.gpu = 0
+        args.device = torch.device(f"cuda:{target_gpu}")
+    else:
+        args.device = torch.device("cpu")
     args.emb_file = args.emb_file or "vectors/glove.6B.{}d.txt".format(str(args.emb_dim))
     print_opts(args)
     
