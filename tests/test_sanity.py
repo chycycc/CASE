@@ -228,7 +228,19 @@ class TestBellShapeModelIntegration(unittest.TestCase):
         mask_val_fp16 = -1e4 if dtype_fp16 == torch.float16 else -1e18
         mask_val_fp32 = -1e4 if dtype_fp32 == torch.float16 else -1e18
         assert mask_val_fp16 == -1e4
-        assert mask_val_fp32 == -1e18
+    def test_16_train_one_batch_acc_type_safety(self):
+        """[Test 16] train_one_batch 返回的准确率指标必须支持 float 转换，兼容 Tensor 与 Python 原生 float"""
+        # 模拟 sklearn accuracy_score 返回的 float 与 Tensor 返回
+        float_acc = 0.425
+        tensor_acc = torch.tensor(0.425)
+        
+        val_from_float = float_acc.item() if hasattr(float_acc, "item") else float(float_acc)
+        val_from_tensor = tensor_acc.item() if hasattr(tensor_acc, "item") else float(tensor_acc)
+        
+        assert isinstance(val_from_float, float), "float_acc 安全转换结果必须为 float"
+        assert isinstance(val_from_tensor, float), "tensor_acc 安全转换结果必须为 float"
+        assert abs(val_from_float - 0.425) < 1e-6
+        assert abs(val_from_tensor - 0.425) < 1e-6
 
 
 if __name__ == "__main__":

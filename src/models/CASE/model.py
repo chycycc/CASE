@@ -2171,9 +2171,9 @@ class CASE(nn.Module):
             ctx_loss.item(),
             math.exp(min(ctx_loss.item(), 100)),
             str_loss.item() if self.dataset=="ESConv" else 0,
-            strategy_acc.item() if self.dataset=="ESConv" else 0,
+            (strategy_acc.item() if hasattr(strategy_acc, "item") else float(strategy_acc)) if self.dataset=="ESConv" else 0,
             emotion_loss.item() if self.dataset=="ED" else 0,
-            emotion_acc.item() if self.dataset=="ED" else 0,
+            (emotion_acc.item() if hasattr(emotion_acc, "item") else float(emotion_acc)) if self.dataset=="ED" else 0,
             epcl_loss.item() if self.dataset=="ED" else 0,
             dec_emo_loss.item() if self.dataset=="ED" else 0  # [V4 Trial 8] Decoder MIM 损失可观测性
         )

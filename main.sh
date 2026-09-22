@@ -17,6 +17,8 @@ GPU_ID=${CUDA_VISIBLE_DEVICES:-"0"}
 SEED=13
 PRETRAIN_EPOCH=4
 
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+
 if [ "$ENV_MODE" = "4G" ]; then
     echo "======================================================================"
     echo "[*] 加载 4GB 显存轻量模式 (RTX 3050Ti 本地兼容调试)"
@@ -31,17 +33,29 @@ if [ "$ENV_MODE" = "4G" ]; then
 else
     echo "======================================================================"
     echo "[*] 加载 24GB 显存生产级全量模式 (RTX 4090 / 3090 旗舰训练)"
-    echo "    - 特性: FP32 全精度原生无损 + 单步大 Batch 64 + 零梯度累加 (每步更新)"
+    echo "    - 特性: FP32 全精度原生无损 + 单步 Batch 32 x 累加 2 (等效 Batch 64) + 显存安全可控"
     echo "======================================================================"
-    BATCH_SIZE=64
-    ACCUM_STEPS=1
+    # 【方案 2: 当前激活】等效 Batch 64 (单步物理 32 x 累加 2，显存峰值约 12GB，兼顾大批次稳定性与防 OOM)
+    BATCH_SIZE=32
+    ACCUM_STEPS=2
     PRECISION="fp32"  # 4090 也可换为 bf16
     LR=0.0003
     WARMUP=2000
     OUTPUT_DIR="save/v9_24g_baseline/"
+
+    # 【方案 1: 备用注释】100% 还原原作者 ACL 2023 官方默认基准 (单步物理 16，零累加，显存峰值约 7GB)
+    # BATCH_SIZE=16
+    # ACCUM_STEPS=1
+    # PRECISION="fp32"
+    # LR=0.0001
+    # WARMUP=4000
+    # OUTPUT_DIR="save/v9_24g_baseline_orig16/"
 fi
 
 # 2. 执行多任务训练
+mkdir -p logs
+LOG_FILE="logs/train.log"
+
 ${pythonpath} main.py \
   --dataset ${DATASET} \
   --gpu ${GPU_ID} \
@@ -83,7 +97,8 @@ ${pythonpath} main.py \
   --composite_emo_loss_weight 5.0 \
   --min_save_step 4500 \
   --patience 10 \
-  --model_file_path ${OUTPUT_DIR}
+  --save_path ${OUTPUT_DIR} \
+  --model_file_path ${OUTPUT_DIR} 2>&1 | tee ${LOG_FILE}
 
 echo "======================================================================"
 echo "[*] 训练完成！自动启动全量学术指标自动化审计..."
