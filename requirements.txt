@@ -1,0 +1,7 @@
+numpy
+tqdm
+scikit-learn
+matplotlib
+nltk
+tensorboardX
+vaderSentiment
