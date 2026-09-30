@@ -240,22 +240,18 @@ class PrototypeContrastiveLoss(nn.Module):
             self.prototypes.data = F.normalize(self.prototypes.data, p=2, dim=1)
             self.register_buffer("class_initialized", torch.zeros(self.total_prototypes, dtype=torch.bool))
             
-            # [V8.2 架构规范] 梯度断链防御与透明度提示:
-            # MCP (Momentum Centroid Prototypes) 机制下，原型被显式设计为不可导常量 Buffer (register_buffer)，
-            # 严格由训练与测试样本投影点云的几何重心通过 EMA（指数移动平均）客观驱动。
-            # 传统超球面斥力 uniformity_loss 作用于不可导 Buffer 时，由于张量没有梯度计算图 (grad_fn=None)，
-            # 其反向传播梯度严格为 0，仅作为一个无意义的浮点常数加入总损失。
-            # 为避免死代码误导实验者，若配置了 alpha_uni > 0，在此发出明确架构告警并在 forward 中显式置零。
+            # [V9 架构规范] MCP 模式下的超球面斥力策略说明:
+            # MCP 原型为不可导 Buffer (register_buffer)，由样本投影点云的 EMA 几何质心驱动。
+            # 传统 uniformity_loss 直接作用于不可导 Buffer 时梯度恒为 0（死代码）。
+            # [V9 修复] 改用 class_aware_uniformity_loss 作用于可导的样本投影特征 proj_norm，
+            # 且仅对不同类别的样本对施加斥力（同类样本不施力），与 alignment 拉力协同而非对抗。
             if self.alpha_uni > 0.0:
-                warn_msg = (
-                    f"[*] [架构规范警告] 当前启用 MCP 动量质心原型 (use_mcp=True)。"
-                    f"原型完全由样本特征重心驱动（属于不可导 Buffer），传统超球面均匀性损失 (uniformity_loss) "
-                    f"在此模式下无任何反向求导梯度 (grad_fn=None)！"
-                    f"配置的 alpha_uni={self.alpha_uni} 将在 forward 中被显式置零忽略。"
-                    f"若需要可导原型间斥力排斥，请切换至可学习参数原型 (use_mcp=False) 或动态超网络 (use_cchp=True)。"
+                info_msg = (
+                    f"[*] [V9 架构] MCP 模式启用类间样本级斥力 (class_aware_uniformity_loss)："
+                    f"alpha_uni={self.alpha_uni}，仅推开不同类别样本，同类样本不施力，"
+                    f"与 alignment 拉力协同驱动类内聚集 + 类间分离。"
                 )
-                print(warn_msg)
-                warnings.warn(warn_msg, UserWarning)
+                print(info_msg)
         elif self.use_cchp:
             self.cchp = ContextConditionedHyperPrototypes(
                 num_classes=num_classes,
@@ -344,21 +340,29 @@ class PrototypeContrastiveLoss(nn.Module):
             sq_pdist = sq_pdist.masked_fill(mask, float('inf'))
             return torch.logsumexp(-self.t_uniform * sq_pdist, dim=1).mean()
 
-    def sample_uniformity_loss(self, proj_norm):
+    def class_aware_uniformity_loss(self, proj_norm, labels):
         """
-        [V9 核心机制] 样本级超球面均匀分布斥力正则 (Wang & Isola, ICML 2020):
-        L_sample_uni = log E_{i,j} [ exp(-t * ||z_i - z_j||_2^2) ]
-        作用于经过投影头的可导特征向量 proj_norm [B, D]。
-        物理本质：所有样本特征互相排斥，杜绝特征空间坍缩（Dimensional Collapse），
-        配合类别对齐拉力（Alignment），使得同一类样本紧密聚合成簇（类内聚集），
-        不同类别的样本簇在超球面上彼此推远，从而驱动 EMA 动量质心原型在空间中彻底分散排开！
+        [V9 Trial 4 核心修复] 类间样本级超球面均匀分布斥力正则:
+        L_ca_uni = log E_{i,j: y_i≠y_j} [ exp(-t * ||z_i - z_j||_2^2) ]
+        
+        与原版 sample_uniformity_loss 的关键区别：
+        - 原版对所有非自身样本对无差别施加斥力，同类样本也被推开，
+          与 alignment loss 的类内聚合拉力直接对抗，导致 DBI 恶化；
+        - 本方法仅对不同类别的样本对施加斥力（同类样本不施力），
+          alignment 负责类内紧凑，class_aware_uniformity 负责类间分离，两力协同。
+        
+        参考: Wang & Isola, ICML 2020 (Alignment and Uniformity on the Hypersphere)
         """
         B = proj_norm.size(0)
         if B <= 1:
             return torch.tensor(0.0, device=proj_norm.device)
         sq_pdist = 2.0 - 2.0 * torch.matmul(proj_norm, proj_norm.T)
-        mask = torch.eye(B, device=proj_norm.device).bool()
-        sq_pdist = sq_pdist.masked_fill(mask, float('inf'))
+        # 构建掩码：自身对 + 同类样本对均不施加斥力
+        same_class = (labels.unsqueeze(0) == labels.unsqueeze(1))  # [B, B]，包含对角线
+        sq_pdist = sq_pdist.masked_fill(same_class, float('inf'))
+        # 安全检查：若批次内仅含单一类别，无异类样本对可供斥力，返回零
+        if (sq_pdist == float('inf')).all():
+            return torch.tensor(0.0, device=proj_norm.device)
         return torch.logsumexp(-self.t_uniform * sq_pdist, dim=1).mean()
 
     def forward(self, features, labels, tau=None, ctx_repr=None):
@@ -455,12 +459,13 @@ class PrototypeContrastiveLoss(nn.Module):
             loss_align = F.cross_entropy(comp_logits, target_zeros)
 
         # =========================================================================
-        # [V9 终局超球面均匀性排斥设计]
-        # 当 use_mcp=True 时，由于原型为不可导 Buffer，直接对样本可导特征调用 sample_uniformity_loss；
+        # [V9 Trial 4] 超球面均匀性排斥设计
+        # 当 use_mcp=True 时，调用 class_aware_uniformity_loss：仅推开不同类别样本，
+        #   同类样本不施力，与 alignment 拉力协同（解决 Trial 3 力学对抗导致 DBI 恶化）；
         # 当 use_mcp=False 时，原型本身为可导参数，调用 uniformity_loss(proto_norm)。
         # =========================================================================
         if self.use_mcp:
-            loss_uni = self.sample_uniformity_loss(proj_norm)
+            loss_uni = self.class_aware_uniformity_loss(proj_norm, labels)
         else:
             loss_uni = self.uniformity_loss(proto_norm)
 
@@ -1890,10 +1895,10 @@ class CASE(nn.Module):
                         self.current_projected_emotion = F.normalize(proj_temp, p=2, dim=1)
 
             # === EPCL: 原型对比学习损失计算 ===
-            # [v3 P3] Temperature Annealing (余弦退火: 0.3 -> 0.1, 回滚单锚点)
+            # [V9 Trial 4] EPCL 温度余弦退火 (0.3 → 0.1)，动态适配大批次步数
             tau_max = 0.3
             tau_min = 0.1
-            max_epcl_step = 20000  # 对应 main.py 的 iters
+            max_epcl_step = getattr(config, 'max_step', 10000)  # 动态读取，不再硬编码 20000
             current_tau = tau_min + (tau_max - tau_min) * (1 + math.cos(math.pi * min(iter, max_epcl_step) / max_epcl_step)) / 2
 
             # [v3 P3 / V7 / V8] 单锚点 EPCL 与 CCHP 位移正则项计算 (输入 target_emotion_feat)

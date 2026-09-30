@@ -6,30 +6,35 @@
 
 ## 一、双端协同架构与同步分工原则
 
-```mermaid
-graph LR
-    subgraph 本地环境 ["本地 PC (RTX 3050Ti / VS Code)"]
-        LocalCode["源码 & 文档 (Git追踪)"]
-        LocalResults["实验日志与指标汇总 (不入Git)"]
-        DocLog["v9_experiment_log.md (Git追踪)"]
-    end
-
-    subgraph 远端仓库 ["GitHub 仓库 (chycycc/CASE: v9-clean)"]
-        GitRepo["纯代码库 (已配置 .gitignore 忽略 save/ logs/ results/)"]
-    end
-
-    subgraph 云端环境 ["AutoDL 云端实例 (RTX 4090D 24GB)"]
-        CloudCode["拉取的源码"]
-        CloudRun["tmux 后台训练进程"]
-        CloudOutputs["实验产出 (save/, logs/, results/)"]
-    end
-
-    LocalCode -->|"1. git push"| GitRepo
-    GitRepo -->|"2. git pull"| CloudCode
-    CloudCode -->|"3. bash main.sh 24G"| CloudRun
-    CloudRun -->|"4. 产生大文件"| CloudOutputs
-    CloudOutputs -.->|"5. 手动下载核心文本/图表"| LocalResults
-    LocalResults -->|"6. 归纳提炼写入"| DocLog
+```text
+本地 PC · RTX 3050Ti / VS Code
+├── 源码与文档              (Git 追踪)
+├── 实验日志与指标汇总      (不入 Git)
+└── v9_experiment_log.md    (Git 追踪)
+        │
+        │ 1. git push
+        ▼
+GitHub 仓库 · chycycc/CASE: v9-clean
+└── 纯代码库 (.gitignore 忽略 save/ logs/ results/)
+        │
+        │ 2. git pull
+        ▼
+AutoDL 云端实例 · RTX 4090D 24GB
+├── 拉取的源码
+├── tmux 后台训练进程
+└── 实验产出 (save/, logs/, results/)
+        │
+        │ 3. bash main.sh 24G
+        ▼
+训练产出：save/ · logs/ · results/
+        │
+        │ 4. 手动下载核心文本/图表
+        ▼
+本地实验日志与指标汇总 (不入 Git)
+        │
+        │ 5. 归纳提炼写入
+        ▼
+v9_experiment_log.md (Git 追踪)
 ```
 
 ### 1. 同步准则（红线纪律）

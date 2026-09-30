@@ -250,8 +250,8 @@ class TestBellShapeModelIntegration(unittest.TestCase):
         assert config.check_iter > 0, "评估间隔必须大于 0"
         assert config.max_step > config.check_iter, "最大训练步数必须大于评估间隔"
 
-    def test_18_sample_uniformity_loss_properties(self):
-        """[Test 18] 样本级超球面均匀度损失 (sample_uniformity_loss) 数值有界性与梯度回传能力"""
+    def test_18_class_aware_uniformity_loss_properties(self):
+        """[Test 18] V9 Trial 4 类间样本级均匀度斥力必须可导、数值有限、且同类样本不施力"""
         import torch.nn.functional as F
         from src.models.CASE.model import PrototypeContrastiveLoss
         epcl_loss_fn = PrototypeContrastiveLoss(num_classes=32, input_dim=64, use_mcp=True)
@@ -260,14 +260,22 @@ class TestBellShapeModelIntegration(unittest.TestCase):
         B, D = 16, 64
         feat = torch.randn(B, D, requires_grad=True)
         feat_norm = F.normalize(feat, p=2, dim=-1)
+        labels = torch.randint(0, 32, (B,))
         
-        uni_loss = epcl_loss_fn.sample_uniformity_loss(feat_norm)
+        uni_loss = epcl_loss_fn.class_aware_uniformity_loss(feat_norm, labels)
         assert torch.isfinite(uni_loss), "均匀度损失必须为有限浮点数"
         assert uni_loss.requires_grad, "均匀度损失必须可导"
         
         uni_loss.backward()
         assert feat.grad is not None, "样本特征梯度不得为 None"
         assert torch.isfinite(feat.grad).all(), "梯度必须数值健康"
+        
+        # 验证：若批次内全为同一类别，斥力损失应为 0（无异类样本对可施力）
+        feat2 = torch.randn(B, D, requires_grad=True)
+        feat2_norm = F.normalize(feat2, p=2, dim=-1)
+        same_labels = torch.zeros(B, dtype=torch.long)
+        uni_loss_same = epcl_loss_fn.class_aware_uniformity_loss(feat2_norm, same_labels)
+        assert uni_loss_same.item() == 0.0, "同类批次斥力损失必须为零"
 
     def test_19_v9_lr_decay_configs(self):
         """[Test 19] V9 学习率退火生命周期参数 (lr_decay_start_step, lr_decay_steps) 必须合法"""
