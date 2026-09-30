@@ -252,6 +252,10 @@ def get_args():
                         help="[V9] 正式多任务训练最大总步数上限 (默认 10000 步，约 32 个 Epoch)")
     parser.add_argument("--exp_name", type=str, default="v9_trial2",
                         help="[V9] 当前实验标识代号，用于隔离权重与评测产出")
+    parser.add_argument("--lr_decay_start_step", type=int, default=3000,
+                        help="[V9] 学习率退火启动步数 (默认 3000 步，适配 10000 步生命周期)")
+    parser.add_argument("--lr_decay_steps", type=int, default=7000,
+                        help="[V9] 学习率退火跨度步数 (默认 7000 步)")
 
     parser.add_argument("--min_save_step", type=int, default=0,
                         help="[V8.2 E] 退火成熟保护期步数 (默认0，V8.2 E 推荐 32000，保护期内不累加早停耐心)")

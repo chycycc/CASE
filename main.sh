@@ -9,9 +9,9 @@ set -e
 pythonpath='python'
 
 # 1. 核心硬件运行模式与实验代号支持
-# 支持命令行指定: ./main.sh 24G v9_trial2 (默认生产全量) 或 ./main.sh 4G v9_debug_4g
+# 支持命令行指定: ./main.sh 24G v9_trial3 (默认生产全量) 或 ./main.sh 4G v9_debug_4g
 ENV_MODE=${1:-"24G"}
-EXP_NAME=${2:-"v9_trial2"}
+EXP_NAME=${2:-"v9_trial3"}
 
 DATASET='ED'
 GPU_ID=${CUDA_VISIBLE_DEVICES:-"0"}
@@ -48,7 +48,7 @@ else
     BATCH_SIZE=32
     ACCUM_STEPS=2
     PRECISION="fp32"  # 4090 也可换为 bf16
-    LR=0.0003
+    LR=0.0002
     WARMUP=2000
     CHECK_ITER=500
     MAX_STEP=10000
@@ -92,6 +92,9 @@ ${pythonpath} main.py \
   --precision ${PRECISION} \
   --lr ${LR} \
   --warmup ${WARMUP} \
+  --lr_schedule cosine \
+  --lr_decay_start_step 3000 \
+  --lr_decay_steps 6000 \
   --check_iter ${CHECK_ITER} \
   --max_step ${MAX_STEP} \
   --pretrain \
@@ -102,6 +105,7 @@ ${pythonpath} main.py \
   --use_mcp \
   --mcp_momentum 0.96 \
   --lambda_epcl 0.07 \
+  --alpha_uni 1.5 \
   --arc_margin 0.30 \
   --arc_mode cos \
   --epcl_anchor fine_emotion \
@@ -110,20 +114,20 @@ ${pythonpath} main.py \
   --emo_vocab_topk_ratio 0.15 \
   --emo_bias_gate_init -2.0 \
   --use_pcgrad \
-  --gate_warmup_steps 3000 \
+  --gate_warmup_steps 2500 \
   --mask_update_interval 1000 \
   --use_bias_annealing \
-  --bias_anneal_start 5000 \
-  --bias_anneal_steps 3000 \
-  --bias_min_scale 0.10 \
+  --bias_anneal_start 2500 \
+  --bias_anneal_steps 2500 \
+  --bias_min_scale 0.05 \
   --use_emo_loss_ramp \
-  --emo_loss_ramp_start 3500 \
-  --emo_loss_ramp_steps 3000 \
-  --emo_loss_ramp_max 1.30 \
+  --emo_loss_ramp_start 2500 \
+  --emo_loss_ramp_steps 2500 \
+  --emo_loss_ramp_max 1.25 \
   --emo_loss_ramp_shape bell \
   --use_composite_score \
   --composite_mode emo_loss \
-  --composite_emo_loss_weight 5.0 \
+  --composite_emo_loss_weight 3.0 \
   --min_save_step ${MIN_SAVE_STEP} \
   --patience ${PATIENCE} \
   --save_path ${OUTPUT_DIR} \

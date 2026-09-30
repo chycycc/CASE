@@ -248,7 +248,34 @@ class TestBellShapeModelIntegration(unittest.TestCase):
         assert hasattr(config, "max_step"), "config 必须包含 max_step 参数"
         assert hasattr(config, "exp_name"), "config 必须包含 exp_name 参数"
         assert config.check_iter > 0, "评估间隔必须大于 0"
-        assert config.max_step >= config.check_iter, "最大步数上限必须大于等于单次评估间隔"
+        assert config.max_step > config.check_iter, "最大训练步数必须大于评估间隔"
+
+    def test_18_sample_uniformity_loss_properties(self):
+        """[Test 18] 样本级超球面均匀度损失 (sample_uniformity_loss) 数值有界性与梯度回传能力"""
+        import torch.nn.functional as F
+        from src.models.CASE.model import PrototypeContrastiveLoss
+        epcl_loss_fn = PrototypeContrastiveLoss(num_classes=32, input_dim=64, use_mcp=True)
+        
+        # 模拟经过 L2 归一化的样本投影特征
+        B, D = 16, 64
+        feat = torch.randn(B, D, requires_grad=True)
+        feat_norm = F.normalize(feat, p=2, dim=-1)
+        
+        uni_loss = epcl_loss_fn.sample_uniformity_loss(feat_norm)
+        assert torch.isfinite(uni_loss), "均匀度损失必须为有限浮点数"
+        assert uni_loss.requires_grad, "均匀度损失必须可导"
+        
+        uni_loss.backward()
+        assert feat.grad is not None, "样本特征梯度不得为 None"
+        assert torch.isfinite(feat.grad).all(), "梯度必须数值健康"
+
+    def test_19_v9_lr_decay_configs(self):
+        """[Test 19] V9 学习率退火生命周期参数 (lr_decay_start_step, lr_decay_steps) 必须合法"""
+        assert hasattr(config, "lr_decay_start_step"), "config 必须包含 lr_decay_start_step"
+        assert hasattr(config, "lr_decay_steps"), "config 必须包含 lr_decay_steps"
+        assert config.lr_decay_start_step >= 0, "退火起始步必须非负"
+        assert config.lr_decay_steps > 0, "退火跨度必须大于 0"
+
         assert isinstance(config.exp_name, str) and len(config.exp_name) > 0, "exp_name 必须为非空字符串"
 
 

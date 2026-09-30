@@ -344,6 +344,23 @@ class PrototypeContrastiveLoss(nn.Module):
             sq_pdist = sq_pdist.masked_fill(mask, float('inf'))
             return torch.logsumexp(-self.t_uniform * sq_pdist, dim=1).mean()
 
+    def sample_uniformity_loss(self, proj_norm):
+        """
+        [V9 核心机制] 样本级超球面均匀分布斥力正则 (Wang & Isola, ICML 2020):
+        L_sample_uni = log E_{i,j} [ exp(-t * ||z_i - z_j||_2^2) ]
+        作用于经过投影头的可导特征向量 proj_norm [B, D]。
+        物理本质：所有样本特征互相排斥，杜绝特征空间坍缩（Dimensional Collapse），
+        配合类别对齐拉力（Alignment），使得同一类样本紧密聚合成簇（类内聚集），
+        不同类别的样本簇在超球面上彼此推远，从而驱动 EMA 动量质心原型在空间中彻底分散排开！
+        """
+        B = proj_norm.size(0)
+        if B <= 1:
+            return torch.tensor(0.0, device=proj_norm.device)
+        sq_pdist = 2.0 - 2.0 * torch.matmul(proj_norm, proj_norm.T)
+        mask = torch.eye(B, device=proj_norm.device).bool()
+        sq_pdist = sq_pdist.masked_fill(mask, float('inf'))
+        return torch.logsumexp(-self.t_uniform * sq_pdist, dim=1).mean()
+
     def forward(self, features, labels, tau=None, ctx_repr=None):
         current_tau = tau if tau is not None else self.temperature
 
@@ -438,34 +455,12 @@ class PrototypeContrastiveLoss(nn.Module):
             loss_align = F.cross_entropy(comp_logits, target_zeros)
 
         # =========================================================================
-        # [V8.2 终局规范改造] 超球面均匀性损失 (uniformity_loss) 的梯度断链防御与显式置零
-        # =========================================================================
-        # 【架构理论复盘与逻辑排查】
-        # 1. 梯度断链的本质原因:
-        #    在 MCP 模式 (use_mcp=True) 下，self.prototypes 被注册为不可导 Buffer (register_buffer, requires_grad=False)。
-        #    其原型位置完全由样本投影特征点云的物理重心通过 EMA (动量累积) 推进。
-        #    如果直接调用 self.uniformity_loss(proto_norm)，返回的标量损失其 grad_fn 为 None。
-        #    将其乘上 self.alpha_uni 加入总损失后，反向传播对其求导得到的梯度严格为 0。
-        #    在 V8 系列早期实验中，该损失实际上仅作为一个无梯度的常数浮点数存在，未产生任何排斥约束力。
-        #
-        # 2. 为什么不宜采用替代方案 (不可行性论证):
-        #    (A) 方案一：为 MCP 原型恢复 requires_grad=True。
-        #        不可行。若既施加基于梯度的斥力更新，又在每个 batch 强行用 EMA 样本重心覆写，两者在流形上
-        #        会发生剧烈的方向拉扯（梯度试图推散，EMA 试图贴合样本），导致原型在超球面上剧烈抖动，
-        #        破坏 MCP 带来的 0.92+ 超高质心重合度 (Alignment)。
-        #    (B) 方案二：用当前 batch 内各类别的临时样本平均中心 z_c 代替原型计算均匀性损失。
-        #        不可行。当前 batch (B=4~8) 极小，单步最多只能覆盖 5~8 个情感类别，绝大多数类别在当前 batch
-        #        中样本数为 0。用局部不完整的样本中心计算斥力，方差极大，且只能提供破碎的局部斥力信号，
-        #        极易引发特征崩溃和训练发散。
-        #
-        # 3. 规范化工程决策 (死代码消除与零开销保障):
-        #    - 当 use_mcp=True 时，显式将 loss_uni 置为 torch.tensor(0.0, device=features.device)。
-        #      这彻底消除了 O(C^2 * D) 的无用矩阵配对计算开销，避免任何隐式死代码误导实验人员。
-        #    - 当 use_mcp=False 时 (如传统 nn.Parameter 静态原型或动态超网络 CCHP)，原型属于完全可导变量，
-        #      正常调用 self.uniformity_loss(proto_norm) 享受完整的超球面均匀排斥正则。
+        # [V9 终局超球面均匀性排斥设计]
+        # 当 use_mcp=True 时，由于原型为不可导 Buffer，直接对样本可导特征调用 sample_uniformity_loss；
+        # 当 use_mcp=False 时，原型本身为可导参数，调用 uniformity_loss(proto_norm)。
         # =========================================================================
         if self.use_mcp:
-            loss_uni = torch.tensor(0.0, device=features.device)
+            loss_uni = self.sample_uniformity_loss(proj_norm)
         else:
             loss_uni = self.uniformity_loss(proto_norm)
 
@@ -2137,18 +2132,24 @@ class CASE(nn.Module):
             # [V8.2 B 关键修复] 学习率退火与冻结逻辑解绑：
             # 无论是否冻结分类头，只要达到退火起始点，强制执行余弦/线性学习率衰减 (从 ~3.125e-4 降至 ~1e-5)
             # 在 --disable_freeze (全程联合微调) 下，以 anneal_start_step (默认 24000) 为退火起点；
-            # 在冻结模式下，以 freeze_anchor 为退火起点。
-            if getattr(config, 'disable_freeze', False):
+            # [V9 学习率退火重构] 彻底解耦分类头冻结强前置条件，适配 10k 步大批次生命周期
+            if hasattr(config, 'lr_decay_start_step') and config.lr_decay_start_step is not None:
+                decay_start = config.lr_decay_start_step
+                should_decay = (iter > decay_start)
+                decay_origin = decay_start
+                total_decay_steps = float(getattr(config, 'lr_decay_steps', 7000))
+            elif getattr(config, 'disable_freeze', False):
                 decay_start = getattr(config, 'anneal_start_step', 24000)
                 should_decay = (iter > decay_start)
                 decay_origin = decay_start
+                total_decay_steps = 22000.0
             else:
                 freeze_anchor = self.actual_freeze_step if config.adaptive_freeze else config.epcl_freeze_step
                 should_decay = (is_currently_frozen and iter > freeze_anchor)
                 decay_origin = freeze_anchor
+                total_decay_steps = 22000.0
 
             if config.noam and should_decay:
-                total_decay_steps = 22000.0  # 退火跨度（约 22k 步平滑衰减至 1e-5）
                 progress = min((iter - decay_origin) / total_decay_steps, 1.0)
                 base_lr = self.optimizer._rate if self.optimizer._rate > 0 else 3.125e-4
                 lr_min = base_lr * 0.03  # 最低 LR ≈ 1e-5

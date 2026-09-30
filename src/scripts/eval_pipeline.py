@@ -145,16 +145,48 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
     config.dataset = "ED"
     config.batch_size = batch_size
     config.woStrategy = True
-    config.emotion_head_type = "residual_mlp"
     config.mlp_hidden_dim = 300
     config.mlp_dropout = 0.1
     config.num_prototypes_per_class = 1
-    config.use_pcam = True
     config.pcam_heads = 2
     config.pcam_dropout = 0.1
     config.pcam_gate_bias = -1.0
     
-    config.use_erp = use_erp
+    # 预检检查点拓扑结构，自适应匹配分类头、PCAM 与 ERP，杜绝拓扑错配导致权重漏载
+    if os.path.exists(checkpoint_path):
+        print(f"[*] 预检检查点权重以自适应对齐模型拓扑: {checkpoint_path}")
+        state_preview = torch.load(checkpoint_path, map_location="cpu")
+        raw_keys = state_preview["model"].keys() if "model" in state_preview else state_preview.keys()
+        
+        # 1. 情绪分类头自适应
+        if any("emotion_linear.linear_2." in k or "emotion_linear.block." in k for k in raw_keys):
+            config.emotion_head_type = "residual_mlp"
+            print("    [自适应拓扑] 检测到残差 MLP 键，配置 config.emotion_head_type = 'residual_mlp'")
+        else:
+            config.emotion_head_type = "linear"
+            print("    [自适应拓扑] 未检测到残差 MLP，配置标准分类头 config.emotion_head_type = 'linear'")
+            
+        # 2. 原型交叉注意力 (PCAM) 自适应
+        if any("pcam." in k for k in raw_keys):
+            config.use_pcam = True
+            print("    [自适应拓扑] 检测到 PCAM 权重，配置 config.use_pcam = True")
+        else:
+            config.use_pcam = False
+            print("    [自适应拓扑] 未检测到 PCAM 权重，配置 config.use_pcam = False")
+            
+        # 3. 情感响应先验 (ERP) 自适应
+        if any("erp." in k for k in raw_keys):
+            config.use_erp = True
+            print("    [自适应拓扑] 检测到 ERP 权重，配置 config.use_erp = True")
+        else:
+            config.use_erp = False
+            print("    [自适应拓扑] 未检测到 ERP 权重，配置 config.use_erp = False")
+        del state_preview
+    else:
+        config.emotion_head_type = getattr(config, "emotion_head_type", "linear")
+        config.use_pcam = getattr(config, "use_pcam", False)
+        config.use_erp = use_erp
+
     config.erp_hidden_dim = 768
     config.erp_dropout = 0.1
     
