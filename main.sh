@@ -11,7 +11,7 @@ pythonpath='python'
 # 1. 核心硬件运行模式与实验代号支持
 # 支持命令行指定: ./main.sh 24G v9_trial3 (默认生产全量) 或 ./main.sh 4G v9_debug_4g
 ENV_MODE=${1:-"24G"}
-EXP_NAME=${2:-"v9_trial5"}
+EXP_NAME=${2:-"v9_trial6"}
 
 DATASET='ED'
 GPU_ID=${CUDA_VISIBLE_DEVICES:-"0"}
@@ -51,7 +51,7 @@ else
     LR=0.0002
     WARMUP=2000
     CHECK_ITER=500
-    MAX_STEP=12000
+    MAX_STEP=10000
     MIN_SAVE_STEP=3000
     PATIENCE=6
     OUTPUT_DIR="save/${EXP_NAME}/"
@@ -94,7 +94,7 @@ ${pythonpath} main.py \
   --warmup ${WARMUP} \
   --lr_schedule cosine \
   --lr_decay_start_step 3000 \
-  --lr_decay_steps 8000 \
+  --lr_decay_steps 6000 \
   --check_iter ${CHECK_ITER} \
   --max_step ${MAX_STEP} \
   --pretrain \
