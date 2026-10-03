@@ -144,3 +144,19 @@ ${pythonpath} src/scripts/eval_pipeline.py \
   --plot_path "results/v9/${EXP_NAME}_manifold.png" \
   --batch_size ${BATCH_SIZE} \
   --gpu ${GPU_ID}
+
+# 3. 汇总所有需要回传本地的文件到统一下载目录
+DOWNLOAD_DIR="${HOME}/autodl-tmp/download/${EXP_NAME}"
+mkdir -p "${DOWNLOAD_DIR}"
+cp -f "${LOG_FILE}" "${DOWNLOAD_DIR}/" 2>/dev/null || true
+cp -f "${OUTPUT_DIR}/eval_metrics.json" "${DOWNLOAD_DIR}/" 2>/dev/null || true
+cp -f "results/v9/${EXP_NAME}_eval.txt" "${DOWNLOAD_DIR}/" 2>/dev/null || true
+cp -f "results/v9/${EXP_NAME}_manifold.png" "${DOWNLOAD_DIR}/" 2>/dev/null || true
+cp -f "results/v9/${EXP_NAME}_results.txt" "${DOWNLOAD_DIR}/" 2>/dev/null || true
+
+echo "======================================================================"
+echo "[*] 全部完成！需要回传的文件已汇总至:"
+echo "    ${DOWNLOAD_DIR}/"
+echo "    包含: ${EXP_NAME}.log, eval_metrics.json, *_eval.txt, *_manifold.png, *_results.txt"
+echo "======================================================================"
+ls -lh "${DOWNLOAD_DIR}/"
