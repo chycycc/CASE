@@ -26,9 +26,9 @@ AutoDL 云端实例 · RTX 4090D 24GB
         │
         │ 3. bash main.sh 24G
         ▼
-训练产出：save/ · logs/ · results/
+训练产出：自动汇总至 download/{EXP_NAME}/
         │
-        │ 4. 手动下载核心文本/图表
+        │ 4. 一键下载该文件夹并本地归档
         ▼
 本地实验日志与指标汇总 (不入 Git)
         │
@@ -130,23 +130,26 @@ rm -rf /root/tf-logs && ln -s $(pwd)/save /root/tf-logs
   bash eval.sh v9_trial3
   ```
 
-### 步骤 7：结果文件回传与本地归档（最关键的手动步骤）
-训练与评测全部结束后，通过 AutoDL 网页端 / JupyterLab 界面将以下文件下载到本地电脑的对应位置：
+### 步骤 7：结果文件回传与本地归档
 
-1. **从云端 `logs/` 下载**：
-   - 云端文件：`logs/v9_trial3.log`
-   - 保存至本地：`E:\github\CASE\logs\v9_trial3.log`
-2. **从云端 `results/v9/` 下载**：
-   - 云端文件：`results/v9/v9_trial3_eval.txt`（学术指标报告）
-   - 云端文件：`results/v9/v9_trial3_manifold.png`（流形图）
-   - 云端文件：`results/v9/v9_trial3_results.txt`（对话生成样例，可选）
-   - 保存至本地：`E:\github\CASE\results\v9\`
-3. **从云端 `save/v9_trial3/` 下载**：
-   - 云端文件：`save/v9_trial3/eval_metrics.json`
-   - 保存至本地：`E:\github\CASE\save\v9_trial3\eval_metrics.json`
-4. **整理进学术日志**：
-   - 打开本地 [`docs/v9/v9_experiment_log.md`](file:///e:/github/CASE/docs/v9/v9_experiment_log.md)，将本次实验的核心指标、现象对比与分析填入表格；
-   - 本地执行 Git 提交并推送该文档，完成实验闭环！
+`main.sh` 运行完毕后会自动将所有评测产物集中收集到统一下载目录：`autodl-tmp/download/{EXP_NAME}/`，无需在多个路径逐个翻找。
+
+1. **一键下载**：
+   在 JupyterLab 中直接右键下载 `autodl-tmp/download/v9_trial3/` 整个文件夹到本地（如桌面）。内含 5 个核心文件：
+   - `v9_trial3.log`（全量训练日志）
+   - `eval_metrics.json`（核心数值指标）
+   - `v9_trial3_eval.txt`（学术指标报告）
+   - `v9_trial3_manifold.png`（流形图）
+   - `v9_trial3_results.txt`（生成样例）
+
+2. **本地归档**：
+   将文件移至本地对应目录（亦可直接让助手协助移动）：
+   - `*.log` → `logs/`
+   - `eval_metrics.json` → `save/v9_trial3/`
+   - `*_eval.txt` / `*_manifold.png` / `*_results.txt` → `results/v9/`
+
+3. **记录与闭环**：
+   在 [`docs/v9/v9_experiment_log.md`](file:///e:/github/CASE/docs/v9/v9_experiment_log.md) 中记录指标对比与实验分析，执行 Git 提交推送。
 
 ---
 
