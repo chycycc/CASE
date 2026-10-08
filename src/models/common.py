@@ -8,6 +8,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from src.utils.config import config
+from src.utils.constants import ED_MAP_EMO, ESC_MAP_EMO
 from tqdm import tqdm
 
 if config.model == "trs" or config.model == "multi-trs":
@@ -943,10 +944,12 @@ def write_config():
                     the_file.write("--{} {} ".format(k, v))
 
 
-def print_custum(emotion, dial, ref, hyp_b, hyp_g, pred_emotions, comet_res):
+def print_custum(emotion, dial, ref, hyp_b, hyp_g, pred_emotions, comet_res, pred_emotion=""):
     res = ""
     res += "Emotion: {}".format(emotion) + "\n"
-    if pred_emotions:
+    if pred_emotion:
+        res += "Predicted Emotion: {}".format(pred_emotion) + "\n"
+    elif pred_emotions:
         res += "Pred Emotions: {}".format(pred_emotions) + "\n"
     if comet_res:
         for k, v in comet_res.items():
@@ -1015,10 +1018,26 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
                 sent_g = model.decoder_greedy(batch, max_dec_step=max_dec_step)
                 if config.model != "empdg":
                     sent_b = t.beam_search(batch, max_dec_step=max_dec_step)
+
+                # [Phase 7 / A6] 提取逐样本预测情感标签，支持 McNemar 配对检验
+                pred_emo_names = []
+                emo_map = ESC_MAP_EMO if getattr(config, 'dataset', 'ED') == "ESConv" else ED_MAP_EMO
+                if hasattr(model, 'current_emo_logits') and model.current_emo_logits is not None:
+                    pred_emo_idx = torch.argmax(model.current_emo_logits, dim=-1).detach().cpu().tolist()
+                    if isinstance(pred_emo_idx, int):
+                        pred_emo_idx = [pred_emo_idx]
+                    pred_emo_names = [emo_map.get(idx, str(idx)) for idx in pred_emo_idx]
+                elif hasattr(model, 'current_pred_emotion') and model.current_pred_emotion is not None:
+                    cur_preds = model.current_pred_emotion
+                    if isinstance(cur_preds, (int, np.integer)):
+                        cur_preds = [cur_preds]
+                    pred_emo_names = [emo_map.get(int(idx), str(idx)) for idx in cur_preds]
+
                 for i, greedy_sent in enumerate(sent_g):
                     rf = " ".join(batch["target_txt"][i])
                     hyp_g.append(greedy_sent)
                     ref.append(rf)
+                    pred_emo_i = pred_emo_names[i] if i < len(pred_emo_names) else ""
                     temp = print_custum(
                         emotion=batch["program_txt"][i],
                         dial=[" ".join(s) for s in batch["input_txt"][i]],
@@ -1027,6 +1046,7 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
                         hyp_g=greedy_sent,
                         pred_emotions=top_preds,
                         comet_res=comet_res,
+                        pred_emotion=pred_emo_i,
                     )
                     results.append(temp)
             pbar.set_description(
