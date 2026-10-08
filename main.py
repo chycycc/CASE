@@ -4,6 +4,7 @@ from tqdm import tqdm
 from copy import deepcopy
 from tensorboardX import SummaryWriter
 from torch.nn.init import xavier_uniform_
+import torch
 
 from src.utils.config import config
 from src.utils.common import set_seed
