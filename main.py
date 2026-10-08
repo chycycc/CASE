@@ -81,6 +81,18 @@ def train(model, train_set, dev_set):
         writer = SummaryWriter(log_dir=config.save_path)
         weights_best = deepcopy(model.state_dict())
         data_iter = make_infinite(train_set)
+
+        # [Phase 7] 主阶段 LR 显式注入
+        actual_lr = config.lr
+        inner_opt = model.optimizer.optimizer if hasattr(model.optimizer, 'optimizer') else model.optimizer
+        for param_group in inner_opt.param_groups:
+            param_group['lr'] = actual_lr
+        if hasattr(model.optimizer, '_rate'):
+            model.optimizer._rate = actual_lr
+        if hasattr(model, 'peak_lr'):
+            model.peak_lr = actual_lr
+        print(f"[LR Override] 主阶段峰值 LR 已显式设定为: {actual_lr:.6e}")
+
         for n_iter in tqdm(range(max_step)):
             bow_loss, kl_loss, mim_loss, ctx_loss, ppl, str_loss, str_acc, emo_loss, emo_acc, epcl_loss, dec_emo_loss = model.train_one_batch(next(data_iter), n_iter)
             writer.add_scalars("bow_loss", {"loss_train": bow_loss}, n_iter)
