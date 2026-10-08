@@ -11,7 +11,7 @@ pythonpath='python'
 # 1. 核心硬件运行模式与实验代号支持
 # 支持命令行指定: ./main.sh 24G v9_trial3 (默认生产全量) 或 ./main.sh 4G v9_debug_4g
 ENV_MODE=${1:-"24G"}
-EXP_NAME=${2:-"v9_trial6"}
+EXP_NAME=${2:-"v9_trial7"}
 
 DATASET='ED'
 GPU_ID=${CUDA_VISIBLE_DEVICES:-"0"}
@@ -48,7 +48,7 @@ else
     BATCH_SIZE=32
     ACCUM_STEPS=2
     PRECISION="fp32"  # 4090 也可换为 bf16
-    LR=0.0002
+    LR=0.000576
     WARMUP=2000
     CHECK_ITER=500
     MAX_STEP=10000
@@ -127,7 +127,7 @@ ${pythonpath} main.py \
   --emo_loss_ramp_shape bell \
   --use_composite_score \
   --composite_mode emo_loss \
-  --composite_emo_loss_weight 3.0 \
+  --composite_emo_loss_weight 5.0 \
   --min_save_step ${MIN_SAVE_STEP} \
   --patience ${PATIENCE} \
   --save_path ${OUTPUT_DIR} \

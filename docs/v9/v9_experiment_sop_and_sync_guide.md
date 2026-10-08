@@ -1,175 +1,122 @@
-# CASE-EPCL V9 实验全流程标准作业程序 (SOP) 与端云协同手册
+# CASE-EPCL 实验端云协同规范与 AI 执行手册
 
-> **编制目的**：本项目采用“本地 IDE 编码分析 + GitHub 远端代码流转 + AutoDL 云端 24G 算力执行 + 手动同步实验结果”的协同架构。为防止多实验轮次间由于路径混乱、文件覆盖或误传大文件导致代码库污染与数据丢失，特制定本标准化作业程序 (SOP)。
+> **核心原则**：
+> 1. 代码/脚本/文档走 Git（`v9-clean` 分支）；
+> 2. 权重/日志/生成产物绝不走 Git（由 `.gitignore` 阻断）；
+> 3. 产物统一汇总至云端 `autodl-tmp/download/{EXP_NAME}/`，一键下载后由 AI 标准化归档与分析。
 
 ---
 
-## 一、双端协同架构与同步分工原则
+## 一、双端流转拓扑
 
 ```text
-本地 PC · RTX 3050Ti / VS Code
-├── 源码与文档              (Git 追踪)
-├── 实验日志与指标汇总      (不入 Git)
-└── v9_experiment_log.md    (Git 追踪)
-        │
-        │ 1. git push
-        ▼
-GitHub 仓库 · chycycc/CASE: v9-clean
-└── 纯代码库 (.gitignore 忽略 save/ logs/ results/)
-        │
-        │ 2. git pull
-        ▼
-AutoDL 云端实例 · RTX 4090D 24GB
-├── 拉取的源码
-├── tmux 后台训练进程
-└── 实验产出 (save/, logs/, results/)
-        │
-        │ 3. bash main.sh 24G
-        ▼
-训练产出：自动汇总至 download/{EXP_NAME}/
-        │
-        │ 4. 一键下载该文件夹并本地归档
-        ▼
-本地实验日志与指标汇总 (不入 Git)
-        │
-        │ 5. 归纳提炼写入
-        ▼
-v9_experiment_log.md (Git 追踪)
+本地 PC (VS Code / AI 助手)
+├── 源码与文档 (src/, main.sh, docs/) ──[ git push ]──> GitHub (v9-clean)
+└── 实验归档 (logs/, results/v9/, save/)                │
+        ▲                                                │ [ git pull ]
+        │ [ 步骤 7: 一键下载与 AI 本地归档 ]                ▼
+AutoDL 实例 (RTX 4090D 24GB) ───────────────> bash main.sh 24G {EXP_NAME}
+└── 训练评测结束 ──> 自动汇聚产物至 autodl-tmp/download/{EXP_NAME}/
 ```
 
-### 1. 同步准则（红线纪律）
-1. **只走 Git 的内容**：Python 源码 (`src/`, `main.py`)、Shell 启动脚本 (`main.sh`, `eval.sh`)、单元测试 (`tests/`)、学术文档与实验记录 (`docs/`)；
-2. **严禁走 Git 的内容**：模型权重文件 (`save/` 包含几百 MB 的 `.pth`/`.pt`)、训练文本全量日志 (`logs/`)、生成解码文本与中间结果 (`results/`)；
-   - 根目录下的 [`.gitignore`](file:///e:/github/CASE/.gitignore) 已硬性屏蔽 `save/`、`logs/`、`results/`，切勿使用 `git add -f` 强行添加大文件；
-3. **实验产出同步方式**：通过 AutoDL 控制台自带的“文件下载”、JupyterLab 文件管理界面、或 Xftp/WinSCP，将云端生成的核心结果文件复制回传至本地对应目录。
+---
+
+## 二、实验产物归档矩阵 (File Matrix)
+
+每个实验代号全局唯一（如 `v9_trial3`, `v9_trial4`）。评测结束后，云端统一下载目录包含以下 5 个文件：
+
+| 文件名 | 云端来源路径 | 本地归档目标路径 | 核心用途 |
+| :--- | :--- | :--- | :--- |
+| `{EXP_NAME}.log` | `logs/{EXP_NAME}.log` | `logs/{EXP_NAME}.log` | 步数/Loss/早停记录 |
+| `eval_metrics.json` | `save/{EXP_NAME}/eval_metrics.json` | `save/{EXP_NAME}/eval_metrics.json` | 核心评测结构化数值 |
+| `{EXP_NAME}_eval.txt` | `results/v9/{EXP_NAME}_eval.txt` | `results/v9/{EXP_NAME}_eval.txt` | 学术指标综合报告 |
+| `{EXP_NAME}_manifold.png`| `results/v9/{EXP_NAME}_manifold.png`| `results/v9/{EXP_NAME}_manifold.png`| 原型空间流形分布图 |
+| `{EXP_NAME}_results.txt` | `results/v9/{EXP_NAME}_results.txt` | `results/v9/{EXP_NAME}_results.txt` | 对话生成抽样样例 |
+
+*注：模型权重（`save/{EXP_NAME}/CASE_*`，约 400MB+）仅在云端留存，无需下载到本地。*
 
 ---
 
-## 二、实验命名规范与文件存放位置矩阵 (File Matrix)
+## 三、单轮实验标准作业程序 (SOP)
 
-每个实验必须拥有一个**全局唯一的实验代号**（推荐格式：`v9_trial2`, `v9_trial3`, `v9_trial4` ...）。
-
-系统已在脚本底层实现多实验物理隔离，具体存放位置如下表：
-
-| 文件类型 | 相对路径与命名规范（以 `v9_trialX` 为例） | 产生位置 | 是否走 Git | 核心作用与回传要求 |
-| :--- | :--- | :---: | :---: | :--- |
-| **黄金模型权重** | `save/v9_trialX/CASE_<step>_<ppl>` | 云端 | ❌ 否 | 仅在云端留存用于评测；**无需下载到本地**（避免挤爆本地硬盘）。 |
-| **结构化评测指标** | `save/v9_trialX/eval_metrics.json` | 云端 | ❌ 否 | 评测脚本自动生成的 JSON 元数据；**建议下载到本地对应目录**。 |
-| **TensorBoard 事件流** | `save/v9_trialX/events.out.tfevents.*` | 云端 | ❌ 否 | 云端在线可视化；**无需下载到本地**。 |
-| **训练终端文本日志** | `logs/v9_trialX.log` | 云端 | ❌ 否 | 记录每一步 loss 与早停；**必须下载回本地 `logs/` 留存归档**。 |
-| **测试集全量生成文本** | `results/v9/v9_trialX_results.txt` | 云端 | ❌ 否 | 包含 5,255 个测试样本的回复；**建议下载回本地 `results/v9/`**。 |
-| **全量学术指标报告** | `results/v9/v9_trialX_eval.txt` | 云端 | ❌ 否 | 包含 PPL, BLEU, Dist-2, Unique 等；**必须下载回本地 `results/v9/`**。 |
-| **原型隐空间流形图** | `results/v9/v9_trialX_manifold.png` | 云端 | ❌ 否 | 高清 t-SNE 散点图；**必须下载回本地 `results/v9/` 作为论文插图**。 |
-| **全生命周期实验日志** | `docs/v9/v9_experiment_log.md` | 本地 |  是 | **核心知识资产**，由研究者依据回传的数据归纳填写，提交 Git。 |
-
----
-
-## 三、单次实验标准作业程序 (7 步闭环 SOP)
-
-以下是以启动新一轮实验 **`v9_trial3`** 为例的标准化实操流程：
-
-### 步骤 1：本地确定实验代号与超参调整
-在本地 VS Code 中，按需修改配置文件或启动脚本：
-1. 若需修改默认启动参数，编辑 [`main.sh`](file:///e:/github/CASE/main.sh)：
-   ```bash
-   # 指定当前默认实验代号为 v9_trial3
-   EXP_NAME=${2:-"v9_trial3"}
-   ```
-2. 若涉及模型架构或超参数调整，在代码中完成修改，并本地执行单测校验：
+### 步骤 1：本地确定实验代号与参数配置
+1. 编辑 `main.sh` 更新实验代号与超参（如 `EXP_NAME="v9_trial4"`，学习率、损失权重等）；
+2. 若涉及模型架构修改，本地运行冒烟单测确保通过（推荐激活环境运行以避免 Windows 编码问题）：
    ```powershell
-   conda run -n cem_env python tests/test_sanity.py
+   conda activate cem_env
+   python tests/test_sanity.py
    ```
-   *确保 17/17 项测试通过后再推进下一步。*
 
-### 步骤 2：本地代码提交与推送到 GitHub
-在本地终端执行原子化提交：
+### 步骤 2：本地代码提交与推送
 ```powershell
 git status
 git add src/ main.py main.sh eval.sh tests/ docs/
-git commit -m "feat(v9): 针对 PPL 退火优化调整，准备启动 v9_trial3 实验"
+git commit -m "feat(v9): 调整 XX 超参，启动 {EXP_NAME} 实验"
 git push origin v9-clean
 ```
 
-### 步骤 3：AutoDL 云端拉取最新代码
-登录 AutoDL 实例终端，进入项目目录并拉取：
+### 步骤 3：AutoDL 云端拉取代码
+登录 AutoDL 实例终端：
 ```bash
-cd /root/autodl-tmp/CASE   # 根据你的实际工作目录而定
-git status                 # 确保工作区无未跟踪冲突
-git pull origin v9-clean   # 拉取最新代码
+cd /root/autodl-tmp/CASE
+git pull origin v9-clean
+# 若遇网络 503，改用镜像源：git pull https://ghfast.top/https://github.com/chycycc/CASE.git v9-clean
 ```
 
-### 步骤 4：在云端 tmux 会话中启动训练
-进入持久化会话执行生产训练：
+### 步骤 4：云端 tmux 会话启动训练
 ```bash
-# 1. 检查是否存在已有会话，若无则新建
 tmux new -s train || tmux attach -t train
-
-# 2. 传入 24G 模式与实验代号启动（脚本自动完成日志双写与产出隔离）
-bash main.sh 24G v9_trial3
-
-# 3. 确认启动正常打印后，安全脱离后台 (挂起会话)
-# 键盘依次按下: Ctrl + B，松开后按 D
+bash main.sh 24G {EXP_NAME}
+# 确认日志正常输出后脱离会话挂起：Ctrl + B，随后按 D
 ```
 
-### 步骤 5：刷新 AutoDL TensorBoard 网页监听
-确保 AutoDL 控制台的 TensorBoard 能够显示当前及历史所有实验：
+### 步骤 5：TensorBoard 监控 (可选)
 ```bash
-# 在云端终端执行（只需执行一次，软链接绑定到根级 save 目录）
+# 绑定软链接（只需执行一次）
 rm -rf /root/tf-logs && ln -s $(pwd)/save /root/tf-logs
 ```
-- 进入 AutoDL 控制台 -> 点击进入 **TensorBoard** 网页；
-- 在左侧 Run 列表中勾选 `v9_trial2` 与 `v9_trial3`，即可实现多实验同屏曲线重叠对比。
+在 AutoDL 控制台打开 TensorBoard 页面对比多实验曲线。
 
-### 步骤 6：训练收官与全自动化评测确认
-`main.sh` 内置自动化收尾机制：
-- 当早停计数器触发（连续 6 次未改善）或达到步数上限时，程序自动退出训练循环；
-- 自动加载 `save/v9_trial3/` 下的唯一黄金权重；
-- 自动调用 `src/scripts/eval_pipeline.py` 进行全量测试集度量，产出报告与流形图；
-- *备用说明：若因异常中断需手动单独重跑评测，执行：*
-  ```bash
-  bash eval.sh v9_trial3
-  ```
-
-### 步骤 7：结果文件回传与本地归档
-
-`main.sh` 运行完毕后会自动将所有评测产物集中收集到统一下载目录：`autodl-tmp/download/{EXP_NAME}/`，无需在多个路径逐个翻找。
-
-1. **一键下载**：
-   在 JupyterLab 中直接右键下载 `autodl-tmp/download/v9_trial3/` 整个文件夹到本地（如桌面）。内含 5 个核心文件：
-   - `v9_trial3.log`（全量训练日志）
-   - `eval_metrics.json`（核心数值指标）
-   - `v9_trial3_eval.txt`（学术指标报告）
-   - `v9_trial3_manifold.png`（流形图）
-   - `v9_trial3_results.txt`（生成样例）
-
-2. **本地归档**：
-   将文件移至本地对应目录（亦可直接让助手协助移动）：
-   - `*.log` → `logs/`
-   - `eval_metrics.json` → `save/v9_trial3/`
-   - `*_eval.txt` / `*_manifold.png` / `*_results.txt` → `results/v9/`
-
-3. **记录与闭环**：
-   在 [`docs/v9/v9_experiment_log.md`](file:///e:/github/CASE/docs/v9/v9_experiment_log.md) 中记录指标对比与实验分析，执行 Git 提交推送。
+### 步骤 6：训练收官与全自动化评测
+训练触发早停或跑满上限后，`main.sh` 会自动：
+1. 加载最佳黄金权重执行全量评测并生成图表报告；
+2. 将上述 5 个产物复制汇总至 `autodl-tmp/download/{EXP_NAME}/`。
 
 ---
 
-## 四、常见疑难与避坑指南 (FAQ)
+### 步骤 7：实验结束后的 AI 标准化闭环流程 (AI Checklist)
 
-### Q1：为什么我运行 `git status` 时，看不到 `save/` 和 `results/` 里的新文件？
-> **答**：这是完全正确的现象。因为 [`.gitignore`](file:///e:/github/CASE/.gitignore) 已显式忽略了这些目录，防止几十 GB 的二进制权重和日志污染代码仓库。只要你按照步骤 7 手动下载归档，并在 `docs/v9/v9_experiment_log.md` 记录总结，所有数据都得到妥善永久留存。
+当用户从云端下载 `autodl-tmp/download/{EXP_NAME}/` 到本地临时路径（如桌面或新建文件夹）并指示“处理/分析结果”时，**AI 必须严格按以下 4 步顺序执行**：
 
-### Q2：云端提示 `fatal: refusing to merge unrelated histories` 或 pull 冲突怎么办？
-> **答**：
-> 1. 云端绝不要直接修改代码，云端只做执行器（`git pull` + `bash main.sh`）；
-> 2. 若云端误改了文件导致冲突，在云端执行以下命令强制对齐远端：
->    ```bash
->    git fetch origin
->    git reset --hard origin/v9-clean
->    ```
+1. **自动归档文件**：
+   - 将用户指定临时目录中的 5 个文件移动/复制到本地项目对应目录：
+     - `*.log` → `logs/`
+     - `eval_metrics.json` → `save/{EXP_NAME}/`
+     - `*_eval.txt` / `*_manifold.png` / `*_results.txt` → `results/v9/`
+2. **提取与比对学术指标**：
+   - 读取 `eval_metrics.json` 与 `*_eval.txt`，精准提取以下核心指标：
+     - **困惑度**：`test_metrics.Test_PPL` (越低越好 ↓)
+     - **分类性能**：`test_metrics.Test_EMO_acc` (越高越好 ↑)
+     - **几何流形**：
+       - `manifold_metrics.Centroid_Alignment` (原型余弦对齐度，越高越好 ↑，趋近 1.0 为完全重合)
+       - `manifold_metrics.DBI` (聚类可分性，越低越好 ↓)
+     - **生成多样性**：
+       - `generation_metrics.Greedy.Dist-2` (越高越好 ↑)
+       - `generation_metrics.Sampling.Unique` (越高越好 ↑)
+   - 计算与 Baseline (CASE 原版 / V8 黄金旗舰) 及上一轮 Trial 的数值增减幅度（Δ）。
+3. **更新学术实验日志**：
+   - 编辑 [`docs/v9/v9_experiment_log.md`](file:///e:/github/CASE/docs/v9/v9_experiment_log.md)：
+     - 在横向对比总表中追加新行；
+     - 创建新小节 `## 试验 X：{EXP_NAME}`，录入详细参数配置、评测指标表格、嵌入流形图 `![Manifold](...)`；
+     - 撰写客观分析：剖析当前配置的得失与物理机制（拒绝空话，聚焦特征收缩、梯度冲突或原型聚集原因）。
+4. **规划下一轮迭代**：
+   - 依据当前指标瓶颈（如 PPL 劣化、DBI 不降反升或过拟合现象），制定下一轮改进假设；
+   - 给出下一轮所需的超参/代码修改方案，待确认后进入下一轮步骤 1。
 
-### Q3：如果我不小心断开了 SSH 连接，训练会停吗？
-> **答**：不会。只要你是在 `tmux` 会话内运行的，后台训练进程不受网络中断影响。重新连上终端后，输入 `tmux attach -t train` 即可恢复查看实时控制台。
+---
 
-### Q4：如何确认当前使用的黄金权重没有被覆盖或篡改？
-> **答**：
-> 检查 `save/v9_trialX/` 目录，正常情况下该目录下有且仅有一个形如 `CASE_<step>_<ppl>` 的权重文件，以及一个 `eval_metrics.json`。磁盘维护机制（`maintain_disk`）会自动保证它是全周期最佳检查点。
+## 四、关键避坑要点 (Cheat Sheet)
+
+1. **GitHub 网络 503**：AutoDL 的 `source /etc/network_turbo` 出现波动时，运行 `unset http_proxy && unset https_proxy` 直连，或使用 `git pull https://ghfast.top/https://github.com/chycycc/CASE.git v9-clean`。
+2. **模型权重唯一性**：`save/{EXP_NAME}/` 下通过磁盘维护逻辑只保留验证集 PPL 最佳的唯一黄金权重（形如 `CASE_<step>_<ppl>`），历史较差权重会被自动修剪，防止撑爆云端磁盘。
+3. **杜绝 Git 污染**：任何时候均不得 `git add save/ logs/ results/`。所有产物完全通过本地文件夹归档留存。
