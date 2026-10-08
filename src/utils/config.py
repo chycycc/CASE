@@ -245,6 +245,9 @@ def get_args():
                         help="[V8.1] 复合评分中 EMO_acc 权衡权重 (默认 20.0)")
     parser.add_argument("--composite_mode", type=str, default="acc", choices=["acc", "emo_loss"],
                         help="[V8.2 D] 复合早停/评分模式 (acc: 传统 PPL-acc, emo_loss: 帕累托 PPL+alpha*EMO_loss)")
+    parser.add_argument("--composite_emo_loss_weight", type=float, default=8.0,
+                        help="[V8.2 D] 帕累托 emo_loss 复合评分中情感损失的权衡系数 alpha "
+                             "(composite_score = PPL + alpha * EMO_loss, 默认 8.0 保持历史行为)")
     # V9 大批次训练生命周期与早停步数重标定
     parser.add_argument("--check_iter", type=int, default=500,
                         help="[V9] 验证集评估步数间隔 (默认 500 步，适配 Batch 64 密集评估)")
