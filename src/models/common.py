@@ -994,7 +994,7 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
             t = Translator(model, model.vocab)
         for j, batch in pbar:
             if config.model == "case":
-                bow, kl, mim, ctx, ppl, str, acc, emotion, emotion_acc, epcl, dec_emo = model.train_one_batch(
+                bow, kl, mim, ctx, ppl, strat_l, acc, emotion, emotion_acc, epcl, dec_emo = model.train_one_batch(
                     batch, 0, train=False
                 )
             else:
@@ -1009,7 +1009,7 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
             mim_loss.append(mim)
             ctx_loss.append(ctx)
             ppls.append(ppl)
-            str_loss.append(str)
+            str_loss.append(strat_l)
             str_acc.append(acc)
             emo_loss.append(emotion)
             emo_acc.append(emotion_acc)
@@ -1026,12 +1026,12 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
                     pred_emo_idx = torch.argmax(model.current_emo_logits, dim=-1).detach().cpu().tolist()
                     if isinstance(pred_emo_idx, int):
                         pred_emo_idx = [pred_emo_idx]
-                    pred_emo_names = [emo_map.get(idx, str(idx)) for idx in pred_emo_idx]
+                    pred_emo_names = [emo_map.get(idx, f"{idx}") for idx in pred_emo_idx]
                 elif hasattr(model, 'current_pred_emotion') and model.current_pred_emotion is not None:
                     cur_preds = model.current_pred_emotion
                     if isinstance(cur_preds, (int, np.integer)):
                         cur_preds = [cur_preds]
-                    pred_emo_names = [emo_map.get(int(idx), str(idx)) for idx in cur_preds]
+                    pred_emo_names = [emo_map.get(int(idx), f"{idx}") for idx in cur_preds]
 
                 for i, greedy_sent in enumerate(sent_g):
                     rf = " ".join(batch["target_txt"][i])
