@@ -50,8 +50,9 @@ from src.utils.data.loader import prepare_data_seq
 from src.utils.decode.case import Translator
 
 # 设置绘图字体
-plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'SimSun', 'Arial']
-plt.rcParams['axes.unicode_minus'] = False
+import matplotlib
+matplotlib.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'SimHei', 'Microsoft YaHei', 'DejaVu Sans']
+matplotlib.rcParams['axes.unicode_minus'] = False
 
 
 def maintain_disk(save_dir, dry_run=False):
@@ -316,7 +317,7 @@ def evaluate_test_set(model, test_set):
     return results
 
 
-def evaluate_manifold_and_plot(model, test_set, output_png_path="docs/v8/images/v8_trial1_manifold.png"):
+def evaluate_manifold_and_plot(model, test_set, output_png_path="docs/v8/images/v8_trial1_manifold.png", exp_name=None):
     """
     提取真实测试集样本隐状态特征与 MCP 动量原型，计算流形几何度量并绘制 t-SNE 图
     """
@@ -423,8 +424,16 @@ def evaluate_manifold_and_plot(model, test_set, output_png_path="docs/v8/images/
             zorder=10
         )
 
+    if not exp_name:
+        exp_name = getattr(config, 'exp_name', None)
+    if not exp_name:
+        base = os.path.basename(output_png_path)
+        exp_name = base.replace("_manifold.png", "").replace(".png", "")
+    if not exp_name or exp_name == "manifold":
+        exp_name = "CASE-EPCL"
+
     title_text = (
-        f"CASE-EPCL V8 真实隐空间流形与 MCP 样本中心原型分布\n"
+        f"{exp_name} 真实隐空间流形与 MCP 样本中心原型分布\n"
         f"Silhouette: {sil_cosine:.4f} | DBI: {dbi:.4f} | 原型中心对齐度: {mean_cos_align:.4f} | 偏移量: {mean_offset:.4f}"
     )
     ax.set_title(title_text, fontsize=12, fontweight='bold', pad=12)
@@ -556,6 +565,7 @@ def main():
     parser.add_argument("--bias_min_scale", type=float, default=0.15, help="偏置退火最低下限缩放比")
     parser.add_argument("--plot_path", type=str, default="results/v9/manifold.png", help="流形图保存路径")
     parser.add_argument("--results_path", type=str, default="results/v9/results.txt", help="评测结果文本保存路径")
+    parser.add_argument("--exp_name", type=str, default=None, help="实验代号标识 (用于报告与图标题)")
     args, unknown = parser.parse_known_args()
     if unknown:
         print(f"[*] [Eval Pipeline] 忽略未定义参数: {unknown}")
@@ -641,7 +651,9 @@ def main():
         }
 
     # 4. 流形与原型物理质心度量 + 绘制 t-SNE
-    manifold_metrics = evaluate_manifold_and_plot(model, test_set, output_png_path=args.plot_path)
+    manifold_metrics = evaluate_manifold_and_plot(
+        model, test_set, output_png_path=args.plot_path, exp_name=getattr(args, 'exp_name', None)
+    )
 
     # 5. 生成多样性评测
     if not args.skip_generation:
