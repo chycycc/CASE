@@ -1818,8 +1818,12 @@ class CASE(nn.Module):
             commonsense_fake_outputs = torch.cat((commonsense_outputs[-1].unsqueeze(0), commonsense_outputs[:-1]), dim=0)
             fine_mim_loss = self.fine_grained_infomax_score(commonsense_outputs, commonsense_fake_outputs, react_enc, react_fake_enc, commonsense_mask)
         
-            # === v2 Step2: 冻结后同步关闭 MIM，释放特征空间给 EPCL ===
-            if train and is_currently_frozen:
+            # === [Phase 7 / A5 修复] MIM 负采样退化与冻结期判定 ===
+            # 1) 分类头冻结后 (is_currently_frozen) 已关闭 MIM 优化，评测时同步置零保持语义一致；
+            # 2) 当 bsz <= 1 时 (如测试集逐句解码评估)，In-Batch 错位负采样 (roll) 退化为正样本自身 (fake==real)，
+            #    导致 logits - fake_logits 恒为 0，sigmoid 距离为 0.5，BCE 损失退化为数学伪常数 -ln(0.5)=0.6931 (加权均值恒为 1.1378)。
+            #    在此无有效负样本情形下安全置零。
+            if is_currently_frozen or bsz <= 1:
                 mim_loss = torch.tensor(0.0, device=config.device)
             else:
                 mim_loss = config.coarse_weight * coarse_mim_loss + config.fine_weight * fine_mim_loss

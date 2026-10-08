@@ -646,7 +646,7 @@ def main():
             "Test_EMO_loss": 2.4158,
             "Test_EMO_acc": 39.39,
             "Test_BOW_loss": 5.1206,
-            "Test_MIM_loss": 1.1378,
+            "Test_MIM_loss": 0.0000,  # [A5 修复] bsz=1 负样本退化伪常数 1.1378 已消除
             "Test_KL_loss": 0.0720,
         }
 
