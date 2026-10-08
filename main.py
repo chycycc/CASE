@@ -69,6 +69,9 @@ def train(model, train_set, dev_set):
         best_ppl = 1000
         best_score = 1000.0
         patient = 0
+        best_ppl_only = 1000.0       # 纯 PPL 最优，独立于复合评分
+        weights_best_ppl_only = None
+        best_ppl_only_step = 0
         # [V5 Trial 4 / Trial 4b] 自适应分类头冻结监控与最佳状态缓存 (BCF)
         best_freeze_metric = -1.0 if config.freeze_metric == "emo_acc" else 1e9
         freeze_patient = 0
@@ -187,6 +190,13 @@ def train(model, train_set, dev_set):
                     else:
                         print(f"[-] Step {n_iter} < min_save_step({min_save_step}): 保护期未改善 ({score_info})，早停耐心保持为 0")
                 else:
+                    # [Phase 7] 纯 PPL 最优检查点独立跟踪
+                    if ppl_val <= best_ppl_only:
+                        best_ppl_only = ppl_val
+                        best_ppl_only_step = n_iter
+                        weights_best_ppl_only = deepcopy(model.state_dict())
+                        print(f"[PPL-Best] Step {n_iter}: 刷新纯 PPL 最优 = {ppl_val:.4f}")
+
                     # [V8.2 E] 进入退火成熟期：若此前处于保护期，首步重置成熟期黄金检查点基线
                     if min_save_step > 0 and not entered_mature:
                         entered_mature = True
@@ -217,6 +227,17 @@ def train(model, train_set, dev_set):
         print("Exiting from training early")
         model.save_model(best_ppl, n_iter)
         weights_best = deepcopy(model.state_dict())
+
+    # [Phase 7] 双检查点落盘
+    if weights_best_ppl_only is not None and best_ppl_only_step != 0:
+        model.load_state_dict(weights_best_ppl_only)
+        ppl_best_save_path = os.path.join(
+            config.save_path, f"CASE_{best_ppl_only_step}_{best_ppl_only:.4f}_ppl_best"
+        )
+        torch.save(model.state_dict(), ppl_best_save_path)
+        print(f"[双检查点摘要] 纯 PPL 最优已落盘: {ppl_best_save_path}")
+        # 恢复复合分最优权重
+        model.load_state_dict(weights_best)
 
     return weights_best
 
