@@ -1,16 +1,22 @@
-# CASE-EPCL V8 实验全生命周期追踪日志
-## (Project V8: Momentum Centroid Prototypes & Additive Angular Margin, CASE-MCP)
+# CASE-EPCL V8 前期实验追踪日志 (Trial 1 ~ Trial 4)
+## (Phase 1~4: 动量质心原型 MCP、加性硬边际 Arc-EPCL 与时序软退火探索)
+
+> **阶段范围说明**：本文档记录 CASE-EPCL V8 架构初期的 4 轮核心基础实验（Trial 1 至 Trial 4：单变量替换 MCP 样本质心、统一特征挂载 `emotion_enc`、加性角度硬边际 Arc-EPCL 与双锚点软退火初探）。  
+> **全周期与后续演化导航**：  
+> - **V8.1 ~ V8.2 闭环迭代复盘报告**：请查阅 [`reports/`](file:///e:/github/CASE/docs/v8/reports/)（含 V8.1 双轨、V8.2 稀疏掩码、PCGrad、退火保护期及 V8.2 F 终局旗舰）；  
+> - **V8 全周期大一统收官总结与 11 代总对照矩阵**：请查阅 [`v8_final_experiment_summary.md`](file:///e:/github/CASE/docs/v8/v8_final_experiment_summary.md) 与全局看板 [`README.md`](file:///e:/github/CASE/docs/v8/README.md)；  
+> - **底层架构数学推导与完整假说**：请查阅 [`plans/v8_momentum_centroid_prototypes_guidance.md`](file:///e:/github/CASE/docs/v8/plans/v8_momentum_centroid_prototypes_guidance.md)。
 
 ---
 
-## 0. V8 课题总览与学术假设
+## 0. V8 基础课题总览与学术假设
 
 - **立项基底**：V7 终局成果（自适应核采样 Dist-2 30.55%，唯一回复率 94.90%，PPL 32.97，彻底消灭感叹号死循环）；
 - **核心病理痛点**：
   1. **原型扎堆与严重脱节**：隐空间 t-SNE 真实投影揭示五角星原型全部坍缩在原点中心死结中，根本没有物理坐落在各类别点云的几何重心；
   2. **双头梯度对抗撕裂**：分类头与对比损失挂载节点脱节，各拉各的；
   3. **软 Softmax 损失平原躺平**：正负样本余弦相似度在 0.50 vs 0.54 胶着，缺乏加性硬边际推力，导致 Cosine Silhouette 轮廓系数始终在负区间徘徊（-0.0319）。
-- **V8 三大核心假说 (Core Hypotheses)**：
+- **V8 三大核心假说 (Core Hypotheses)**（详见 [`plans/v8_momentum_centroid_prototypes_guidance.md`](file:///e:/github/CASE/docs/v8/plans/v8_momentum_centroid_prototypes_guidance.md)）：
   - **假说 1 (MCP 样本质心假说)**：将原型废除独立参数定义，注册为不可导 Buffer，在训练 Batch 中对类别样本求几何均值并以 EMA（$\mu=0.99$）平滑滚动更新。原型在数学定义上严格等于样本点云的物理几何重心，从根源上消灭原型漂移与中心扎堆死结；
   - **假说 2 (统一锚点假说)**：将 EPCL 与分类头统一下沉锚定在门控融合节点 `emotion_enc`，杜绝双头对抗撕裂，使生成自回归能最大化利用高质量良构流形；
   - **假说 3 (Arc-EPCL 硬边际假说)**：在超球面上引入加性角度硬间隔 $\cos(\theta_y) - m$（$m=0.30$），强制提供压倒性类间排斥梯度，强推测试集 Silhouette 轮廓系数突破 0.00 翻正（目标 > +0.05）。
@@ -35,11 +41,11 @@
 
 ## 2. 自动化执行与学术评测标准流 (Evaluation Protocol & SOP)
 
-为了保证实验结果的可重复性、客观性与严谨性，所有 V8 试验均由专属流水线脚本 [`src/scripts/eval_v8_pipeline.py`](file:///e:/github/CASE/src/scripts/eval_v8_pipeline.py) 全自动完成，包含：磁盘单权重维护、官方 5,255 测试集指标提取、流形几何度量与 MCP 原型质心对齐评估（附 t-SNE 高清投影散点图）及 3 种生成模式多样性解码测评。
+为了保证实验结果的可重复性、客观性与严谨性，所有 V8 试验均由专属流水线脚本 [`src/scripts/eval_pipeline.py`](file:///e:/github/CASE/src/scripts/eval_pipeline.py) 全自动完成，包含：磁盘单权重维护、官方 5,255 测试集指标提取、流形几何度量与 MCP 原型质心对齐评估（附 t-SNE 高清投影散点图）及 3 种生成模式多样性解码测评。
 
 ---
 
-## 3. V8 全阶段试验对比全景表 (Trial Scorecard)
+## 3. V8 基础阶段试验对比表 (Trial 1 ~ Trial 4 Scorecard)
 
 | 试验代号 | 核心改动说明 | 最佳验证 PPL | 测试集 PPL | 测试集 EMO_acc | 测试集 EMO_loss | 轮廓系数 Silhouette | 紧实度 DBI | 原型中心对齐度 | 核采样 Dist-2 | 唯一回复率 | 磁盘维护状态 |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
@@ -91,7 +97,7 @@
   - 显存与硬件：显存占用严守 3,966 MiB / 4,096 MiB（稳定在 4GB 红线内），核心温度 75°C；
   - 磁盘状态：E 盘可用空间充足。
 - **验证集指标追踪曲线 (精炼核心里程碑)**：
-  > 完整 31 轮逐步打点数据（每 2,000 步）已归档至专项目录文档：[v8_validation_curves.md#1-v8-trial-1-mcp-动量质心原型首发实战-单变量替换](file:///e:/github/CASE/docs/v8/v8_validation_curves.md#1-v8-trial-1-mcp-动量质心原型首发实战-单变量替换)
+  > 完整 31 轮逐步打点数据（每 2,000 步）已归档至专项目录文档：[raw/v8_validation_curves.md#1-v8-trial-1-mcp-动量质心原型首发实战-单变量替换](file:///e:/github/CASE/docs/v8/raw/v8_validation_curves.md#1-v8-trial-1-mcp-动量质心原型首发实战-单变量替换)
 
   | 关键阶段 | 步数 (Step) | Valid PPL ↓ | EMO_acc ↑ | EMO_loss ↓ | BOW_loss ↓ | KL_loss ↓ | 机制事件与状态演进说明 |
   | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
@@ -175,7 +181,7 @@
   ```
 - **训练状态**：主训练与官方测试集评测、真实流形及多样性全量收官 (Completed 🟢)
 - **验证集指标追踪曲线 (精炼核心里程碑)**：
-  > 完整 31 轮逐步打点数据（每 2,000 步）已归档至专项目录文档：[v8_validation_curves.md#2-v8-trial-2-统一挂载-emotion_enc-与加性硬边际-arc-epcl-实战](file:///e:/github/CASE/docs/v8/v8_validation_curves.md#2-v8-trial-2-统一挂载-emotion_enc-与加性硬边际-arc-epcl-实战)
+  > 完整 31 轮逐步打点数据（每 2,000 步）已归档至专项目录文档：[raw/v8_validation_curves.md#2-v8-trial-2-统一挂载-emotion_enc-与加性硬边际-arc-epcl-实战](file:///e:/github/CASE/docs/v8/raw/v8_validation_curves.md#2-v8-trial-2-统一挂载-emotion_enc-与加性硬边际-arc-epcl-实战)
 
   | 关键阶段 | 步数 (Step) | Valid PPL ↓ | EMO_acc ↑ | EMO_loss ↓ | BOW_loss ↓ | KL_loss ↓ | 机制事件与状态演进说明 |
   | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
@@ -261,7 +267,7 @@
   ```
 - **训练状态**：主训练与官方测试集评测、真实流形及多样性全量收官 (Completed 🟢)
 - **验证集指标追踪曲线 (精炼核心里程碑)**：
-  > 完整 31 轮逐步打点数据（每 2,000 步）已归档至专项目录文档：[v8_validation_curves.md#3-v8-trial-3-黄金平衡调优实战](file:///e:/github/CASE/docs/v8/v8_validation_curves.md#3-v8-trial-3-黄金平衡调优实战)
+  > 完整 31 轮逐步打点数据（每 2,000 步）已归档至专项目录文档：[raw/v8_validation_curves.md#3-v8-trial-3-黄金平衡调优实战](file:///e:/github/CASE/docs/v8/raw/v8_validation_curves.md#3-v8-trial-3-黄金平衡调优实战)
 
   | 关键阶段 | 步数 (Step) | Valid PPL ↓ | EMO_acc ↑ | EMO_loss ↓ | BOW_loss ↓ | KL_loss ↓ | 机制事件与状态演进说明 |
   | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
@@ -344,7 +350,7 @@
   ```
 - **训练状态**：主训练与官方测试集评测、真实流形及多样性全量收官 (Completed 🟢)
 - **验证集指标追踪曲线 (精炼核心里程碑)**：
-  > 完整 31 轮逐步打点数据（每 2,000 步）已归档至专项目录文档：[v8_validation_curves.md#4-v8-trial-4-双锚点解耦与时序软退火实战](file:///e:/github/CASE/docs/v8/v8_validation_curves.md#4-v8-trial-4-双锚点解耦与时序软退火实战)
+  > 完整 31 轮逐步打点数据（每 2,000 步）已归档至专项目录文档：[raw/v8_validation_curves.md#4-v8-trial-4-双锚点解耦与时序软退火实战](file:///e:/github/CASE/docs/v8/raw/v8_validation_curves.md#4-v8-trial-4-双锚点解耦与时序软退火实战)
 
   | 关键阶段 | 步数 (Step) | Valid PPL ↓ | EMO_acc ↑ | EMO_loss ↓ | BOW_loss ↓ | KL_loss ↓ | 机制事件与状态演进说明 |
   | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :--- |
@@ -395,3 +401,27 @@
 | **V8 Trial 2** | `save/epcl_v8_trial2` | 8 (七次更替) | `CASE_51999_36.5874` | 2958.24 (7个旧检查点已物理销毁) | 14:51 (最终归档) | 🟢 唯一黄金权重锁定 |
 | **V8 Trial 3** | `save/epcl_v8_trial3` | 10 (九次更替) | `CASE_51999_37.1078` | 3173.84 (9个旧检查点已物理销毁) | 21:24 (最终归档) | 🟢 唯一黄金权重锁定 |
 | **V8 Trial 4** | `save/epcl_v8_trial4` | 9 (八次更替) | `CASE_51999_37.3874` | 2958.24 (8个旧检查点已物理销毁) | 04:19 (最终归档) | 🟢 唯一黄金权重锁定 |
+
+---
+
+## 6. 后续演进阶段交接与报告索引
+
+Trial 4 结束后，针对硬冻结导致分类头脱节与解码端缺乏显式共情偏置的痛点，项目进入 V8 后期攻坚阶段（V8.1 ~ V8.2 F）。各后续阶段的完整闭环复盘已移交至对应报告文档：
+
+1. **V8.1 双轨攻坚**：词表偏置联合微调 vs 时序软退火解耦  
+   👉 详细复盘报告：[`reports/v8.1_dual_track_iteration_report.md`](file:///e:/github/CASE/docs/v8/reports/v8.1_dual_track_iteration_report.md)
+2. **V8.2 破局初版**：Top 15% 拓扑稀疏偏置掩码与 PCGrad 正交投影  
+   👉 详细复盘报告：[`reports/v8.2_iteration_report.md`](file:///e:/github/CASE/docs/v8/reports/v8.2_iteration_report.md)
+3. **V8.2 B 破局迭代**：解绑学习率退火与早停 patience 修复  
+   👉 详细复盘报告：[`reports/v8.2_b_iteration_report.md`](file:///e:/github/CASE/docs/v8/reports/v8.2_b_iteration_report.md)
+4. **V8.2 C 全达标演进**：标准对称双向 PCGrad 与偏置余弦退火  
+   👉 详细复盘报告：[`reports/v8.2_c_iteration_report.md`](file:///e:/github/CASE/docs/v8/reports/v8.2_c_iteration_report.md)
+5. **V8.2 D 终局探索**：动态情感损失加权与帕累托早产归因  
+   👉 详细复盘报告：[`reports/v8.2_d_iteration_report.md`](file:///e:/github/CASE/docs/v8/reports/v8.2_d_iteration_report.md)
+6. **V8.2 E 全量达标**：统一锚点复位与退火成熟保护期  
+   👉 详细复盘报告：[`reports/v8.2_e_iteration_report.md`](file:///e:/github/CASE/docs/v8/reports/v8.2_e_iteration_report.md)
+7. **V8.2 F / F2 终局旗舰与流形审计**：钟形余弦加权全周期收官版与批次升级动因分析  
+   👉 旗舰复盘报告：[`reports/v8.2_f_experiment_report.md`](file:///e:/github/CASE/docs/v8/reports/v8.2_f_experiment_report.md) | 审计报告：[`reports/v8.2_f2_manifold_audit_and_batch_upgrade_analysis.md`](file:///e:/github/CASE/docs/v8/reports/v8.2_f2_manifold_audit_and_batch_upgrade_analysis.md)
+8. **V8 全周期大一统总结与 11 代版本总对照矩阵**：  
+   👉 终局总结：[`v8_final_experiment_summary.md`](file:///e:/github/CASE/docs/v8/v8_final_experiment_summary.md) | 全局看板：[`README.md`](file:///e:/github/CASE/docs/v8/README.md)
+
