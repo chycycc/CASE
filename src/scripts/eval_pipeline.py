@@ -55,12 +55,16 @@ matplotlib.rcParams['font.sans-serif'] = ['Noto Sans CJK SC', 'SimHei', 'Microso
 matplotlib.rcParams['axes.unicode_minus'] = False
 
 
-def maintain_disk(save_dir, dry_run=False):
+def maintain_disk(save_dir, dry_run=False, target_preference="auto"):
     """
-    扫描 save_dir 下所有检查点，识别出验证集 PPL 最低的单一最优权重，安全删除其余冗余权重。
+    扫描 save_dir 下所有检查点，实行【双检查点锁定保护机制】：
+    1. 锁定复合评分最优检查点 (Composite Best，带有 _composite_best 或最新有效权重)；
+    2. 锁定纯 PPL 最优检查点 (PPL Best，带有 _ppl_best 或最低验证 PPL 权重)；
+    3. 严禁误删上述受保护的黄金权重，仅安全清理其余过时过程冗余权重。
+    4. 根据 target_preference ("auto" / "composite" / "ppl") 返回最匹配的黄金权重路径。
     """
     print(f"\n=======================================================")
-    print(f"  [Step 1/5] 磁盘空间维护与黄金权重遴选: {save_dir}")
+    print(f"  [Step 1/5] 磁盘空间维护与双检查点白名单锁定: {save_dir}")
     print(f"=======================================================")
 
     if not os.path.exists(save_dir):
@@ -69,7 +73,7 @@ def maintain_disk(save_dir, dry_run=False):
 
     # 检索所有的权重文件 (CASE_*)
     pattern = os.path.join(save_dir, "CASE_*")
-    ckpt_files = [f for f in glob.glob(pattern) if not f.endswith(".json") and not f.endswith(".txt")]
+    ckpt_files = [f for f in glob.glob(pattern) if not f.endswith(".json") and not f.endswith(".txt") and not f.endswith(".png") and not f.endswith(".log")]
 
     if not ckpt_files:
         print(f"[!] 在 {save_dir} 中未找到符合 CASE_* 命名的权重文件。")
@@ -79,58 +83,113 @@ def maintain_disk(save_dir, dry_run=False):
     for f in ckpt_files:
         fname = os.path.basename(f)
         parts = fname.split("_")
-        # 命名格式: CASE_<step>_<ppl> 或 CASE_<step>_<ppl>.pt
+        # 命名格式: CASE_<step>_<ppl>[_tag]
+        step_val = 0
+        ppl_val = 999999.0
         try:
-            step_str = parts[1]
-            ppl_str = parts[2].replace(".pt", "")
-            ppl_val = float(ppl_str)
-            step_val = int(step_str)
-            parsed_ckpts.append({
-                "path": f,
-                "name": fname,
-                "step": step_val,
-                "ppl": ppl_val,
-                "size_mb": os.path.getsize(f) / (1024 * 1024)
-            })
-        except Exception as e:
-            # 若无法解析，按修改时间备选
-            parsed_ckpts.append({
-                "path": f,
-                "name": fname,
-                "step": 0,
-                "ppl": 999999.0,
-                "size_mb": os.path.getsize(f) / (1024 * 1024)
-            })
+            if len(parts) >= 2 and parts[1].isdigit():
+                step_val = int(parts[1])
+            if len(parts) >= 3:
+                ppl_str = parts[2].replace(".pt", "").replace(".pth", "")
+                ppl_val = float(ppl_str)
+        except Exception:
+            pass
 
-    # 按 PPL 升序排序，PPL 最小的为最优权重
-    parsed_ckpts.sort(key=lambda x: x["ppl"])
-    best_ckpt = parsed_ckpts[0]
+        is_composite_best = "composite_best" in fname or ("composite" in fname and "best" in fname)
+        is_ppl_best = "ppl_best" in fname or ("ppl" in fname and "best" in fname)
 
-    print(f"[*] 扫描到 {len(parsed_ckpts)} 个检查点:")
+        parsed_ckpts.append({
+            "path": f,
+            "name": fname,
+            "step": step_val,
+            "ppl": ppl_val,
+            "is_composite": is_composite_best,
+            "is_ppl_best": is_ppl_best,
+            "mtime": os.path.getmtime(f),
+            "size_mb": os.path.getsize(f) / (1024 * 1024)
+        })
+
+    # 1. 遴选复合评分最优黄金权重
+    composite_candidates = [c for c in parsed_ckpts if c["is_composite"]]
+    if composite_candidates:
+        # 优先按 step 降序 / mtime 最新的复合黄金检查点
+        composite_candidates.sort(key=lambda x: (x["step"], x["mtime"]), reverse=True)
+        locked_composite = composite_candidates[0]
+    else:
+        # 若无明确 composite 标签（兼容老实验），在非 ppl_best 的常规权重中，选最新的权重
+        regular_candidates = [c for c in parsed_ckpts if not c["is_ppl_best"]]
+        if regular_candidates:
+            regular_candidates.sort(key=lambda x: (x["step"], x["mtime"]), reverse=True)
+            locked_composite = regular_candidates[0]
+        else:
+            locked_composite = None
+
+    # 2. 遴选纯 PPL 最优黄金权重
+    ppl_candidates = [c for c in parsed_ckpts if c["is_ppl_best"]]
+    if ppl_candidates:
+        # 优先选择 ppl 最低的那一个
+        ppl_candidates.sort(key=lambda x: x["ppl"])
+        locked_ppl = ppl_candidates[0]
+    else:
+        # 若无明确 ppl_best 标签，从全量候选里选 PPL 最低者
+        sorted_by_ppl = sorted(parsed_ckpts, key=lambda x: x["ppl"])
+        locked_ppl = sorted_by_ppl[0] if sorted_by_ppl else None
+
+    # 3. 建立受保护白名单集合
+    protected_paths = set()
+    if locked_composite:
+        protected_paths.add(locked_composite["path"])
+    if locked_ppl:
+        protected_paths.add(locked_ppl["path"])
+
+    print(f"[*] 扫描到 {len(parsed_ckpts)} 个检查点，双检查点锁定状态:")
     for item in parsed_ckpts:
-        tag = ">>> [最佳保持]" if item["path"] == best_ckpt["path"] else "    [待清理]"
-        print(f"  {tag} {item['name']} | Step: {item['step']} | Valid PPL: {item['ppl']:.4f} | 大小: {item['size_mb']:.2f} MB")
+        tags = []
+        if locked_composite and item["path"] == locked_composite["path"]:
+            tags.append("[锁定保护: 复合评分最优]")
+        if locked_ppl and item["path"] == locked_ppl["path"]:
+            tags.append("[锁定保护: 纯 PPL 最优]")
+        if not tags:
+            tag_str = "    [待清理冗余]"
+        else:
+            tag_str = ">>> " + " & ".join(tags)
+        print(f"  {tag_str} {item['name']} | Step: {item['step']} | Valid PPL: {item['ppl']:.4f} | 大小: {item['size_mb']:.2f} MB")
 
-    # 执行清理
+    # 4. 执行冗余清理（严禁触碰白名单）
     removed_count = 0
     reclaimed_mb = 0.0
-    for item in parsed_ckpts[1:]:
+    for item in parsed_ckpts:
+        if item["path"] in protected_paths:
+            continue
         if not dry_run:
             try:
                 os.remove(item["path"])
                 removed_count += 1
                 reclaimed_mb += item["size_mb"]
-                print(f"  [-] 已安全删除: {item['name']}")
+                print(f"  [-] 已安全删除冗余检查点: {item['name']}")
             except Exception as e:
-                print(f"  [!] 删除失败: {item['name']}, 原因: {e}")
+                print(f"  [!] 删除冗余失败: {item['name']}, 原因: {e}")
         else:
             removed_count += 1
             reclaimed_mb += item["size_mb"]
-            print(f"  [DryRun] 模拟删除: {item['name']}")
+            print(f"  [DryRun] 模拟删除冗余检查点: {item['name']}")
 
-    print(f"\n[+] 磁盘维护完成: 保留黄金权重 {best_ckpt['name']}")
-    print(f"    成功清理冗余权重: {removed_count} 个 | 释放磁盘空间: {reclaimed_mb:.2f} MB")
-    return best_ckpt["path"]
+    print(f"\n[+] 磁盘维护完成: 成功锁定保护 {len(protected_paths)} 个黄金检查点")
+    print(f"    清理过期冗余检查点: {removed_count} 个 | 释放磁盘空间: {reclaimed_mb:.2f} MB")
+
+    # 5. 决定当前评测所使用的权重
+    if target_preference == "ppl":
+        chosen = locked_ppl or locked_composite
+    elif target_preference == "composite":
+        chosen = locked_composite or locked_ppl
+    else:  # "auto"
+        # 默认优先复合评分最优，若无则使用纯 PPL 最优
+        chosen = locked_composite or locked_ppl
+
+    if chosen:
+        print(f"[*] 当前评测流程选定黄金权重 [{target_preference} 偏好]: {chosen['name']}")
+        return chosen["path"]
+    return None
 
 
 def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, use_unlikelihood=True,
@@ -563,6 +622,7 @@ def main():
     parser.add_argument("--use_sparse_emo_bias", action="store_true", default=False, help="[V8.2] 是否启用自适应稀疏情感词表偏置")
     parser.add_argument("--emo_vocab_topk_ratio", type=float, default=0.15, help="[V8.2] 稀疏偏置保留前 K%% 亲和词比例")
     parser.add_argument("--bias_min_scale", type=float, default=0.15, help="偏置退火最低下限缩放比")
+    parser.add_argument("--eval_target", type=str, default="auto", choices=["auto", "composite", "ppl"], help="评测目标黄金权重选择偏好: auto (优先复合最优), composite (复合评分最优), ppl (纯PPL最优)")
     parser.add_argument("--plot_path", type=str, default="results/v9/manifold.png", help="流形图保存路径")
     parser.add_argument("--results_path", type=str, default="results/v9/results.txt", help="评测结果文本保存路径")
     parser.add_argument("--exp_name", type=str, default=None, help="实验代号标识 (用于报告与图标题)")
@@ -591,16 +651,33 @@ def main():
             best_ckpt = target_path
             print(f"[*] 命中直接指定模型权重文件: {best_ckpt}")
         elif os.path.isdir(target_path):
-            best_ckpt = maintain_disk(target_path, dry_run=args.dry_run_clean)
+            best_ckpt = maintain_disk(target_path, dry_run=args.dry_run_clean, target_preference=args.eval_target)
         else:
-            # 路径不存在，尝试作为目录名或其父目录检索
+            # 路径不存在时：进入安全只读智能纠偏，严禁执行物理删除
             clean_dir = target_path.rstrip("/").rstrip("\\")
             parent_dir = os.path.dirname(target_path)
-            if os.path.isdir(clean_dir):
-                best_ckpt = maintain_disk(clean_dir, dry_run=args.dry_run_clean)
-            elif parent_dir and os.path.isdir(parent_dir):
-                print(f"[*] 指定文件 {target_path} 暂不存在，自动扫描其所在目录: {parent_dir}")
-                best_ckpt = maintain_disk(parent_dir, dry_run=args.dry_run_clean)
+            target_fname = os.path.basename(target_path)
+
+            search_dir = clean_dir if os.path.isdir(clean_dir) else (parent_dir if parent_dir and os.path.isdir(parent_dir) else None)
+            if search_dir:
+                print(f"[!] 警告: 指定权重文件 '{target_path}' 暂不存在！")
+                print(f"[*] 启动目录安全模糊匹配 (只读保护模式): {search_dir}")
+                # 尝试模糊匹配同 Step 文件（例如输入 CASE_7499_38.0498 匹配到 CASE_7499_38.0498_composite_best）
+                step_match = None
+                parts = target_fname.split("_")
+                if len(parts) >= 2 and parts[1].isdigit():
+                    step_prefix = f"CASE_{parts[1]}_"
+                    matches = [f for f in glob.glob(os.path.join(search_dir, f"{step_prefix}*")) if not f.endswith(".json") and not f.endswith(".txt") and not f.endswith(".png")]
+                    if matches:
+                        step_match = matches[0]
+                        print(f"[+] 模糊匹配成功: 定位到同 Step 权重: {step_match}")
+
+                if step_match and os.path.exists(step_match):
+                    best_ckpt = step_match
+                else:
+                    # 无法同 step 匹配，只读遴选当前可用黄金权重（强制 dry_run=True，杜绝误删）
+                    print(f"[*] 未找到同 Step 文件，安全回退遴选可用黄金权重 (只读模式，不执行任何磁盘清理)...")
+                    best_ckpt = maintain_disk(search_dir, dry_run=True, target_preference=args.eval_target)
 
     if not best_ckpt:
         default_dirs = [
@@ -613,7 +690,7 @@ def main():
         print("[!] 未命中指定权重，正在扫描默认候选目录...")
         for d in default_dirs:
             if os.path.exists(d) and os.path.isdir(d):
-                best_ckpt = maintain_disk(d, dry_run=args.dry_run_clean)
+                best_ckpt = maintain_disk(d, dry_run=True, target_preference=args.eval_target)
                 if best_ckpt:
                     break
 

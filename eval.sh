@@ -11,6 +11,7 @@ pythonpath='python'
 INPUT_TARGET=${1:-"save/v9_trial2"}
 GPU_ID=${2:-"0"}
 BATCH_SIZE=${3:-"64"}
+EVAL_TARGET=${4:-"auto"}  # auto / composite / ppl
 
 # 智能推断实验代号与路径
 if [ -d "${INPUT_TARGET}" ] || [ -f "${INPUT_TARGET}" ]; then
@@ -27,18 +28,30 @@ fi
 
 mkdir -p results/v9
 
+# 依评测目标定制化输出报告文件名
+if [ "${EVAL_TARGET}" = "composite" ]; then
+    OUTPUT_TAG="${EXP_NAME}_composite"
+elif [ "${EVAL_TARGET}" = "ppl" ]; then
+    OUTPUT_TAG="${EXP_NAME}_ppl_best"
+else
+    OUTPUT_TAG="${EXP_NAME}"
+fi
+
 echo "======================================================================"
-echo "[*] 启动 CASE-EPCL 全量自动化评估体系 (独立隔离模式)"
+echo "[*] 启动 CASE-EPCL 全量自动化评估体系 (双检查点安全锁定模式)"
 echo "    - 目标实验: ${EXP_NAME}"
 echo "    - 权重路径: ${MODEL_PATH}"
+echo "    - 评测偏好: ${EVAL_TARGET}"
 echo "    - 执行设备: GPU ${GPU_ID} | 批次大小: ${BATCH_SIZE}"
-echo "    - 报告产出: results/v9/${EXP_NAME}_eval.txt"
-echo "    - 流形产出: results/v9/${EXP_NAME}_manifold.png"
+echo "    - 报告产出: results/v9/${OUTPUT_TAG}_eval.txt"
+echo "    - 流形产出: results/v9/${OUTPUT_TAG}_manifold.png"
 echo "======================================================================"
 
 ${pythonpath} src/scripts/eval_pipeline.py \
   --model_path "${MODEL_PATH}" \
-  --results_path "results/v9/${EXP_NAME}_eval.txt" \
-  --plot_path "results/v9/${EXP_NAME}_manifold.png" \
+  --eval_target "${EVAL_TARGET}" \
+  --results_path "results/v9/${OUTPUT_TAG}_eval.txt" \
+  --plot_path "results/v9/${OUTPUT_TAG}_manifold.png" \
   --batch_size "${BATCH_SIZE}" \
   --gpu "${GPU_ID}"
+

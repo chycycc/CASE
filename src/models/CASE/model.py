@@ -1403,25 +1403,41 @@ class CASE(nn.Module):
             return self.pcam(dec_output, protos)
         return dec_output
 
-    def save_model(self, running_avg_ppl, iter):
+    def save_model(self, running_avg_ppl, iter, tag=None):
+        """
+        保存模型检查点，支持双检查点标签（tag="composite_best" 或 "ppl_best"）。
+        严格遵循分类隔离清理：同标签的旧检查点自动更新清理，不同标签或受保护检查点绝不交叉误删。
+        """
         state = {
             "iter": iter,
             "optimizer": self.optimizer.state_dict(),
             "current_loss": running_avg_ppl,
             "model": self.state_dict(),
+            "tag": tag,
         }
-        model_save_path = os.path.join(
-            self.model_dir,
-            "CASE_{}_{:.4f}".format(iter, running_avg_ppl),
-        )
-        old_path = getattr(self, 'best_path', None)
+        if tag:
+            ckpt_name = "CASE_{}_{:.4f}_{}".format(iter, running_avg_ppl, tag)
+        else:
+            ckpt_name = "CASE_{}_{:.4f}".format(iter, running_avg_ppl)
+
+        model_save_path = os.path.join(self.model_dir, ckpt_name)
+
+        if not hasattr(self, "best_paths"):
+            self.best_paths = {}
+
+        tag_key = tag if tag else "default"
+        old_path = self.best_paths.get(tag_key, None)
+        self.best_paths[tag_key] = model_save_path
         self.best_path = model_save_path
+
         torch.save(state, model_save_path)
-        # 严格遵守单黄金权重保留红线，清理过时旧检查点
+        print(f"[Checkpoint Save] 权重落盘成功 [{tag_key}]: {model_save_path}")
+
+        # 分类隔离清理：仅清理同标签的上一轮旧权重，绝对不跨类别误删其他黄金检查点
         if old_path and os.path.exists(old_path) and old_path != model_save_path:
             try:
                 os.remove(old_path)
-                print(f"[Disk Maintenance] 自动物理清除过时旧检查点: {old_path}")
+                print(f"[Disk Maintenance] 自动清除同类别过时旧检查点 [{tag_key}]: {old_path}")
             except Exception as e:
                 print(f"[Disk Maintenance Warning] 清除旧检查点失败: {e}")
 

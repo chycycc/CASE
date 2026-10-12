@@ -255,3 +255,69 @@ class PrototypeConditionedAttentionModule(nn.Module):
 | **Beam Dist-2** | **核心防御指标**：平滑温度 $\tau_{\text{attn}}=1.5$ 抑制概率过度锐化 | **$\ge 9.0\%$**（远超 V6 塌陷值 3.11%） | $\ge 11.0\%$ |
 | **Greedy Dist-2** | 摆脱词表固定偏置，遣词造句恢复多样性 | $\ge 16.0\%$ | $\ge 17.5\%$ |
 | **Alignment** | 原型参与解码任务优化，几何质心更贴合真实语义 | $\ge 0.935$ | $\ge 0.940$ |
+
+---
+
+## 八、审查补遗与实施注意事项
+
+> 本章由代码审查环节补充，实施者须逐项核对。
+
+### 1. 必做项
+
+#### 1.1 注册 `--pcam_tau_attn` 到 config.py
+- **目标文件**：[`src/utils/config.py`](file:///e:/github/CASE/src/utils/config.py)
+- **位置**：L153（`--pcam_gate_bias` 定义之后）
+- **操作**：插入以下一行：
+```python
+    parser.add_argument("--pcam_tau_attn", type=float, default=1.5,
+                        help="PCAM 交叉注意力的平滑温度系数 (默认 1.5，防止注意力权重过度锐化)")
+```
+- **原因**：文档修改项 2 的 PCAM 类构造函数需要从 config 读取此参数。若不注册，`getattr(config, 'pcam_tau_attn', 1.5)` 虽然能走 fallback 不报错，但不符合显式可控原则。
+
+### 2. 建议项（非阻断，但建议一并实施）
+
+#### 2.1 eval_pipeline.py 补充 pcam_tau_attn 硬编码
+- **目标文件**：[`src/scripts/eval_pipeline.py`](file:///e:/github/CASE/src/scripts/eval_pipeline.py)
+- **位置**：L154（`config.pcam_gate_bias = -1.0` 之后）
+- **操作**：追加一行：
+```python
+    config.pcam_tau_attn = 1.5
+```
+- **原因**：保持评测脚本与训练配置的自解释对齐。
+
+#### 2.2 PCAM 初始化时添加 gamma 冷启动审计日志
+- **位置**：文档修改项 2 的 PCAM 初始化代码（L1266~L1273 区域），在 `print(f"[V6 Architecture]...")` 行之后追加：
+```python
+            if hasattr(self.pcam, 'gamma'):
+                print(f"[PCAM V9 Upgrade] gamma 以冷启动值 {self.pcam.gamma.item():.4f} 初始化, tanh(gamma)={torch.tanh(self.pcam.gamma).item():.4f}")
+```
+- **原因**：加载旧检查点（不含 PCAM 权重）时，`gamma` 以 0.0 默认初始化进入训练。此日志让审计者确认冷启动机制生效。
+
+#### 2.3 emo_bias 相关死代码暂不删除
+- **代码位置**：`model.py:1277-1310`（初始化投影层与掩码）及 `train_one_batch` / `decoder_greedy` / `decoder_sampling` 中的偏置注入路径。
+- **处理**：`main.sh` 不传 `--use_emo_bias` 和 `--use_sparse_emo_bias` 即可，这些路径不会执行。**保留死代码**的风险低于误删导致的回退困难。
+- **注意**：文档修改项 3 提到的"彻底删除 `--use_sparse_emo_bias`" 实际上 `main.sh` 中已不存在这两行参数，此操作为空操作。
+
+#### 2.4 文档中引用的代码行号偏差
+- 文档第 69 行引用 `model.py:1257` 对应 `config.hop`，实际位于约 L1254。偏差约 3 行，不影响论证正确性。
+- **操作**：实施者在修改代码时以实际 grep 定位为准，不依赖文档行号。
+
+### 3. 数学层面的监控项
+
+#### 3.1 tau_attn=1.5 的有效性验证
+- $\tau=1.5$ 使得 32 个原型上的 softmax 温度为标准 Transformer 注意力的 1.5 倍，注意力分布更均匀。
+- **风险**：若 $\tau$ 过大（>2.0），注意力退化为近似均匀分布，PCAM 输出趋向所有原型的简单平均，丧失情感区分能力。
+- **应对**：$\tau=1.5$ 作为初始值合理。若后续 DBI 没有改善，可在 $\{1.0, 1.2, 1.5, 2.0\}$ 范围内搜索。初版不需要引入自适应温度。
+
+#### 3.2 gamma 增速监控
+- `gamma` 初始化为 0.0，在 Adam 优化器主阶段 LR=$5.76 \times 10^{-4}$ 下，预计 ~500 步内 $\tanh(\gamma)$ 达到 0.3~0.5 区间。
+- **风险**：若 `gamma` 增长过快（如 ~200 步即达到 $\tanh(\gamma) > 0.8$），冷启动保护窗口过短，在原型尚未通过 EMA 稳定时即注入强信号。
+- **必须操作**：在 `train_one_batch` 中，每 500 步（即 `check_iter` 周期）打印一次 gamma 监控信息。在 `model.py` 的日志打印区域（训练步 eval 区域附近）追加：
+```python
+# [PCAM gamma 监控] 每个 check_iter 打印一次
+if self.use_pcam and hasattr(self.pcam, 'gamma'):
+    gamma_val = self.pcam.gamma.item()
+    print(f"[PCAM Monitor] Step {iter}: gamma={gamma_val:.4f}, tanh(gamma)={math.tanh(gamma_val):.4f}")
+```
+- **应对预案**：若首轮训练中 `gamma` 在 Step 1000 前即超过 1.0（$\tanh > 0.76$），后续迭代可对 `gamma` 单独设置较低的学习率（通过 param_group 隔离）。
+

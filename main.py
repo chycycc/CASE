@@ -69,6 +69,8 @@ def train(model, train_set, dev_set):
         model.train()
         best_ppl = 1000
         best_score = 1000.0
+        best_score_step = 0
+        best_composite_ppl = 1000.0
         patient = 0
         best_ppl_only = 1000.0       # 纯 PPL 最优，独立于复合评分
         weights_best_ppl_only = None
@@ -191,42 +193,49 @@ def train(model, train_set, dev_set):
                 min_save_step = getattr(config, 'min_save_step', 0)
                 in_protection_period = (min_save_step > 0 and n_iter < min_save_step)
 
+                # [双检查点追踪] 纯 PPL 最优检查点独立跟踪并实时落盘
+                if ppl_val <= best_ppl_only:
+                    best_ppl_only = ppl_val
+                    best_ppl_only_step = n_iter
+                    weights_best_ppl_only = deepcopy(model.state_dict())
+                    model.save_model(best_ppl_only, n_iter, tag="ppl_best")
+                    print(f"[PPL-Best] Step {n_iter}: 刷新并落盘纯 PPL 最优权重 = {ppl_val:.4f}")
+
                 if in_protection_period:
                     # [V8.2 E] 处于退火成熟保护期：记录过渡指标，但不消耗早停耐心
                     patient = 0
                     if is_score_better:
                         best_score = cur_score
                         best_ppl = ppl_val
-                        model.save_model(best_ppl, n_iter)
+                        best_score_step = n_iter
+                        best_composite_ppl = ppl_val
+                        model.save_model(best_ppl, n_iter, tag="composite_best")
                         weights_best = deepcopy(model.state_dict())
-                        print(f"[*] Step {n_iter} < min_save_step({min_save_step}): 保护期刷新过渡权重！{score_info}")
+                        print(f"[*] Step {n_iter} < min_save_step({min_save_step}): 保护期刷新过渡复合权重！{score_info}")
                     else:
                         print(f"[-] Step {n_iter} < min_save_step({min_save_step}): 保护期未改善 ({score_info})，早停耐心保持为 0")
                 else:
-                    # [Phase 7] 纯 PPL 最优检查点独立跟踪
-                    if ppl_val <= best_ppl_only:
-                        best_ppl_only = ppl_val
-                        best_ppl_only_step = n_iter
-                        weights_best_ppl_only = deepcopy(model.state_dict())
-                        print(f"[PPL-Best] Step {n_iter}: 刷新纯 PPL 最优 = {ppl_val:.4f}")
-
                     # [V8.2 E] 进入退火成熟期：若此前处于保护期，首步重置成熟期黄金检查点基线
                     if min_save_step > 0 and not entered_mature:
                         entered_mature = True
                         best_score = cur_score
                         best_ppl = ppl_val
+                        best_score_step = n_iter
+                        best_composite_ppl = ppl_val
                         patient = 0
-                        model.save_model(best_ppl, n_iter)
+                        model.save_model(best_ppl, n_iter, tag="composite_best")
                         weights_best = deepcopy(model.state_dict())
-                        print(f"[*] [V8.2 E] Step {n_iter}: 正式进入退火成熟期 (>= min_save_step {min_save_step})，锚定成熟期基线黄金检查点！{score_info}")
+                        print(f"[*] [V8.2 E] Step {n_iter}: 正式进入退火成熟期 (>= min_save_step {min_save_step})，锚定成熟期基线复合黄金权重！{score_info}")
                     else:
                         if is_score_better:
                             best_score = cur_score
                             best_ppl = ppl_val
+                            best_score_step = n_iter
+                            best_composite_ppl = ppl_val
                             patient = 0
-                            model.save_model(best_ppl, n_iter)
+                            model.save_model(best_ppl, n_iter, tag="composite_best")
                             weights_best = deepcopy(model.state_dict())
-                            print(f"[*] Step {n_iter}: 刷新成熟期黄金权重！{score_info}，已落盘检查点。")
+                            print(f"[*] Step {n_iter}: 刷新成熟期复合黄金权重！{score_info}，已落盘检查点。")
                         else:
                             patient += 1
                             max_patience = getattr(config, "patience", 5)
@@ -237,20 +246,31 @@ def train(model, train_set, dev_set):
 
     except KeyboardInterrupt:
         print("-" * 89)
-        print("Exiting from training early")
-        model.save_model(best_ppl, n_iter)
-        weights_best = deepcopy(model.state_dict())
+        print("Exiting from training early (KeyboardInterrupt)")
+        if best_score_step != 0 and weights_best is not None:
+            model.load_state_dict(weights_best)
+            model.save_model(best_composite_ppl, best_score_step, tag="composite_best")
+        if best_ppl_only_step != 0 and weights_best_ppl_only is not None:
+            model.load_state_dict(weights_best_ppl_only)
+            model.save_model(best_ppl_only, best_ppl_only_step, tag="ppl_best")
+            if weights_best is not None:
+                model.load_state_dict(weights_best)
 
-    # [Phase 7] 双检查点落盘
+    # [双检查点最终确认与落盘审计]
+    print(f"\n=======================================================")
+    print(f"  [双检查点锁定确认]")
+    print(f"  1. 复合评分最优: Step {best_score_step} | Score: {best_score:.4f} | PPL: {best_composite_ppl:.4f}")
+    print(f"  2. 纯 PPL 最优:  Step {best_ppl_only_step} | PPL: {best_ppl_only:.4f}")
+    print(f"=======================================================")
+    if weights_best is not None and best_score_step != 0:
+        model.load_state_dict(weights_best)
+        model.save_model(best_composite_ppl, best_score_step, tag="composite_best")
     if weights_best_ppl_only is not None and best_ppl_only_step != 0:
         model.load_state_dict(weights_best_ppl_only)
-        ppl_best_save_path = os.path.join(
-            config.save_path, f"CASE_{best_ppl_only_step}_{best_ppl_only:.4f}_ppl_best"
-        )
-        torch.save(model.state_dict(), ppl_best_save_path)
-        print(f"[双检查点摘要] 纯 PPL 最优已落盘: {ppl_best_save_path}")
-        # 恢复复合分最优权重
-        model.load_state_dict(weights_best)
+        model.save_model(best_ppl_only, best_ppl_only_step, tag="ppl_best")
+        # 恢复模型为复合评分最优权重以供下游 test 使用
+        if weights_best is not None:
+            model.load_state_dict(weights_best)
 
     return weights_best
 
