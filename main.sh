@@ -11,7 +11,7 @@ pythonpath='python'
 # 1. 核心硬件运行模式与实验代号支持
 # 支持命令行指定: ./main.sh 24G v9_trial3 (默认生产全量) 或 ./main.sh 4G v9_debug_4g
 ENV_MODE=${1:-"24G"}
-EXP_NAME=${2:-"v9_trial8"}
+EXP_NAME=${2:-"v9_trial9"}
 
 DATASET='ED'
 GPU_ID=${CUDA_VISIBLE_DEVICES:-"0"}
@@ -109,8 +109,11 @@ ${pythonpath} main.py \
   --arc_mode cos \
   --epcl_anchor fine_emotion \
   --cls_anchor default \
-  --use_sparse_emo_bias \
-  --emo_vocab_topk_ratio 0.15 \
+  --use_pcam \
+  --pcam_heads 2 \
+  --pcam_dropout 0.1 \
+  --pcam_gate_bias -1.0 \
+  --pcam_tau_attn 1.5 \
   --emo_bias_gate_init -2.0 \
   --use_pcgrad \
   --gate_warmup_steps 2500 \

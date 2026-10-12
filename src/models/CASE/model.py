@@ -505,17 +505,18 @@ class ResidualEmotionHead(nn.Module):
 # ================= PCAM: 原型交叉记忆注意力模块 (支持动态与静态原型) =================
 class PrototypeConditionedAttentionModule(nn.Module):
     """
-    原型交叉记忆注意力模块 (Prototype-Conditioned Attention Module, PCAM):
-    定位: 解码器隐状态输出端与生成器之间的自适应门控残差跨注意力桥梁。
-    [V7 增强]: 原生兼容 2D 静态原型 [M, D] 与 3D 动态上下文原型 [B, M, D]。
+    原型交叉记忆注意力模块 (PCAM V9 升级版):
+    - 引入平滑温度系数 tau_attn (默认 1.5)，抑制条件概率分布过度锐化;
+    - 引入可学习标量 gamma (初始化为 0.0)，通过 tanh(gamma) 实现严格的冷启动残差保护。
     """
-    def __init__(self, d_model=300, num_heads=2, dropout=0.1, gate_bias=-1.0):
+    def __init__(self, d_model=300, num_heads=2, dropout=0.1, gate_bias=-1.0, tau_attn=1.5):
         super(PrototypeConditionedAttentionModule, self).__init__()
         self.d_model = d_model
         self.num_heads = num_heads
         assert d_model % num_heads == 0, f"d_model ({d_model}) 必须能被 num_heads ({num_heads}) 整除"
         self.head_dim = d_model // num_heads
-        self.scaling = self.head_dim ** -0.5
+        self.tau_attn = max(float(tau_attn), 0.1)
+        self.scaling = (self.head_dim ** -0.5) / self.tau_attn
 
         self.q_proj = nn.Linear(d_model, d_model)
         self.k_proj = nn.Linear(d_model, d_model)
@@ -528,6 +529,9 @@ class PrototypeConditionedAttentionModule(nn.Module):
         self.gate_linear = nn.Linear(2 * d_model, d_model)
         nn.init.constant_(self.gate_linear.bias, gate_bias)
         nn.init.xavier_uniform_(self.gate_linear.weight, gain=0.1)
+
+        # 显式冷启动平滑残差标量，初始化为 0.0 (tanh(0.0) = 0.0)
+        self.gamma = nn.Parameter(torch.zeros(1))
 
         self.layer_norm = nn.LayerNorm(d_model)
 
@@ -573,10 +577,10 @@ class PrototypeConditionedAttentionModule(nn.Module):
         context = context.transpose(1, 2).contiguous().view(bsz, seq_len, self.d_model)
         h_proto = self.out_dropout(self.out_proj(context))
 
-        # 5. 通道自适应门控与残差融合
+        # 5. 通道自适应门控与冷启动残差融合
         gate_input = torch.cat([dec_output, h_proto], dim=-1)
         gate = torch.sigmoid(self.gate_linear(gate_input))
-        enhanced_output = self.layer_norm(dec_output + gate * h_proto)
+        enhanced_output = self.layer_norm(dec_output + torch.tanh(self.gamma) * (gate * h_proto))
         return enhanced_output
 # ==============================================================================
 
@@ -1261,16 +1265,19 @@ class CASE(nn.Module):
             filter_size=config.filter,
         )
         
-        # [V6 Trial 3] 原型交叉记忆注意力 (PCAM) 模块初始化
+        # [V6/V9 Architecture] 原型交叉记忆注意力 (PCAM) 模块初始化
         self.use_pcam = getattr(config, 'use_pcam', False)
         if self.use_pcam:
             self.pcam = PrototypeConditionedAttentionModule(
                 d_model=config.hidden_dim,
                 num_heads=getattr(config, 'pcam_heads', 2),
                 dropout=getattr(config, 'pcam_dropout', 0.1),
-                gate_bias=getattr(config, 'pcam_gate_bias', -1.0)
+                gate_bias=getattr(config, 'pcam_gate_bias', -1.0),
+                tau_attn=getattr(config, 'pcam_tau_attn', 1.5)
             )
-            print(f"[V6 Architecture] 成功启用原型交叉记忆注意力模块 (PCAM): heads={getattr(config, 'pcam_heads', 2)}, dropout={getattr(config, 'pcam_dropout', 0.1)}, gate_bias={getattr(config, 'pcam_gate_bias', -1.0)}")
+            print(f"[V6/V9 Architecture] 成功启用原型交叉记忆注意力模块 (PCAM): heads={getattr(config, 'pcam_heads', 2)}, dropout={getattr(config, 'pcam_dropout', 0.1)}, gate_bias={getattr(config, 'pcam_gate_bias', -1.0)}, tau_attn={getattr(config, 'pcam_tau_attn', 1.5)}")
+            if hasattr(self.pcam, 'gamma'):
+                print(f"[PCAM V9 Upgrade] gamma 以冷启动值 {self.pcam.gamma.item():.4f} 初始化, tanh(gamma)={torch.tanh(self.pcam.gamma).item():.4f}")
 
         self.generator = Generator(config.hidden_dim, self.vocab_size, parent_model=self)
         
@@ -2189,6 +2196,13 @@ class CASE(nn.Module):
 
                 for pg in self.optimizer.optimizer.param_groups:
                     pg["lr"] = decayed_lr
+
+            # [PCAM gamma 监控] 每个 check_iter 周期打印一次
+            if self.use_pcam and hasattr(self, 'pcam') and hasattr(self.pcam, 'gamma'):
+                check_interval = getattr(config, 'check_iter', 500)
+                if (iter + 1) % check_interval == 0:
+                    gamma_val = self.pcam.gamma.item()
+                    print(f"[PCAM Monitor] Step {iter + 1}: gamma={gamma_val:.4f}, tanh(gamma)={math.tanh(gamma_val):.4f}")
         
         return (
             bow_loss.item(),

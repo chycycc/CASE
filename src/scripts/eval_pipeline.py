@@ -211,6 +211,7 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
     config.pcam_heads = 2
     config.pcam_dropout = 0.1
     config.pcam_gate_bias = -1.0
+    config.pcam_tau_attn = 1.5
     
     # 预检检查点拓扑结构，自适应匹配分类头、PCAM 与 ERP，杜绝拓扑错配导致权重漏载
     if os.path.exists(checkpoint_path):

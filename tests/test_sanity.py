@@ -286,8 +286,64 @@ class TestBellShapeModelIntegration(unittest.TestCase):
 
         assert isinstance(config.exp_name, str) and len(config.exp_name) > 0, "exp_name 必须为非空字符串"
 
+    def test_20_pcam_v9_properties_and_cold_start(self):
+        """[Test 20] V9 PCAM 原型交叉记忆注意力算子数学特性、平滑温度与严格冷启动残差保护验证"""
+        from src.models.CASE.model import PrototypeConditionedAttentionModule
+        
+        # 1. 验证配置参数注册
+        assert hasattr(config, "pcam_tau_attn"), "config 必须包含 pcam_tau_attn 参数"
+        assert config.pcam_tau_attn == 1.5, f"pcam_tau_attn 默认值必须为 1.5, 实际为 {config.pcam_tau_attn}"
+        
+        # 2. 算子初始化与超参数绑定
+        d_model = 300
+        num_heads = 2
+        tau_attn = 1.5
+        pcam = PrototypeConditionedAttentionModule(
+            d_model=d_model, num_heads=num_heads, dropout=0.1, gate_bias=-1.0, tau_attn=tau_attn
+        )
+        
+        expected_scaling = ((d_model // num_heads) ** -0.5) / tau_attn
+        assert abs(pcam.scaling - expected_scaling) < 1e-6, f"scaling 计算偏差: {pcam.scaling} vs {expected_scaling}"
+        assert hasattr(pcam, "gamma"), "PCAM 必须包含 gamma 参数"
+        assert isinstance(pcam.gamma, torch.nn.Parameter), "gamma 必须为可学习参数 (nn.Parameter)"
+        assert pcam.gamma.item() == 0.0, f"gamma 初始值必须为 0.0, 实际为 {pcam.gamma.item()}"
+        assert torch.tanh(pcam.gamma).item() == 0.0, "tanh(gamma) 初始值必须严格为 0.0"
+        
+        # 3. 前向维度匹配 (2D 静态原型 [M, D] 与 3D 动态原型 [B, M, D])
+        B, L, M = 4, 16, 32
+        dec_output = torch.randn(B, L, d_model, requires_grad=True)
+        protos_2d = torch.randn(M, d_model)
+        
+        out_2d = pcam(dec_output, protos_2d)
+        assert out_2d.shape == (B, L, d_model), f"2D 原型前向输出形状不符: {out_2d.shape}"
+        
+        protos_3d = torch.randn(B, M, d_model)
+        out_3d = pcam(dec_output, protos_3d)
+        assert out_3d.shape == (B, L, d_model), f"3D 原型前向输出形状不符: {out_3d.shape}"
+        
+        # 4. 严格冷启动验证: gamma=0.0 时，残差项贡献严格为 0，输出必须与 layer_norm(dec_output) 完全一致
+        expected_cold_start_out = pcam.layer_norm(dec_output)
+        diff = torch.max(torch.abs(out_2d - expected_cold_start_out)).item()
+        assert diff < 1e-6, f"冷启动保护失效: gamma=0.0 时输出与 layer_norm(dec_output) 最大绝对误差 {diff} >= 1e-6"
+        
+        # 5. 反向传播可导性与梯度健全性
+        loss = out_2d.sum()
+        loss.backward()
+        assert pcam.gamma.grad is not None, "gamma 梯度不得为 None"
+        assert torch.isfinite(pcam.gamma.grad).all(), "gamma 梯度必须数值健康"
+        assert pcam.q_proj.weight.grad is not None and torch.isfinite(pcam.q_proj.weight.grad).all(), "q_proj 梯度健全"
+        assert pcam.gate_linear.weight.grad is not None and torch.isfinite(pcam.gate_linear.weight.grad).all(), "gate_linear 梯度健全"
+        
+        # 6. 非零 gamma 活性验证: 当 gamma != 0 时，残差项必须真正生效注入
+        with torch.no_grad():
+            pcam.gamma.fill_(1.0)
+            out_active = pcam(dec_output, protos_2d)
+            active_diff = torch.max(torch.abs(out_active - expected_cold_start_out)).item()
+            assert active_diff > 1e-4, f"gamma=1.0 时残差反哺未生效，误差仅为 {active_diff}"
+
 
 if __name__ == "__main__":
+    unittest.main()
     if pytest is not None:
         pytest.main([__file__, "-v", "--tb=short"])
     else:

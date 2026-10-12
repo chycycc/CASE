@@ -151,6 +151,8 @@ def get_args():
                         help="PCAM 交叉注意力的 Dropout 概率 (默认0.1)")
     parser.add_argument("--pcam_gate_bias", type=float, default=-1.0,
                         help="PCAM 自适应门控的初始偏置 (默认-1.0，实现平滑暖启动)")
+    parser.add_argument("--pcam_tau_attn", type=float, default=1.5,
+                        help="PCAM 交叉注意力的平滑温度系数 (默认 1.5，防止注意力权重过度锐化)")
     
     # V7 架构超参数: 高维解缠残差投影头 (ERP) 与动态超网络原型 (CCHP)
     parser.add_argument("--use_erp", action="store_true", default=False,
