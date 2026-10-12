@@ -250,7 +250,7 @@ git push origin v9-clean
 
 ## 四、Trial 7 端云执行流程
 
-按照 [SOP 手册](file:///e:/github/CASE/docs/v9/v9_experiment_sop_and_sync_guide.md) 执行：
+按照 [SOP 手册](file:///e:/github/CASE/docs/v9/guides/v9_autodl_operation_and_sync_guide.md) 执行：
 
 ### 步骤 1：本地提交推送
 ```powershell

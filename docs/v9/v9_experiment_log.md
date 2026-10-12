@@ -41,6 +41,9 @@
 | **V9 Trial 4** | Class-Aware Uniformity α_uni=1.5, λ_epcl=0.03, decay 3k→9k, max 10k | 38.6506 (Step 7499) | 33.19 | 40.82% | 2.2413 | 0.9290 | — | 已归档 (`save/v9_trial4`) |
 | **V9 Trial 5** | T4 + α_uni=0.8 + max_step 12k + decay 3k→11k (多变量) | 39.3968 (Step 7499) | 34.08 | 40.82% | 2.2541 | 0.9195 | — | 已归档 (`save/v9_trial5`) |
 | **V9 Trial 6** | T4 + α_uni=0.8 (单变量, 恢复 decay 3k→9k, max 10k) | 38.7629 (Step 7499) | **33.62** | **41.88%** | 2.2390 | 0.9344 | 51m48s (训练段) | 已归档 (`save/v9_trial6`) |
+| **V9 Trial 7** | 单变量下调主阶段峰值 LR (5.76e-4), α=5.0 复合评分 | 38.4005 (Step 7499) | **33.58** | **42.25%** | **2.2130** | **0.9353** | ~52m | 已归档 (`save/v9_trial7`) |
+| **V9 Trial 8** | 单步 Batch 32 零累加 (更新 10k 次), 双检查点机制落地 | 37.8523 (Step 8999) | **32.97** | 40.46% (PPL) / 43.35% (复合) | 2.5850 | 0.9353 | 52m 48s | 已归档 (`save/v9_trial8`) |
+| **V9 Trial 9** | 升级版 PCAM (软记忆反哺, τ_attn=1.5, tanh(γ) 冷启动保护) | 待跑 (代码闭环) | 待测 | 待测 | 待测 | 待测 | 预计 ~53m | **工程就绪/准备启动** (`save/v9_trial9`) |
 
 ---
 
@@ -497,4 +500,19 @@ Greedy Dist-2 18.00% 为 V6~V9 最高，Beam Dist-2 11.19% 显著高于 V8.2 F�
 #### 五、论文所需消融矩阵（与上表并行规划）
 
 CASE（仅 MIM）/ CASE + EPCL / 去 MIM + EPCL / 去 uniformity，统一在 V9 最终配置、3 种子下运行，用于支撑 "EPCL 与 MIM 正交互补" 的核心论点。
+
+---
+
+## 4. [Phase 9] V9 Trial 9: 升级版 PCAM 原型软记忆反哺工程落地追踪
+
+- **实施日期**：2026-10-12
+- **实施依据**：[`docs/v9/v9_pcam_upgrade_plan.md`](file:///e:/github/CASE/docs/v9/v9_pcam_upgrade_plan.md)
+- **工程实施报告**：[`docs/v9/v9_trial9_pcam_implementation_report.md`](file:///e:/github/CASE/docs/v9/v9_trial9_pcam_implementation_report.md)
+- **技术定位**：在 Trial 8 确立的 10,000 步高分辨率零累积底座上，以隐层软反哺替代加性词表硬偏置，消除条件概率过度锐化引发的束搜索候选坍塌。
+- **算子形式化**：
+  $$\text{scaling} = \frac{d_k^{-0.5}}{\tau_{\text{attn}}}, \quad \tau_{\text{attn}} = 1.5$$
+  $$H_{\text{enhanced}} = \operatorname{LayerNorm}\left(H_{\text{dec}} + \tanh(\gamma) \odot (G \odot H_{\text{proto}})\right), \quad \gamma \sim \operatorname{Init}(0.0)$$
+- **闭环验证结论**：
+  1. `tests/test_sanity.py` 新增 Test 20 验证算子缩放系数、$\gamma=0.0$ 冷启动严格对齐（误差 $< 10^{-6}$）及反传可导性，20 项单元测试全部通过；
+  2. `tests/smoke_test_pcam_integration.py` 完成真实数据批次下的前向反向、gamma 周期监控、三种解码模式（Greedy、Sampling、Beam）及检查点拓扑自适应识别，端到端冒烟测试 100% 通过。
 

@@ -147,7 +147,7 @@
 
 ## 七、决策树判读与下一步工作指示 (Trial 8)
 
-根据 [`docs/v9/v9_phase7_execution_plan.md`](file:///e:/github/CASE/docs/v9/v9_phase7_execution_plan.md) 第五章决策树判读标准：
+根据 [`docs/v9/plans/v9_phase7_execution_plan.md`](file:///e:/github/CASE/docs/v9/plans/v9_phase7_execution_plan.md) 第五章决策树判读标准：
 
 ```
 Trial 7 实测结果：
