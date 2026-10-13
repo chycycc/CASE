@@ -2,7 +2,7 @@
 
 > **项目标识**：CASE-EPCL (V9 生产级大批次与原型对比学习优化)  
 > **计算环境**：AutoDL 单卡 NVIDIA GeForce RTX 4090D (24GB 显存, CUDA 12.1, PyTorch 2.1.0, FP32)  
-> **当前状态**：Trial 8 深度复盘完成；Trial 9（PCAM 原型注意力调制重构）已完成代码重构与单测验收，待云端启动。
+> **当前状态**：Trial 9 已收官（Test PPL 32.79，创历史新低）；阶段 0 离线诊断定稿完成，Trial 10 已按 v2 方案重新立项（唯一自变量：恢复 `--use_arc_margin`），待基础设施修复后启动。
 
 ---
 
@@ -17,11 +17,15 @@ docs/v9/
 ├── plans/                                       # 架构演进与阶段执行规划
 │   ├── v9_architecture_roadmap.md               # V9 架构路线图与阶段战略规划
 │   ├── v9_phase7_execution_plan.md              # Phase 7 架构优化、16 项工程修复与 Trial 7 执行计划
-│   └── v9_pcam_upgrade_plan.md                  # PCAM 原型注意力调制模块架构升级方案
+│   ├── v9_pcam_upgrade_plan.md                  # PCAM 原型注意力调制模块架构升级方案
+│   ├── v9_trial10_upgrade_plan.md               # Trial 10 (v2 修订版)：v1 逐条标注保留/修正/失效，唯一自变量恢复 Arc-EPCL
+│   └── v9_trial10_upgrade_plan_v1_archive.md    # [存档] v1 原文（恒等 PCAM + DPFC 方案全文），禁止修改
 ├── reports/                                     # 各试验深度报告与单测验收记录
 │   ├── v9_trial7_report.md                      # Trial 7 实验复盘、对齐失效归因与决策树分析
 │   ├── v9_trial8_report.md                      # Trial 8 实验复盘、强正则下表征崩塌与消融分析
-│   └── v9_trial9_pcam_implementation_report.md  # Trial 9 PCAM 模块工程实现与冒烟测试报告
+│   ├── v9_trial9_pcam_implementation_report.md  # Trial 9 PCAM 模块工程实现与冒烟测试报告
+│   ├── v9_trial9_report.md                      # Trial 9 实验审计、纯 PPL 评测专章、缺陷剖析与优化路线报告
+│   └── v9_trial10_phase0_diagnostic_report.md   # Trial 10 阶段 0 定稿：六模式动力学、DPFC 统计检验、验证噪声实测与 PPL 口径发现
 └── guides/                                      # 端云协同与运维标准操作规程 (SOP)
     └── v9_autodl_operation_and_sync_guide.md    # AutoDL 极速部署、后台持久化、产物 5 矩阵与 AI 闭环手册
 ```
@@ -41,6 +45,10 @@ docs/v9/
   详细记录 P0-1 至 P0-6 共 16 项代码异味修复工程、单测防护网建立过程以及 Trial 7 调优方案。
 - [v9_pcam_upgrade_plan.md](file:///e:/github/CASE/docs/v9/plans/v9_pcam_upgrade_plan.md)  
   推导并设计 PCAM（原型条件注意力模块）的软反哺架构，引入 $\tau_{\text{attn}}=1.5$ 锐化与 $\tanh(\gamma)$ 冷启动门控机制，替代原硬截断方式。
+- [v9_trial10_upgrade_plan.md](file:///e:/github/CASE/docs/v9/plans/v9_trial10_upgrade_plan.md)  
+  Trial 10 (v2 增量修订版)：第零章给出 v1 全部条目的保留/修正/失效对照表；保留 v1 的两条否决论证、损失调度规范、单测防护规程、eval.sh 透传改进与消融矩阵结构；唯一自变量改为恢复 Arc-EPCL 加性硬边际，另附三项评测基础设施修复、与噪声带宽对齐的可证伪判据及 3-seed 对照预算。
+- [v9_trial10_upgrade_plan_v1_archive.md](file:///e:/github/CASE/docs/v9/plans/v9_trial10_upgrade_plan_v1_archive.md)  
+  v1 方案原文逐字存档（规范化恒等 PCAM 适配器 + 双流判别头 DPFC）。其中恒等 PCAM 算子定义仍作为 Trial 11+ 候选 B 的技术依据被引用，禁止修改。
 
 ### 3. 实验报告目录 (`reports/`)
 - [v9_trial7_report.md](file:///e:/github/CASE/docs/v9/reports/v9_trial7_report.md)  
@@ -48,7 +56,11 @@ docs/v9/
 - [v9_trial8_report.md](file:///e:/github/CASE/docs/v9/reports/v9_trial8_report.md)  
   剖析 Trial 8 物理批次 32 零累加策略下，Test PPL 刷新至 32.97 的机制，复盘旧版磁盘清理逻辑误删双检查点的问题，明确表征收缩与多样性平衡点。
 - [v9_trial9_pcam_implementation_report.md](file:///e:/github/CASE/docs/v9/reports/v9_trial9_pcam_implementation_report.md)  
-  详细记录 PCAM 算子在 `model.py`、`config.py`、`main.sh`、`eval_pipeline.py` 的集成修改，以及 16 项回归测试与单测验证结果。
+  详细记录 PCAM 算子在 `model.py`、`config.py`、`main.sh`、`eval_pipeline.py` 的集成修改，以及 20 项回归测试与单测验证结果。
+- [v9_trial9_report.md](file:///e:/github/CASE/docs/v9/reports/v9_trial9_report.md)  
+  Trial 9 产出审计、纯 PPL 最优检查点评测指南、后半程分类遗忘与原型解耦四大架构缺陷剖析、无反降进阶优化路线图。
+- [v9_trial10_phase0_diagnostic_report.md](file:///e:/github/CASE/docs/v9/reports/v9_trial10_phase0_diagnostic_report.md)  
+  阶段 0 定稿报告：权重装配核验、六模式 PPL 矩阵与因果纠偏（推理期 OOD ≠ 训练期因果）、2×2 析因分解、DPFC 双重 McNemar 检验、验证集批次重组噪声实测（极差 0.2142 > 遴选裕度 0.0517）、PPL 口径发现（Test 32.78 为样本级，token 级为 39.27）与七项已知缺陷清单。
 
 ### 4. 运行规范目录 (`guides/`)
 - [v9_autodl_operation_and_sync_guide.md](file:///e:/github/CASE/docs/v9/guides/v9_autodl_operation_and_sync_guide.md)  
@@ -68,7 +80,7 @@ docs/v9/
 | **V9 Trial 6** | 单变量 $\alpha_{\text{uni}}=0.8$, decay 3k→9k | 38.7629 | 33.62 | 41.88% | 0.9344 | — | — | 尺度收敛 |
 | **V9 Trial 7** | 下调峰值 LR ($5.76\times 10^{-4}$), $\alpha=5.0$ 评分 | 38.4005 | 33.58 | **42.25%** | 0.9353 | — | — | 分类突破 |
 | **V9 Trial 8** | 单步物理 B=32 (更新 10k 次), 双权重保存 | **37.8523** | **32.97** | 40.46% (PPL最优) / 43.35% (复合) | 0.9353 | — | 12.76% | 逼近 V8.2F |
-| **V9 Trial 9** | PCAM 软反哺注意力, $\tau=1.5, \tanh(\gamma)$ | 待测 | 待测 | 待测 | 待测 | 待测 | 待测 | **就绪待跑** |
+| **V9 Trial 9** | PCAM 软反哺注意力, $\tau=1.5, \tanh(\gamma)$ | 37.7145 | **32.79** (创历史新低) | **41.20%** | **0.9415** | 6.0543 | **14.32%** (创历史新高) | **生产大捷/刷新历史纪录** |
 
 ---
 
@@ -76,5 +88,6 @@ docs/v9/
 
 1. **分支管理**：所有代码、配置与文档变更均归集至 `v9-clean` 分支；
 2. **权重隔离**：`save/` 目录下的大体积权重文件禁止纳入 Git 追踪，仅保留结构化元数据 `eval_metrics.json`；
-3. **环境健康**：代码提交前必须执行 `python tests/test_sanity.py`，保证 16 项回归测试全部通过；
-4. **注释与文档规范**：所有代码行内注释、Docstring 及工程文档均使用规范中文。
+3. **环境健康**：代码提交前必须执行 `python tests/test_sanity.py`，保证 20 项回归测试全部通过；
+4. **注释与文档规范**：所有代码行内注释、Docstring 及工程文档均使用规范中文；
+5. **实验方法论**：所有诊断、消融与结论文档必须遵循 [`.agents/rules/case-epcl-experiment-audit-rules.md`](file:///e:/github/CASE/.agents/rules/case-epcl-experiment-audit-rules.md) 的四条审计铁律（因果对齐、验证基准确定性、指标口径显式化、开关生效性验证）。

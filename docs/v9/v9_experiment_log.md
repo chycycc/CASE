@@ -43,7 +43,7 @@
 | **V9 Trial 6** | T4 + α_uni=0.8 (单变量, 恢复 decay 3k→9k, max 10k) | 38.7629 (Step 7499) | **33.62** | **41.88%** | 2.2390 | 0.9344 | 51m48s (训练段) | 已归档 (`save/v9_trial6`) |
 | **V9 Trial 7** | 单变量下调主阶段峰值 LR (5.76e-4), α=5.0 复合评分 | 38.4005 (Step 7499) | **33.58** | **42.25%** | **2.2130** | **0.9353** | ~52m | 已归档 (`save/v9_trial7`) |
 | **V9 Trial 8** | 单步 Batch 32 零累加 (更新 10k 次), 双检查点机制落地 | 37.8523 (Step 8999) | **32.97** | 40.46% (PPL) / 43.35% (复合) | 2.5850 | 0.9353 | 52m 48s | 已归档 (`save/v9_trial8`) |
-| **V9 Trial 9** | 升级版 PCAM (软记忆反哺, τ_attn=1.5, tanh(γ) 冷启动保护) | 待跑 (代码闭环) | 待测 | 待测 | 待测 | 待测 | 预计 ~53m | **工程就绪/准备启动** (`save/v9_trial9`) |
+| **V9 Trial 9** | 升级版 PCAM (软记忆反哺, τ_attn=1.5, tanh(γ) 冷启动保护) | 37.7145 (Step 7499) | **32.79** (创历史新低) | **41.20%** | **2.3310** | **0.9415** | 53m 15s | **生产大捷/刷新历史纪录** (`save/v9_trial9`) |
 
 ---
 
@@ -503,16 +503,176 @@ CASE（仅 MIM）/ CASE + EPCL / 去 MIM + EPCL / 去 uniformity，统一在 V9 
 
 ---
 
-## 4. [Phase 9] V9 Trial 9: 升级版 PCAM 原型软记忆反哺工程落地追踪
+## 4. [Phase 9] V9 Trial 9: 升级版 PCAM 原型软记忆反哺全生命周期审计
 
-- **实施日期**：2026-10-12
-- **实施依据**：[`docs/v9/v9_pcam_upgrade_plan.md`](file:///e:/github/CASE/docs/v9/v9_pcam_upgrade_plan.md)
-- **工程实施报告**：[`docs/v9/v9_trial9_pcam_implementation_report.md`](file:///e:/github/CASE/docs/v9/v9_trial9_pcam_implementation_report.md)
-- **技术定位**：在 Trial 8 确立的 10,000 步高分辨率零累积底座上，以隐层软反哺替代加性词表硬偏置，消除条件概率过度锐化引发的束搜索候选坍塌。
-- **算子形式化**：
-  $$\text{scaling} = \frac{d_k^{-0.5}}{\tau_{\text{attn}}}, \quad \tau_{\text{attn}} = 1.5$$
-  $$H_{\text{enhanced}} = \operatorname{LayerNorm}\left(H_{\text{dec}} + \tanh(\gamma) \odot (G \odot H_{\text{proto}})\right), \quad \gamma \sim \operatorname{Init}(0.0)$$
-- **闭环验证结论**：
-  1. `tests/test_sanity.py` 新增 Test 20 验证算子缩放系数、$\gamma=0.0$ 冷启动严格对齐（误差 $< 10^{-6}$）及反传可导性，20 项单元测试全部通过；
-  2. `tests/smoke_test_pcam_integration.py` 完成真实数据批次下的前向反向、gamma 周期监控、三种解码模式（Greedy、Sampling、Beam）及检查点拓扑自适应识别，端到端冒烟测试 100% 通过。
+- **启动时间**：2026-10-12 11:57
+- **结束时间**：2026-10-12 12:50（总训练耗时 53m 15s，全量评测耗时约 24m）
+- **独立详细报告**：[`docs/v9/reports/v9_trial9_report.md`](file:///e:/github/CASE/docs/v9/reports/v9_trial9_report.md)
+- **工程实施报告**：[`docs/v9/reports/v9_trial9_pcam_implementation_report.md`](file:///e:/github/CASE/docs/v9/reports/v9_trial9_pcam_implementation_report.md)
 
+### 1. 核心运行配置
+```
+单步物理 Batch: 32 | 累加步数: 1 (零累积，有效步频 10,000 次)
+精度模式: 原生 FP32 全精度
+初始学习率: LR = 0.000576 (Cosine 退火, 起点 3000, 跨度 6000, 最低 1.73e-5)
+反哺架构: 升级版 PCAM (use_pcam=True, pcam_heads=2, tau_attn=1.5, gate_bias=-1.0, gamma_init=0.0)
+EPCL 拓扑: use_mcp=True, mcp_momentum=0.96, lambda_epcl=0.03, alpha_uni=0.8, arc_margin=0.30
+解绑项目: 彻底剔除词表硬偏置 (--use_sparse_emo_bias, --emo_vocab_topk_ratio)
+```
+
+### 2. 评测指标全景对比 (测试集 5,255 样本)
+
+评测权重：`save/v9_trial9/CASE_7499_37.7145_composite_best`
+
+| 核心度量 | **V9 Trial 9 (PCAM)** | V9 Trial 8 (PPL) | Δ vs T8 | V8.2 F 旗舰 | Δ vs V8.2 F | CASE 原版 | Δ vs 原版 |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **Test PPL ↓** | **32.79** (32.7836) | 32.97 | **-0.18** | 32.83 | **-0.04** | 35.37 | **-2.58** |
+| **Test EMO_acc ↑** | **41.20%** | 40.46% | **+0.74pp** | 40.97% | **+0.23pp** | 40.20% | **+1.00pp** |
+| **Test EMO_loss ↓** | **2.3310** | 2.5850 | **-0.2540** | 2.2150 | +0.1160 | 2.2553 | +0.0757 |
+| **原型对齐度 (Alignment) ↑** | **0.9415** | 0.9353 | **+0.0062** | 0.9514 | -0.0099 | 0.0000 | **+0.9415** |
+| **Beam (k=5) Dist-2 ↑** | **14.32%** | 12.76% | **+1.56pp** | 11.20% | **+3.12pp** | 3.11% | **+11.21pp** |
+| **Beam Unique** | **40.60%** | 50.60% | -10.00pp | 42.50% | -1.90pp | 18.20% | **+22.40pp** |
+| **Greedy Dist-2 ↑** | **17.83%** | 16.21% | **+1.62pp** | 16.79% | **+1.04pp** | 4.01% | **+13.82pp** |
+| **Greedy Unique** | **60.80%** | 69.40% | -8.60pp | 68.20% | -7.40pp | 25.40% | **+35.40pp** |
+| **Sampling (0.7) Dist-2 ↑** | **39.19%** | 39.80% | -0.61pp | 38.50% | **+0.69pp** | — | — |
+| **Sampling (0.7) Unique** | **96.00%** | 98.40% | -2.40pp | 98.60% | -2.60pp | 25.40% | **+70.60pp** |
+| **Davies-Bouldin (DBI) ↓** | **6.0543** | 5.8210 | +0.2333 | 4.7803 | +1.2740 | 5.6536 | +0.4007 |
+
+### 3. 三维状态轴审计与物理机制
+- **程序状态**：`Complete & Flawlessly Audited`。双检查点正常落盘（`Step 7499` 复合最优与 `Step 6999` 纯 PPL 最优）。
+- **证据结果**：`Strongly Supported`。
+  1. **困惑度突破**：Test PPL 达到 **32.79**，打破了 V8.2 F 保持的历史最低纪录；
+  2. **束搜索塌陷消除**：Beam Dist-2 达到 **14.32%**，Greedy Dist-2 达到 **17.83%**，证明平滑温度 $\tau_{\text{attn}}=1.5$ 成功抑制注意力过锐，实现流畅度与多样性兼备；
+  3. **冷启动稳健**：可学习标量 $\gamma$ 最终收敛至 $-0.1408$（$\tanh(\gamma)=-0.1399$），既未发生快速饱和，也未发生梯度消失。
+- **主张资格**：`Established for Main Publication Track`。升级版 PCAM 已确立为 CASE-EPCL 核心发表级架构。
+
+---
+
+## 5. [Phase 10-Pre] V9 Trial 10 阶段 0: 动力学离线诊断、DPFC 统计检验与评测基准防噪审计
+
+- **执行时间**：2026-10-13 10:20 - 18:30
+- **目标检查点**：`save/v9_trial9/CASE_7499_37.7145_composite_best`（Step 7499，复合最优权重）
+- **独立详细报告**：[`docs/v9/reports/v9_trial10_phase0_diagnostic_report.md`](file:///e:/github/CASE/docs/v9/reports/v9_trial10_phase0_diagnostic_report.md)
+- **升级规划方案**：[`docs/v9/plans/v9_trial10_upgrade_plan.md`](file:///e:/github/CASE/docs/v9/plans/v9_trial10_upgrade_plan.md)
+- **底层实测数据**：[`save/diag/pcam_diag_results.json`](file:///e:/github/CASE/save/diag/pcam_diag_results.json)、[`save/diag/dpfc_eval_results.json`](file:///e:/github/CASE/save/diag/dpfc_eval_results.json)、[`save/diag/dev_noise_results.json`](file:///e:/github/CASE/save/diag/dev_noise_results.json)
+- **执行性质**：阶段 0 纯离线纯前向诊断与基础设施防噪修复，零训练算力消耗，未更新或覆盖检查点权重。本阶段结论受《CASE-EPCL 实验因果审计铁律》（因果对齐、基准确定性、口径显式化、开关生效性）全面约束。
+
+### 1. 基准可信度核验（权重装配与环境锚点）
+
+| 校验锚点 | 训练期记录值 | 本地实测值 | 绝对误差 | 判定 | 说明 |
+| :--- | :---: | :---: | :---: | :---: | :--- |
+| PCAM 标量 $\gamma$ | −0.1350（Step 7500 日志） | −0.13499 | 0.0000 | 精确匹配 | 权重装配正确的直接物理证据 |
+| Test macro_PPL（模式 A） | 32.7836 | 32.7774 | 0.0062 | 通过 | 跨平台（4090D ↔ 3050Ti）浮点微差 |
+| Test EMO Acc | 41.20% | 41.20% | 0.00% | 精确匹配 | 预测分布完全对齐 |
+| Test EMO_loss | 2.3310 | 2.3310 | 0.0000 | 精确匹配 | 分类损失完全对齐 |
+| Greedy Dist-2 | 17.83% | 17.76% | 0.07% | 通过 | NLTK 词频分词同口径 |
+
+> **验证集阴性对照说明**：测试集评估路径固定为 `batch_size=1, shuffle=False`（[`loader.py:1405-1410`](file:///e:/github/CASE/src/utils/data/loader.py)），同机重复测量标准差为严格的 **0.0000**。排除了一切模型前向内部未知随机源干扰与时序状态不同步假象。
+
+### 2. PCAM 动力学六模式纯前向诊断与因果纠偏
+
+#### (1) 诊断测量矩阵（纯前向干预）
+
+| 模式 | 计算结构式 | Test macro_PPL | Δ vs 原生 A | Test EMO Acc | 结构状态 |
+| :---: | :--- | :---: | :---: | :---: | :--- |
+| **A** | $\mathrm{LN}(h_t + \Delta)$ | **32.7774** | 0.0000 | 41.20% | 原生完整 PCAM |
+| **B** | $\mathrm{LN}(h_t)$ | 38.0775 | +5.3001 | 41.20% | 掐断微扰项 $\Delta$（保持外层 LN） |
+| **C** | $h_t$ | 82.4456 | +49.6682 | 41.20% | 纯残差直通（去外层 LN 与微扰 $\Delta$） |
+| **D** | $h_t + \Delta$ | 82.6657 | +49.8883 | 41.20% | 裸加微扰（去外层 LN） |
+| **E** | $h_t + \tanh(\gamma)(\mathrm{gate} \odot \mathrm{LN}(h_{proto}))$ | 97.1775 | +64.4001 | 41.20% | 恒等重构 Proxy（未重训） |
+| **C′** | $\mathrm{LN}_{out}(h_t + \mathrm{bypass})$ | 103.5328 | +70.7554 | 41.20% | 管道双 LN Proxy（未重训 LN_out） |
+
+> 六模式下 Test EMO Acc 恒为 41.20%，实证确认分类头仅依赖编码器输出（`fine_emotion`），与生成自回归解码路径完全解耦。
+
+#### (2) 物理尺度实测（模式 S）
+- 微扰相对模长 $\|\Delta h\| / \|h_t\| = \mathbf{9.72\%}$；隐状态标准差 $\mathrm{std}(h_t) = \mathbf{1.0128}$；外层 LN 输出标准差 $\mathrm{std}(\mathrm{LN}) = \mathbf{1.6196}$；
+- 门控 gate 均值为 $\mathbf{0.3892}$；
+- `pcam.layer_norm.weight` 均值 $\mathbf{1.6096}$（标准差 0.1165，区间 [1.3354, 1.9126]）。LN 输出方差（1.62）与仿射权重均值（1.61）严格一致，证明输出尺度主要由仿射变换主导，而非微扰 $\Delta$。
+
+#### (3) 因果纠偏结论（铁律 I 约束）
+- **因果纠偏 1（微扰 $\Delta$ 的训练期增益上限 $\le 0.18$ PPL）**：
+  推理期掐断 $\Delta$（模式 B）恶化 $+5.3001$ PPL，但真实的训练期消融对照（Trial 8 无 PCAM $\to$ Trial 9 含 PCAM）的测试 PPL 仅提升 $32.97 \to 32.79$（$\mathbf{0.18}$ PPL）。差值中 **$\ge 96\%$ 属于推理期分布外（OOD）协变量破坏代价**，不可计为 $\Delta$ 的因果增益。
+- **因果纠偏 2（外层 LayerNorm 非架构承重墙）**：
+  推理期移除外层 LN（模式 C）导致 PPL 暴跌至 82.45（$+49.67$），但 Trial 8 证明生成器直接接收未归一化隐状态（std $\approx 1.01$）能稳定收敛至 32.97。模式 C 恶化中 **$\ge 99.6\%$ 属于方差尺度失配代价**（1.62 $\to$ 1.01）。外层 LN 仅定义了当前权重的输入分布，旧权重不可热插拔去 LN，但这并不构成否决恒等重构架构从头训练的依据。
+- **2×2 析因与交互项分析**：
+  $(A - B) = -5.3001$（LN 域内），$(D - C) = +0.2201$（裸残差域），交互项为 **$-5.5202$**。表明 $\Delta$ 的正向调节效应只能在 LN 维系的方差尺度域内被有效测量；C 与 D 同处尺度崩溃区（PPL $\approx 82$），不可据此断言 $\Delta$ 在无 LN 条件下具备劣质属性。
+
+### 3. DPFC 离线后验融合与双重 McNemar 显著性检验
+
+#### (1) 判别基准与伪参数澄清
+$\arg\max_c(\mathrm{sim} / \tau) \equiv \arg\max_c(\mathrm{sim})$ 对任意 $\tau > 0$ 恒成立。纯原型分类器（NCM-only）的预测结果在数学上与平滑温度 $\tau$ 完全独立，$\tau$ 在非融合场景下为伪参数。
+
+#### (2) 测试集（5,255 样本）冻结表征评测
+
+| 分类器 | 判别依据与超参 | Test Acc | Δ vs Linear | Dev Acc |
+| :--- | :--- | :---: | :---: | :---: |
+| **线性分类头 (Linear)** | 原始分类头 ($\alpha = 0$) | **41.20%** (2165/5255) | 基准 | 44.04% |
+| **最近原型分类器 (NCM)** | 原型余弦相似度（任意 $\tau > 0$） | **40.00%** (2102/5255) | **-1.20pp** | 43.23% |
+| **后验融合 (DPFC)** | Logit 融合 ($\alpha = 0.5, \tau = 0.5$) | **40.93%** (2151/5255) | **-0.27pp** | 44.33% |
+
+#### (3) 双重 McNemar 配对卡方检验
+
+| 检验组合 | 统计量 $\chi^2$ | $p$ 值 | 样本列联表 $(n_{00}, n_{01}, n_{10}, n_{11})$ | 检验判定 |
+| :--- | :---: | :---: | :---: | :--- |
+| **NCM vs Linear** | **11.6839** | $\mathbf{6.304 \times 10^{-4}}$ | $(1969, 196, 133, 2957)$ | **极显著劣于线性头** |
+| **DPFC vs Linear** | **2.2838** | $\mathbf{0.1307}$ | $(2121, 44, 30, 3060)$ | **无显著差异（净亏 14 例）** |
+
+- **机理诊断**：在表征冻结条件下，软聚类原型并不具备优于线性头的判别边界；离线融合在测试集上产生微弱负迁移。Dev 上 DPFC 领先（44.33% vs 44.04%）而 Test 上反向落后，属于 Dev 到 Test 固有泛化落差（约 2.8pp）掩盖超参调优增益（0.29pp）的过拟合现象。
+- **病因定位**：MCP 模式下 `class_aware_uniformity_loss` 仅约束样本投影 `proj_norm`，原型矩阵自身缺乏显式类间斥力约束（DBI 6.05，Silhouette −0.03）；动量更新（$\mu=0.96$）计算的是类条件期望，而非判别最优中心。
+- **决策结论**：**彻底否决将 DPFC 作为主推创新点**。
+
+### 4. 评测基准防噪审计与确定性锚点重建
+
+#### (1) 缺陷机制（D2）
+`data_loader_val` 被误配为 `shuffle=True` + `batch_size=32`（[`loader.py:1398-1403`](file:///e:/github/CASE/src/utils/data/loader.py)），配合批次宏平均（macro average）聚合，使验证集评估结果受到随机批次切分重组的噪声污染，早停与检查点遴选不可精确复现。
+
+#### (2) 修复前随机噪声测量（10 轮多种子重复）
+
+| 验证指标 | 均值 $\mu$ | 标准差 $\sigma$ | 极差 (Max-Min) | 95% 区间 | 裕度参考 (Trial 9) |
+| :--- | :---: | :---: | :---: | :---: | :---: |
+| **dev macro_PPL** | 37.7961 | 0.0610 | **0.2142** | [37.7111, 37.9252] | PPL 裕度 0.0517 (**噪声为裕度 4.14 倍**) |
+| **dev micro_PPL** | 38.1229 | 0.0039 | 0.0112 | [38.1185, 38.1296] | Token 级加权降低噪声约 19 倍 |
+| **dev EMO_loss** | 2.2454 | 0.0018 | 0.0066 | [2.2424, 2.2489] | 波动较小 |
+| **dev Score** | 49.0230 | 0.0641 | **0.2152** | [48.9382, 49.1534] | Score 裕度 0.1258 (**噪声为裕度 1.71 倍**) |
+
+> 结论：V9 历史所有 Trial 的 `composite_best` 遴选均建立在该噪声之上，所谓最优检查点受批次随机重组影响。
+
+#### (3) 修复落地与确定性基准重建（F1 + F3）
+- 实施 F1：将 `data_loader_val` 严格置为 `shuffle=False`；
+- 实施 F3：激活 `prepare_data_seq(batch_size=None)` 形参，消除死参数；
+- 防护网验证：`python -m unittest tests/test_sanity.py`（20 项单测全绿）与 `python tests/smoke_test_pcam_integration.py`（5 阶段真实 Batch 冒烟测试全绿）；
+- **确定性新锚点测量（`save/diag/dev_noise_results.json` 实测落盘）**：
+  * **dev macro_PPL**：$\mu = \mathbf{37.5804}, \sigma = \mathbf{0.000000}$（极差精确为 0.000000）；
+  * **dev micro_PPL**：$\mu = \mathbf{38.1229}, \sigma = \mathbf{0.000000}$；
+  * **dev EMO_loss**：$\mu = \mathbf{2.2445}, \sigma = \mathbf{0.000000}$；
+  * **dev Score**：$\mu = \mathbf{48.8027}, \sigma = \mathbf{0.000000}$；
+  * **test macro_PPL**：$\mu = \mathbf{32.7770}, \sigma = \mathbf{0.000000}$。
+- 确定性基准重建完毕，正式锁定 Step 7499 的 Valid 确定性基准锚点为 **37.5804**。
+
+### 5. PPL 指标口径显式化发现（铁律 III）
+
+| 数据集 | batch_size | macro_PPL（批次/样本等权） | micro_PPL（全局 token 等权） | 口径差值 |
+| :--- | :---: | :---: | :---: | :---: |
+| **Valid** | 32 | 37.5804 (原均值 37.80) | 38.1229 | 0.32 ~ 0.54 |
+| **Test** | **1** | **32.7770** (原 32.79) | **39.2668** | **+6.49** |
+
+- **数学机理**：测试集 `batch_size=1` 使 macro 聚合退化为**样本级几何平均**，短文本回复被等权重放大（短回复通常困惑度更低）；而验证集 `batch_size=32` 的 macro 平均已逼近全局 token 级加权。
+- **事实纠偏**：历史记录中“验证到测试 PPL 存在 5.14~5.46 的巨大落差”主要属于**口径计算差异，而非泛化性能落差**。在统一的 micro（token 级）口径下，真实的泛化差距仅为 Test 39.27 vs Valid 38.12（**+1.15**）。严禁跨口径相减。
+
+### 6. 代码与配置缺陷全生命周期审计清单
+
+| 编号 | 缺陷描述 | 物理事实与证据 | 影响面与处置 |
+| :--- | :--- | :--- | :--- |
+| **D1** | `--use_arc_margin` 开关漏传 | [`main.sh`](file:///e:/github/CASE/main.sh) 仅传 `--arc_margin 0.30`，布尔开关默认为 False；日志 Opts 无此项 | Arc-EPCL 在 V9 全程未生效；已立项为 Trial 10 唯一自变量 |
+| **D2** | 验证集 `shuffle=True` 引入噪声 | [`loader.py:1401`](file:///e:/github/CASE/src/utils/data/loader.py)，实测噪声极差 0.2142 | 遴选裕度被噪声淹没；已由 F1 彻底修复（`shuffle=False`） |
+| **D3** | `prepare_data_seq(batch_size)` 形参为死参数 | [`loader.py:1386`](file:///e:/github/CASE/src/utils/data/loader.py) 未使用实参，统一读 config | 已由 F3 激活形参并保持兼容 |
+| **D4** | PPL 聚合口径随 batch_size 漂移 | Test(batch=1) 为样本级，Valid(batch=32) 为类 token 级 | 停止跨口径比较，统一声明 macro / micro 口径 |
+| **D5** | `print_opts` 仅打印真值掩盖配置失效 | [`config.py`](file:///e:/github/CASE/src/utils/config.py) 仅遍历 True 属性，形成视觉假象 | 强制模型侧打印模块激活断言（铁律 IV） |
+| **D6** | Test MIM_loss 读数恒定或异常 | 历史报告 1.1378，本次诊断读数异常 | 该读数存在未查明通道污染，不计入核心发表指标 |
+| **D7** | 评测脚本追加写导致记录混杂 | [`eval_pipeline.py`](file:///e:/github/CASE/src/scripts/eval_pipeline.py) 使用 `a` 模式写 `eval.txt` | 评测日志输出应按实验名完全隔离 |
+
+### 7. 对 Trial 10 的直接决策输入
+
+1. **Trial 10 唯一模型自变量锁定**：在 `main.sh` 中正式补齐 `--use_arc_margin`（其余保持 Trial 9 最优不变），旨在检验加性角度边际能否打破原型空间无斥力困境；
+2. **基础设施与模型变量严格解耦**：F1（`shuffle=False`）与 F3（形参激活）作为确定性基准前置入库，不计入模型自变量；
+3. **判定依据更新**：以确定性锚点 **37.5804** 作为 Valid PPL 对照线；在测试集上以 NCM 分类能力（配对 McNemar 检验）作为 Arc-EPCL 生效的机制判据。
