@@ -67,19 +67,28 @@ venv.bak/
 
 # AI Context Files
 .gemini
-.agents/
+# [修正] 原写法 `.agents/` 会排除整个目录，导致 `!.agents/rules/` 白名单失效
+# （git 规范：父目录被排除后，无法再重新包含其内部文件）。
+# 改为「排除目录内容 + 白名单放行 rules 子目录」，使审计铁律纳入版本控制。
+.agents/*
+!.agents/rules/
+!.agents/rules/**
 # docs/ (Un-ignored for tracking academic documentation)
 
 # Data and Weights
-data/
-vectors
+# [修正] 原写法 `data/`（无前导斜杠）会匹配任意层级的 data 目录，导致
+# src/utils/data/ 整目录被忽略，loader.py 与 preprocess.py 从未进入版本控制。
+# 现锚定至仓库根目录，仅忽略根级数据集与词向量目录。
+/data/
+# [修正] vectors 为符号链接（非目录），带尾斜杠的规则无法匹配，必须不带斜杠
+/vectors
 
 # Outputs
-save/
-results/
+/save/
+/results/
 
 # Logs
-logs/
+/logs/
 *.log
 
 # Temp and Archives

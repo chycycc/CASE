@@ -1385,21 +1385,26 @@ class Dataset(data.Dataset):
 
 def prepare_data_seq(batch_size=None):
     """
-    [F3 修复] 原实现完整忽略形参 batch_size，三个 DataLoader 全部读取 config.batch_size，
-    导致 `prepare_data_seq(batch_size=2)`（如 tests/smoke_test_pcam_integration.py:60）被静默架空。
-    现改为：显式传入时以传入值为准，未传入时回退 config.batch_size。
+    加载数据集并构建 Train / Valid / Test 的 DataLoader。
 
-    [F1 修复] 验证集 DataLoader 由 shuffle=True 改为 shuffle=False。
-    原实现使验证指标成为随机实现值（实测批次重组噪声极差 0.2142，为 Trial 9 遴选裕度
-    0.0517 的 4.14 倍），违反审计铁律 II（验证基准确定性）。
-    注意：本修复会使验证 PPL 基线相对历史随机实现发生约 0.07 量级平移，
-    不得与历史日志中的验证 PPL 直接比较。
+    1. batch_size 形参生效 (F3):
+       - 原缺陷: 内部写死读取 config.batch_size，显式传入的形参被静默忽略。
+       - 修改后: 传入时优先使用并同步更新 config.batch_size；未传入时回退既有配置。
+
+    2. 验证集确定性保障 (F1):
+       - 原缺陷: 原配置 shuffle=True，批次重组引入 0.2142 PPL 随机噪声，干扰检查点遴选。
+       - 修改后: 改为 shuffle=False，消除随机性确保评估严格可复现。
+
+    3. 测试集约束:
+       - 保持硬编码 batch_size=1, shuffle=False，对齐单样本解码机制与基准评测协议。
     """
     pairs_tra, pairs_val, pairs_tst, vocab = load_dataset()
     logging.info("Vocab  {} ".format(vocab.n_words))
     
-    # [F3] 形参生效化：显式传入优先，否则回退全局配置
-    bs = config.batch_size if batch_size is None else batch_size
+    # [F3] 形参生效化并保持全局配置状态同步
+    if batch_size is not None:
+        config.batch_size = batch_size
+    bs = config.batch_size
 
     dataset_train = Dataset(pairs_tra, vocab)
     data_loader_tra = torch.utils.data.DataLoader(
@@ -1412,7 +1417,7 @@ def prepare_data_seq(batch_size=None):
     data_loader_val = torch.utils.data.DataLoader(
         dataset=dataset_valid,
         batch_size=bs,
-        shuffle=False,  # [F1] 验证集必须确定性可复现（审计铁律 II）
+        shuffle=False,  # [F1] 验证集必须确定性可复现
         collate_fn=dataset_valid.collate_fn,
     )
     dataset_test = Dataset(pairs_tst, vocab)
