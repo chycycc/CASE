@@ -38,17 +38,29 @@ if [ "$ENV_MODE" = "4G" ]; then
     echo "======================================================================"
     echo "[*] 加载 4GB 显存轻量模式 (RTX 3050Ti 本地兼容训练)"
     echo "    - 实验代号: ${EXP_NAME}"
-    echo "    - 特性: FP32 全精度原生无损 + 单步 Batch 8 梯度累加 4 次 (等效 Batch 32) + 显存峰值 < 1.4GB"
+    echo "    - 特性: FP32 全精度原生无损 + 单步 Batch 4 梯度累加 8 次 (等效 Batch 32) + 显存峰值 < 900MB"
+    echo "    - 时序映射: 前向步数与时序调度按 8x 等比映射，确保 10,000 次真实参数更新完全对齐云端"
     echo "======================================================================"
-    BATCH_SIZE=8
-    ACCUM_STEPS=4
+    BATCH_SIZE=4
+    ACCUM_STEPS=8
     PRECISION="fp32"
     LR=0.000576
-    WARMUP=2000
-    CHECK_ITER=500
-    MAX_STEP=10000
-    MIN_SAVE_STEP=3000
+    WARMUP=16000           # 对应 2000 次更新预热
+    CHECK_ITER=4000        # 对应每 500 次更新评估一次
+    MAX_STEP=80000         # 对应 10000 次更新上限
+    MIN_SAVE_STEP=24000    # 对应 3000 次更新保护期
     PATIENCE=6
+    
+    # 4G 模式专属时序调度 (乘以 8x 保证与云端 24G 优化器轨迹严格等价)
+    LR_DECAY_START=24000   # 3000 * 8
+    LR_DECAY_STEPS=48000   # 6000 * 8
+    GATE_WARMUP=20000      # 2500 * 8
+    MASK_INTERVAL=8000     # 1000 * 8
+    BIAS_ANNEAL_START=20000
+    BIAS_ANNEAL_STEPS=20000
+    EMO_RAMP_START=20000
+    EMO_RAMP_STEPS=20000
+    
     EXTRA_FLAGS=""
     OUTPUT_DIR="save/${EXP_NAME}/"
     LOG_FILE="logs/${EXP_NAME}.log"
@@ -58,16 +70,25 @@ else
     echo "    - 实验代号: ${EXP_NAME}"
     echo "    - 特性: FP32 全精度原生无损 + 单步 Batch 32 零累加 (更新步数 10,000 次) + 显存安全可控"
     echo "======================================================================"
-    # 【Trial 8 激活】单步物理 32 x 累加 1 (零累加)，参数更新次数恢复为 10,000 次，提升步频分辨率
     BATCH_SIZE=32
     ACCUM_STEPS=1
-    PRECISION="fp32"  # 4090 也可换为 bf16
+    PRECISION="fp32"
     LR=0.000576
     WARMUP=2000
     CHECK_ITER=500
     MAX_STEP=10000
     MIN_SAVE_STEP=3000
     PATIENCE=6
+    
+    LR_DECAY_START=3000
+    LR_DECAY_STEPS=6000
+    GATE_WARMUP=2500
+    MASK_INTERVAL=1000
+    BIAS_ANNEAL_START=2500
+    BIAS_ANNEAL_STEPS=2500
+    EMO_RAMP_START=2500
+    EMO_RAMP_STEPS=2500
+    
     EXTRA_FLAGS=""
     OUTPUT_DIR="save/${EXP_NAME}/"
     LOG_FILE="logs/${EXP_NAME}.log"
@@ -109,8 +130,8 @@ ${pythonpath} main.py \
   --lr ${LR} \
   --warmup ${WARMUP} \
   --lr_schedule cosine \
-  --lr_decay_start_step 3000 \
-  --lr_decay_steps 6000 \
+  --lr_decay_start_step ${LR_DECAY_START} \
+  --lr_decay_steps ${LR_DECAY_STEPS} \
   --check_iter ${CHECK_ITER} \
   --max_step ${MAX_STEP} \
   --pretrain \
@@ -134,15 +155,15 @@ ${pythonpath} main.py \
   --pcam_tau_attn 1.5 \
   --emo_bias_gate_init -2.0 \
   --use_pcgrad \
-  --gate_warmup_steps 2500 \
-  --mask_update_interval 1000 \
+  --gate_warmup_steps ${GATE_WARMUP} \
+  --mask_update_interval ${MASK_INTERVAL} \
   --use_bias_annealing \
-  --bias_anneal_start 2500 \
-  --bias_anneal_steps 2500 \
+  --bias_anneal_start ${BIAS_ANNEAL_START} \
+  --bias_anneal_steps ${BIAS_ANNEAL_STEPS} \
   --bias_min_scale 0.05 \
   --use_emo_loss_ramp \
-  --emo_loss_ramp_start 2500 \
-  --emo_loss_ramp_steps 2500 \
+  --emo_loss_ramp_start ${EMO_RAMP_START} \
+  --emo_loss_ramp_steps ${EMO_RAMP_STEPS} \
   --emo_loss_ramp_max 1.25 \
   --emo_loss_ramp_shape bell \
   --use_composite_score \
