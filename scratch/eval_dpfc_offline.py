@@ -37,7 +37,22 @@ from src.utils.data.loader import prepare_data_seq
 
 def safe_load_checkpoint(checkpoint_path, batch_size=32):
     if not os.path.exists(checkpoint_path):
-        raise FileNotFoundError(f"检查点文件不存在: {checkpoint_path}")
+        raise FileNotFoundError(f"检查点路径不存在: {checkpoint_path}")
+
+    if os.path.isdir(checkpoint_path):
+        candidates = [
+            os.path.join(checkpoint_path, f) for f in os.listdir(checkpoint_path)
+            if not f.endswith((".json", ".txt", ".png", ".tmp", ".log")) and os.path.isfile(os.path.join(checkpoint_path, f))
+        ]
+        composite_cands = [f for f in candidates if "composite_best" in os.path.basename(f)]
+        if composite_cands:
+            checkpoint_path = composite_cands[0]
+        elif candidates:
+            case_cands = [f for f in candidates if "CASE_" in os.path.basename(f)]
+            checkpoint_path = case_cands[0] if case_cands else candidates[0]
+        else:
+            raise FileNotFoundError(f"在目录中未找到有效模型检查点文件: {checkpoint_path}")
+        print(f"[*] 目录输入自动定位目标检查点: {checkpoint_path}")
 
     print(f"\n[*] 预检检查点拓扑结构: {checkpoint_path}")
     state = torch.load(checkpoint_path, map_location="cpu")
