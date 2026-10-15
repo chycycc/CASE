@@ -182,6 +182,8 @@ def get_args():
                         help="[V8] Arc-EPCL 加性角度硬边际 m (默认0.30)")
     parser.add_argument("--arc_mode", type=str, default="cos", choices=["cos", "angle"],
                         help="[V8] Arc-EPCL 硬边际计算模式 (cos: cos(θ)-m, angle: cos(θ+m))")
+    parser.add_argument("--arc_margin_ramp_steps", type=int, default=0,
+                        help="[V9 Trial 11] Arc-EPCL 角度硬边际慢速加载步数 (默认0表示全程恒定，>0 表示前 N 步线性平滑预热至 arc_margin)")
     parser.add_argument("--epcl_anchor", type=str, default="fine_emotion", choices=["fine_emotion", "emotion_enc"],
                         help="[V8] EPCL 对比学习特征挂载锚点 (默认 fine_emotion，支持统一挂载至 emotion_enc)")
     parser.add_argument("--cls_anchor", type=str, default="default", choices=["default", "fine_emotion", "emotion_enc"],

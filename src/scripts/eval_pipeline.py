@@ -296,10 +296,20 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
 
     print(f"[*] 正在加载模型权重: {checkpoint_path}")
     state = torch.load(checkpoint_path, map_location=config.device)
-    if "model" in state:
-        model.load_state_dict(state["model"], strict=False)
-    else:
-        model.load_state_dict(state, strict=False)
+    model_state = state["model"] if "model" in state else state
+    missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
+
+    # [E2 修复 / 铁律 IV 规约] 关键拓扑前缀缺失熔断检查 (fail-fast，杜绝掩耳盗铃式假通过)
+    critical_prefixes = ["decoder.", "encoder.", "emotion_linear."]
+    if getattr(config, "use_pcam", False):
+        critical_prefixes.append("pcam.")
+    if hasattr(model, "epcl_criterion"):
+        critical_prefixes.append("epcl_criterion.")
+
+    missing_critical = [p for p in critical_prefixes if any(k.startswith(p) for k in missing_keys)]
+    if missing_critical:
+        raise RuntimeError(f"[FATAL AUDIT / 铁律 IV] 关键拓扑前缀权重缺失: {missing_critical}，拒绝使用残缺模型执行评测！")
+    print(f"[+] [Weight Audit] 关键拓扑前缀完整性核验通过: {critical_prefixes}")
 
     model.eval()
     model.is_eval = True
@@ -788,10 +798,25 @@ def main():
     except Exception as e:
         print(f"[!] 追加保存评测报告失败: {e}")
 
-    # 同时在权重所在目录保存 JSON 结构化元数据
+    # 同时在权重所在目录保存 JSON 结构化元数据 (含 NaN/Inf 容错清洗与原子写入保护)
     try:
+        def sanitize_metric_values(obj):
+            if isinstance(obj, dict):
+                return {k: sanitize_metric_values(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [sanitize_metric_values(v) for v in obj]
+            elif isinstance(obj, (float, np.floating)):
+                val = float(obj)
+                if math.isnan(val) or math.isinf(val):
+                    return None
+                return round(val, 6)
+            elif isinstance(obj, (int, np.integer)):
+                return int(obj)
+            return obj
+
         model_dir = os.path.dirname(best_ckpt)
         json_path = os.path.join(model_dir, "eval_metrics.json")
+        tmp_json_path = json_path + ".tmp"
         combined_metrics = {
             "checkpoint": best_ckpt,
             "eval_time": time.strftime('%Y-%m-%d %H:%M:%S'),
@@ -799,9 +824,11 @@ def main():
             "manifold_metrics": manifold_metrics,
             "generation_metrics": gen_metrics
         }
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(combined_metrics, f, indent=2, ensure_ascii=False)
-        print(f"[+] 结构化指标元数据已保存: {json_path}")
+        clean_metrics = sanitize_metric_values(combined_metrics)
+        with open(tmp_json_path, "w", encoding="utf-8") as f:
+            json.dump(clean_metrics, f, indent=2, ensure_ascii=False)
+        os.replace(tmp_json_path, json_path)
+        print(f"[+] 结构化指标元数据已原子保存: {json_path}")
     except Exception as e:
         print(f"[!] 保存 JSON 元数据失败: {e}")
 

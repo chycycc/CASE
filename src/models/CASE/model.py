@@ -200,7 +200,8 @@ class PrototypeContrastiveLoss(nn.Module):
                  use_erp=False, erp_hidden_dim=768, erp_dropout=0.1,
                  use_cchp=False, cchp_alpha=0.1,
                  use_mcp=False, mcp_momentum=0.99,
-                 use_arc_margin=False, arc_margin=0.30, arc_mode='cos'):
+                 use_arc_margin=False, arc_margin=0.30, arc_mode='cos',
+                 arc_margin_ramp_steps=0):
         super(PrototypeContrastiveLoss, self).__init__()
         self.num_classes = num_classes
         self.num_prototypes_per_class = num_prototypes_per_class
@@ -215,6 +216,8 @@ class PrototypeContrastiveLoss(nn.Module):
         self.use_arc_margin = use_arc_margin
         self.arc_margin = arc_margin
         self.arc_mode = arc_mode
+        self.arc_margin_ramp_steps = arc_margin_ramp_steps
+        self.current_step = 0
 
         # 1. 投影头选择 (ERP vs 原版瓶颈 MLP)
         if self.use_erp:
@@ -365,7 +368,9 @@ class PrototypeContrastiveLoss(nn.Module):
             return torch.tensor(0.0, device=proj_norm.device)
         return torch.logsumexp(-self.t_uniform * sq_pdist, dim=1).mean()
 
-    def forward(self, features, labels, tau=None, ctx_repr=None):
+    def forward(self, features, labels, tau=None, ctx_repr=None, step=None):
+        if step is not None:
+            self.current_step = step
         current_tau = tau if tau is not None else self.temperature
 
         # 1. 投影特征
@@ -398,16 +403,26 @@ class PrototypeContrastiveLoss(nn.Module):
             # [B, D] x [D, M] -> [B, M]
             all_sim = torch.matmul(proj_norm, proto_norm.T)
 
+        # [V9 Trial 11] 计算动态平滑慢速加载 margin
+        ramp_steps = getattr(self, "arc_margin_ramp_steps", 0)
+        if ramp_steps > 0 and self.training:
+            scale = min(1.0, float(getattr(self, "current_step", 0)) / float(ramp_steps))
+            effective_margin = self.arc_margin * scale
+            if getattr(self, "current_step", 0) % 1000 == 0:
+                print(f"[*] [V9 Trial 11] Step {self.current_step}: Arc-EPCL effective_margin = {effective_margin:.4f} (m_max={self.arc_margin}, scale={scale:.1%})")
+        else:
+            effective_margin = self.arc_margin
+
         if self.num_prototypes_per_class == 1:
-            if getattr(self, "use_arc_margin", False) and self.arc_margin > 0.0 and self.training:
-                # [V8 手术 3] 加性硬边际 Arc-EPCL：仅在训练期对目标正类别施加加性硬间隔惩罚
+            if getattr(self, "use_arc_margin", False) and effective_margin > 0.0 and self.training:
+                # [V8 手术 3 / V9 Trial 11] 加性硬边际 Arc-EPCL：动态退火 margin
                 margin_sim = all_sim.clone()
                 target_sim = margin_sim[batch_idx, labels]
                 if getattr(self, "arc_mode", "cos") == "angle":
                     # 角域加性硬边际: cos(θ + m) = cos(θ)cos(m) - sin(θ)sin(m)
                     cos_theta = target_sim.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
                     sin_theta = torch.sqrt((1.0 - cos_theta * cos_theta).clamp(min=1e-7))
-                    m = self.arc_margin
+                    m = effective_margin
                     cos_m = math.cos(m)
                     sin_m = math.sin(m)
                     cos_theta_m = cos_theta * cos_m - sin_theta * sin_m
@@ -420,7 +435,7 @@ class PrototypeContrastiveLoss(nn.Module):
                     )
                 else:
                     # 余弦加性硬边际 (CosFace 形式): cos(θ) - m，平滑且极度数值稳定
-                    margin_sim[batch_idx, labels] = target_sim - self.arc_margin
+                    margin_sim[batch_idx, labels] = target_sim - effective_margin
                 logits = margin_sim / current_tau
             else:
                 logits = all_sim / current_tau
@@ -437,11 +452,11 @@ class PrototypeContrastiveLoss(nn.Module):
             neg_mask[batch_idx, labels] = False
             neg_cosines = all_cosine[neg_mask].view(B, (C - 1) * K)
 
-            if getattr(self, "use_arc_margin", False) and self.arc_margin > 0.0 and self.training:
+            if getattr(self, "use_arc_margin", False) and effective_margin > 0.0 and self.training:
                 if getattr(self, "arc_mode", "cos") == "angle":
                     cos_theta = best_pos_cosine.clamp(-1.0 + 1e-7, 1.0 - 1e-7)
                     sin_theta = torch.sqrt((1.0 - cos_theta * cos_theta).clamp(min=1e-7))
-                    m = self.arc_margin
+                    m = effective_margin
                     cos_m = math.cos(m)
                     sin_m = math.sin(m)
                     cos_theta_m = cos_theta * cos_m - sin_theta * sin_m
@@ -452,7 +467,7 @@ class PrototypeContrastiveLoss(nn.Module):
                         cos_theta - math.sin(m) * m
                     )
                 else:
-                    best_pos_cosine = best_pos_cosine - self.arc_margin
+                    best_pos_cosine = best_pos_cosine - effective_margin
 
             comp_logits = torch.cat([best_pos_cosine, neg_cosines], dim=-1) / current_tau
             target_zeros = torch.zeros(B, dtype=torch.long, device=labels.device)
@@ -1176,6 +1191,7 @@ class CASE(nn.Module):
         self.use_arc_margin = getattr(config, 'use_arc_margin', False)
         self.arc_margin = getattr(config, 'arc_margin', 0.30)
         self.arc_mode = getattr(config, 'arc_mode', 'cos')
+        self.arc_margin_ramp_steps = getattr(config, 'arc_margin_ramp_steps', 0)
         self.epcl_anchor = getattr(config, 'epcl_anchor', 'fine_emotion')
         self.epcl_criterion = PrototypeContrastiveLoss(
             self.emotion_num, config.emb_dim,
@@ -1190,14 +1206,15 @@ class CASE(nn.Module):
             mcp_momentum=self.mcp_momentum,
             use_arc_margin=self.use_arc_margin,
             arc_margin=self.arc_margin,
-            arc_mode=self.arc_mode
+            arc_mode=self.arc_mode,
+            arc_margin_ramp_steps=self.arc_margin_ramp_steps
         )
         if self.use_mcp:
             print(f"[V8 Architecture] 成功启用动量样本中心原型 (MCP): momentum={self.mcp_momentum}")
         elif self.use_cchp:
             print(f"[V7 Architecture] 成功启用动态上下文条件超网络原型 (CCHP): alpha_dyn={getattr(config, 'cchp_alpha', 0.1)}")
         if self.use_arc_margin:
-            print(f"[V8 Architecture] 成功启用加性角度硬边际对比损失 (Arc-EPCL): margin={self.arc_margin}, mode={self.arc_mode}")
+            print(f"[V8/V9 Architecture] 成功启用加性角度硬边际对比损失 (Arc-EPCL): margin={self.arc_margin}, mode={self.arc_mode}, ramp_steps={self.arc_margin_ramp_steps}")
         self.cls_anchor = getattr(config, 'cls_anchor', 'default')
         if self.cls_anchor == 'default':
             self.cls_anchor = self.epcl_anchor
@@ -1211,6 +1228,8 @@ class CASE(nn.Module):
         if self.num_prototypes_per_class > 1:
             print(f"[V6/V7 Multi-Prototype] EPCL: {self.emotion_num} classes x {self.num_prototypes_per_class} sub-protos = {total_protos} total prototypes")
         self.emo_dropout = nn.Dropout(0.3)
+        if getattr(config, 'max_grad_norm', 0.0) > 0.0:
+            print(f"[Gradient Clip] 成功启用全局梯度裁剪: max_grad_norm={config.max_grad_norm}")
         # [V4 Trial 8: MoP-DR] Router input dim = total_protos (32 when K=1, 64 when K=2)
         self.router_linear = nn.Linear(total_protos, config.emb_dim)
         self.concept_prior_attn = Attention(query_size=config.emb_dim,
@@ -1931,7 +1950,7 @@ class CASE(nn.Module):
             # [v3 P3 / V7 / V8] 单锚点 EPCL 与 CCHP 位移正则项计算 (输入 target_emotion_feat)
             if self.dataset == "ED" and train:
                 ctx_repr_for_cchp = enc_outputs[:, 0, :] if getattr(self.epcl_criterion, 'use_cchp', False) else None
-                epcl_loss, cchp_reg_loss = self.epcl_criterion(target_emotion_feat, batch["program_label"], tau=current_tau, ctx_repr=ctx_repr_for_cchp)
+                epcl_loss, cchp_reg_loss = self.epcl_criterion(target_emotion_feat, batch["program_label"], tau=current_tau, ctx_repr=ctx_repr_for_cchp, step=iter)
             else:
                 epcl_loss = torch.tensor(0.0, device=config.device)
                 cchp_reg_loss = torch.tensor(0.0, device=config.device)
@@ -2102,11 +2121,15 @@ class CASE(nn.Module):
         if train:
             if getattr(self, 'use_pcgrad', False) and self.dataset == "ED":
                 # [V8.2 创新机制 2: PCGrad 多任务对抗梯度正交投影]
+                # [D9 修复] 若启用梯度累加 (accum_steps > 1)，双任务损失必须同时除以 accum_steps 归一化
+                loss_gen_scaled = loss_gen / accum_steps
+                loss_emo_scaled = loss_emo / accum_steps
+
                 # 1. 计算自回归语言生成核心任务梯度
                 if self.scaler is not None:
-                    self.scaler.scale(loss_gen).backward(retain_graph=True)
+                    self.scaler.scale(loss_gen_scaled).backward(retain_graph=True)
                 else:
-                    loss_gen.backward(retain_graph=True)
+                    loss_gen_scaled.backward(retain_graph=True)
                 grads_gen = {p: p.grad.clone() for p in self.parameters() if p.grad is not None}
                 
                 # 清除当前梯度缓存以隔离第二任务
@@ -2115,9 +2138,9 @@ class CASE(nn.Module):
                 
                 # 2. 计算辅助情感分类/原型对比学习任务梯度
                 if self.scaler is not None:
-                    self.scaler.scale(loss_emo).backward()
+                    self.scaler.scale(loss_emo_scaled).backward()
                 else:
-                    loss_emo.backward()
+                    loss_emo_scaled.backward()
                 grads_emo = {p: p.grad.clone() for p in self.parameters() if p.grad is not None}
                 
                 # 3. 共有参数上的负内积冲突检测与标准对称双向正交投影 (Symmetric PCGrad)
@@ -2148,13 +2171,23 @@ class CASE(nn.Module):
                     elif g_emo is not None:
                         p.grad = g_emo
             else:
+                loss_scaled = loss / accum_steps
                 if self.scaler is not None:
-                    self.scaler.scale(loss).backward()
+                    self.scaler.scale(loss_scaled).backward()
                 else:
-                    loss.backward()
+                    loss_scaled.backward()
 
             if (iter + 1) % accum_steps == 0:
                 opt = self.optimizer.optimizer if config.noam else self.optimizer
+                # [D8 修复] 梯度裁剪：在两任务梯度合并后、opt.step() 前执行；预留 AMP unscale
+                if getattr(config, 'max_grad_norm', 0.0) > 0.0:
+                    if self.scaler is not None:
+                        self.scaler.unscale_(opt)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), config.max_grad_norm)
+                    if (iter + 1) == accum_steps or (iter + 1) % (accum_steps * 500) == 0:
+                        norm_val = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
+                        print(f"[Gradient Norm] Step {iter+1} (Update {(iter+1)//accum_steps}): Total Grad Norm={norm_val:.4f} (Clip={config.max_grad_norm})")
+
                 if self.scaler is not None:
                     self.scaler.step(opt)
                     self.scaler.update()

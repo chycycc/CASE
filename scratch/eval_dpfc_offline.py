@@ -43,8 +43,13 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
     state = torch.load(checkpoint_path, map_location="cpu")
     raw_keys = list(state["model"].keys() if "model" in state else state.keys())
 
-    # H1 关键前缀断言
-    assert any(k.startswith("pcam.") for k in raw_keys), f"[致命 H1] 检查点不含 PCAM 权重: {checkpoint_path}"
+    # H1 关键前缀断言 (自适应 PCAM / Baseline)
+    has_pcam = any(k.startswith("pcam.") for k in raw_keys)
+    config.use_pcam = has_pcam
+    if has_pcam:
+        print("    [拓扑识别] 检出 PCAM 特征增强模块")
+    else:
+        print("    [拓扑识别] 无 PCAM 模块 (标准 Baseline 模式)")
     assert any(k.startswith("epcl_criterion.") for k in raw_keys), f"[致命 H1] 检查点不含 EPCL 权重: {checkpoint_path}"
     assert any(k.startswith("emotion_linear.") for k in raw_keys), f"[致命 H1] 检查点不含 分类头 权重: {checkpoint_path}"
 
@@ -55,7 +60,6 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
         config.emotion_head_type = "linear"
         print("    [拓扑识别] 检出标准线性分类头 (linear)")
 
-    config.use_pcam = True
     config.use_erp = any("erp." in k for k in raw_keys)
     config.dataset = "ED"
     config.batch_size = batch_size
@@ -339,7 +343,7 @@ def run_dpfc_evaluation(args):
     stat_ncm, p_ncm, method_ncm = mcnemar_test(b_ncm, c_ncm)
 
     # L3: 产物矩阵深度落盘
-    output_dir = os.path.join(PROJECT_ROOT, "save", "diag")
+    output_dir = os.path.abspath(args.output_dir) if hasattr(args, "output_dir") and args.output_dir else os.path.join(PROJECT_ROOT, "save", "diag")
     os.makedirs(output_dir, exist_ok=True)
     report_json_path = os.path.join(output_dir, "dpfc_eval_results.json")
     preds_npz_path = os.path.join(output_dir, "dpfc_preds.npz")
@@ -430,6 +434,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="CASE-EPCL DPFC 阶段 0 离线后验融合与统计检验脚本")
     parser.add_argument("--model_path", type=str, default="save/v9_trial9/CASE_7499_37.7145_composite_best", help="目标检查点路径")
     parser.add_argument("--batch_size", type=int, default=32, help="评估 Batch 大小")
+    parser.add_argument("--output_dir", type=str, default="save/diag", help="评测结果与特征 NPZ 保存目录")
     args = parser.parse_args()
 
     run_dpfc_evaluation(args)
