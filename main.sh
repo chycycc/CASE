@@ -61,7 +61,7 @@ if [ "$ENV_MODE" = "4G" ]; then
     EMO_RAMP_START=20000
     EMO_RAMP_STEPS=20000
     
-    EXTRA_FLAGS=""
+    EXTRA_FLAGS=${EXTRA_FLAGS:-""}
     OUTPUT_DIR="save/${EXP_NAME}/"
     LOG_FILE="logs/${EXP_NAME}.log"
 else
@@ -89,7 +89,7 @@ else
     EMO_RAMP_START=2500
     EMO_RAMP_STEPS=2500
     
-    EXTRA_FLAGS=""
+    EXTRA_FLAGS=${EXTRA_FLAGS:-""}
     OUTPUT_DIR="save/${EXP_NAME}/"
     LOG_FILE="logs/${EXP_NAME}.log"
 
@@ -114,6 +114,7 @@ mkdir -p results/v9
 echo "[*] 启动配置全览:"
 echo "    - 实验代号: ${EXP_NAME}"
 echo "    - 硬件模式: ${ENV_MODE} (Batch: ${BATCH_SIZE}, Accum: ${ACCUM_STEPS}, Precision: ${PRECISION})"
+echo "    - 注入参数: ${EXTRA_FLAGS:-'(无)'}"
 echo "    - 权重保存: ${OUTPUT_DIR}"
 echo "    - 训练日志: ${LOG_FILE}"
 echo "    - 评估间隔: 每 ${CHECK_ITER} 步 | 最大步数: ${MAX_STEP} 步 | 保护期: ${MIN_SAVE_STEP} 步"
