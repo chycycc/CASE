@@ -272,6 +272,11 @@ def train(model, train_set, dev_set):
         if weights_best is not None:
             model.load_state_dict(weights_best)
 
+    # [T11-B 监控] 训练收尾一次性输出全局梯度范数分布与 PCGrad 冲突统计（纯只读，无副作用）
+    _monitor = getattr(model, "print_training_monitor", None)
+    if callable(_monitor):
+        _monitor()
+
     return weights_best
 
 def test(model, test_set):

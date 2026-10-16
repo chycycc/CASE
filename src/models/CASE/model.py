@@ -1308,6 +1308,14 @@ class CASE(nn.Module):
         self.mask_update_interval = getattr(config, 'mask_update_interval', 5000)
         self.use_pcgrad = getattr(config, 'use_pcgrad', False)
         self.current_step = 0
+
+        # [T11-B 监控加固] 全局梯度范数与 PCGrad 冲突零开销监控
+        # 注意：此处刻意【不】使用 register_buffer，避免 _gn_buf 进入 state_dict
+        # 而触发 eval_pipeline.py:298-312 的关键前缀严格断言（多余键风险）。
+        self._gn_buf = torch.zeros(20000, device=config.device)
+        self._gn_n = 0
+        self._pcg_conflict_steps = 0
+        self._pcg_cos_sum = 0.0
         
         # [V8.2 C] 解码端偏置门控时序余弦退火超参数
         self.use_bias_annealing = getattr(config, 'use_bias_annealing', False)
@@ -1428,6 +1436,39 @@ class CASE(nn.Module):
                 protos = self.epcl_criterion.current_prototypes
             return self.pcam(dec_output, protos)
         return dec_output
+
+    @torch.no_grad()
+    def print_training_monitor(self):
+        """
+        [T11-B 监控] 训练收尾一次性输出全局梯度范数分布与 PCGrad 冲突统计。
+        设计约束：
+          1) 全程零逐步同步（仅此处发生 Host-Device 同步，共 2 次）；
+          2) P95 使用 torch.kthvalue 而非 torch.quantile（后者对超大张量有元素上限）；
+             中位数使用 torch.median —— 注意：元素数为偶数时它返回【下中位数】（非两中间值平均），
+             10000 步样本下该偏差量级 < 0.001，可忽略，但对外表述时不应称为「两中间值平均」。
+          3) 该统计不改变任何训练行为，纯只读。
+        """
+        if not hasattr(self, "_gn_n") or self._gn_n <= 0:
+            return
+        g = self._gn_buf[: self._gn_n]
+        k_p95 = max(1, int(round(0.95 * self._gn_n)))
+        print("\n====================== [T11-B 训练监控全局统计] ======================")
+        print(
+            f"[Gradient Norm] 总更新步数={self._gn_n}（含 pretrain 阶段） | 均值={g.mean().item():.4f} | "
+            f"中位数={torch.median(g).item():.4f} | "
+            f"P95={torch.kthvalue(g, k_p95).values.item():.4f} | 最大值={g.max().item():.4f}"
+        )
+        print(
+            f"[Gradient Norm 超阈比例] >2.0 比例={100.0 * (g > 2.0).float().mean().item():.2f}% | "
+            f">6.0 比例={100.0 * (g > 6.0).float().mean().item():.2f}%"
+        )
+        ratio_pcg = 100.0 * self._pcg_conflict_steps / max(1, self._gn_n)
+        mean_cos = (self._pcg_cos_sum / self._pcg_conflict_steps) if self._pcg_conflict_steps > 0 else 0.0
+        print(
+            f"[PCGrad 负内积冲突监控] 冲突发生步数={self._pcg_conflict_steps}/{self._gn_n} "
+            f"(占比={ratio_pcg:.2f}%) | 冲突步平均|cos|={mean_cos:.4f}"
+        )
+        print("======================================================================\n")
 
     def save_model(self, running_avg_ppl, iter, tag=None):
         """
@@ -2148,7 +2189,13 @@ class CASE(nn.Module):
                 if shared_params:
                     dot_prod = sum(torch.sum(grads_gen[p] * grads_emo[p]) for p in shared_params)
                     if dot_prod < 0:
+                        # [T11-B 监控] 仅在冲突分支内统计：分支内 dot_prod < 0 恒成立，
+                        # 故带符号 cos 无信息量，此处只累计 |cos| 均值与冲突步数。
                         norm_gen_sq = sum(torch.sum(grads_gen[p] * grads_gen[p]) for p in shared_params)
+                        norm_emo_sq_tmp = sum(torch.sum(grads_emo[p] * grads_emo[p]) for p in shared_params)
+                        with torch.no_grad():
+                            self._pcg_conflict_steps += 1
+                            self._pcg_cos_sum += abs((dot_prod / (torch.sqrt(norm_gen_sq + 1e-8) * torch.sqrt(norm_emo_sq_tmp + 1e-8) + 1e-8)).item())
                         norm_emo_sq = sum(torch.sum(grads_emo[p] * grads_emo[p]) for p in shared_params)
                         coeff_emo = dot_prod / (norm_gen_sq + 1e-8)
                         coeff_gen = dot_prod / (norm_emo_sq + 1e-8)
@@ -2184,6 +2231,12 @@ class CASE(nn.Module):
                     if self.scaler is not None:
                         self.scaler.unscale_(opt)
                     grad_norm = torch.nn.utils.clip_grad_norm_(self.parameters(), config.max_grad_norm)
+                    # [T11-B 监控约束 1] 逐 update 记录裁剪前总范数到 GPU 张量（禁止逐步 .item()
+                    # 造成 10000 次 Host-Device 同步）；取值严格位于 scaler.unscale_ 之后、opt.step 之前。
+                    with torch.no_grad():
+                        if self._gn_n < self._gn_buf.size(0):
+                            self._gn_buf[self._gn_n] = grad_norm.detach()
+                            self._gn_n += 1
                     if (iter + 1) == accum_steps or (iter + 1) % (accum_steps * 500) == 0:
                         norm_val = grad_norm.item() if hasattr(grad_norm, 'item') else float(grad_norm)
                         print(f"[Gradient Norm] Step {iter+1} (Update {(iter+1)//accum_steps}): Total Grad Norm={norm_val:.4f} (Clip={config.max_grad_norm})")
