@@ -502,9 +502,10 @@ def evaluate_manifold_and_plot(model, test_set, output_png_path="docs/v8/images/
     if not exp_name or exp_name == "manifold":
         exp_name = "CASE-EPCL"
 
+    # 标题保持纯 ASCII：云端 Linux 常无中文字体，中文会渲染成方框（tofu）。
     title_text = (
-        f"{exp_name} 真实隐空间流形与 MCP 样本中心原型分布\n"
-        f"Silhouette: {sil_cosine:.4f} | DBI: {dbi:.4f} | 原型中心对齐度: {mean_cos_align:.4f} | 偏移量: {mean_offset:.4f}"
+        f"{exp_name}  Latent Manifold & MCP Prototype Centers\n"
+        f"Silhouette: {sil_cosine:.4f} | DBI: {dbi:.4f} | Centroid Alignment: {mean_cos_align:.4f} | Offset: {mean_offset:.4f}"
     )
     ax.set_title(title_text, fontsize=12, fontweight='bold', pad=12)
     ax.set_xlabel("t-SNE Dimension 1", fontsize=10)
@@ -539,6 +540,9 @@ def calc_distinct_n(n, candidates):
             d[key] = 1
             total += 1
     return (len(d) / (total + 1e-16)) * 100.0
+
+
+
 
 
 def evaluate_generation_diversity(model, vocab, test_set, num_samples=500):
@@ -601,7 +605,7 @@ def evaluate_generation_diversity(model, vocab, test_set, num_samples=500):
     sampling_res = summarize_cands(sampling_cands)
     sampling_08_res = summarize_cands(sampling_08_cands)
 
-    print(f"[+] 多样性解码评测完成:")
+    print(f"[+] 多样性评测完成:")
     print(f"    - Greedy        : Dist-1={greedy_res['Dist-1']}%, Dist-2={greedy_res['Dist-2']}%, Unique={greedy_res['Unique']}%")
     print(f"    - Beam (k=5)    : Dist-1={beam_res['Dist-1']}%, Dist-2={beam_res['Dist-2']}%, Unique={beam_res['Unique']}%")
     print(f"    - Sampling(0.7) : Dist-1={sampling_res['Dist-1']}%, Dist-2={sampling_res['Dist-2']}%, Unique={sampling_res['Unique']}%")

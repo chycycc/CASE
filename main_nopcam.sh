@@ -198,7 +198,7 @@ ${pythonpath} src/scripts/eval_pipeline.py \
   --batch_size ${BATCH_SIZE} \
   --gpu ${GPU_ID} \
   --use_arc_margin \
-  ${EXTRA_FLAGS}
+  ${EXTRA_FLAGS} 2>&1 | tee -a ${LOG_FILE}
 
 # 3. 汇总所有需要回传或归档的文件到统一输出目录
 if [ -d "${HOME}/autodl-tmp" ]; then

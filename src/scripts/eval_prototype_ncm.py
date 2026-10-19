@@ -1,16 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-CASE-EPCL V9 Trial 10: 阶段 0 DPFC 离线后验融合与统计检验脚本 (eval_dpfc_offline.py 终极完善版)
+CASE-EPCL 学术评测流水线: 原型最近邻分类器 (NCM) 评测、逐样本表征落盘与 McNemar 配对检验脚本
+脚本路径: src/scripts/eval_prototype_ncm.py (由 scratch/eval_dpfc_offline.py 升格)
 
-【落地防御与增强清单】:
-  - H1 关键权重严格断言: 强制断言 pcam/epcl_criterion/emotion_linear 权重非空且无未匹配项;
-  - L1 Hook 强一致性防御: 增加 assert (captured_logits[0].argmax(1) == model.current_pred_emotion) 绝对防止错位;
-  - N1 降级未初始化原型断言: 取消崩溃性 assert，改为警告 + -1e9 掩码屏蔽，并将 num_init 记录进 JSON;
-  - N6 补全 Dev 侧基准指标: JSON 完整归档 dev_linear_acc, dev_ncm_acc, dev_dpfc_acc，审稿链条完全闭环;
-  - L2 双重 McNemar 检验: 独立输出 (NCM-only vs Linear) 与 (DPFC-fused vs Linear) 的双列联表与显著性;
-  - L3 深度离线特征落盘: NPZ 增存 true_labels, linear_probs, ncm_sim, preds_linear, preds_ncm, preds_dpfc;
-  - L4 显著性方向细分: 区分 is_significant_positive 与 is_significant_negative;
-  - 零文件传输优化: 终端单行打印 [EVAL_DPFC_COMPACT_JSON]。
+【核心功能】:
+1. 权重拓扑自适应加载与关键断言 (H1 防御):
+   - 自动检测并断言 pcam / epcl_criterion / emotion_linear / residual_mlp 权重;
+2. 测试集/验证集特征与 Logits 提取:
+   - 使用 Hook 捕获真实样本在编码器输出端的投影隐向量与分类头 Logits;
+   - 强一致性防御 (L1): 逐批核对 Hook 提取预测与模型内置预测;
+3. 原型空间最近质心/均值分类 (NCM):
+   - 计算余弦相似度与温度尺度变换下的类别指派与准确率;
+4. 离线表征矩阵与概率深度落盘:
+   - 导出 dpfc_preds.npz (包含 true_labels, linear_probs, ncm_sim, preds_linear, preds_ncm, preds_dpfc);
+   - 支撑跨 Trial (如 T12 vs T11-B, T12 vs T12-C) 的离线配对 McNemar 检验;
+5. 显著性检验与结构化报告:
+   - 运行连续性校正 McNemar 检验与双侧精确二项检验，输出标准化 JSON 报告。
 """
 
 import os
@@ -24,8 +29,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-# 项目路径注入
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# 项目根目录路径注入
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
@@ -36,6 +41,9 @@ from src.utils.data.loader import prepare_data_seq
 
 
 def safe_load_checkpoint(checkpoint_path, batch_size=32):
+    """
+    自适应定位并安全加载模型检查点，执行拓扑识别与关键权重断言 (H1 防御)。
+    """
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(f"检查点路径不存在: {checkpoint_path}")
 
@@ -65,8 +73,9 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
         print("    [拓扑识别] 检出 PCAM 特征增强模块")
     else:
         print("    [拓扑识别] 无 PCAM 模块 (标准 Baseline 模式)")
+
     assert any(k.startswith("epcl_criterion.") for k in raw_keys), f"[致命 H1] 检查点不含 EPCL 权重: {checkpoint_path}"
-    assert any(k.startswith("emotion_linear.") for k in raw_keys), f"[致命 H1] 检查点不含 分类头 权重: {checkpoint_path}"
+    assert any(k.startswith("emotion_linear.") for k in raw_keys), f"[致命 H1] 检查点不含分类头权重: {checkpoint_path}"
 
     if any("emotion_linear.linear_2." in k or "emotion_linear.block." in k for k in raw_keys):
         config.emotion_head_type = "residual_mlp"
@@ -74,6 +83,11 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
     else:
         config.emotion_head_type = "linear"
         print("    [拓扑识别] 检出标准线性分类头 (linear)")
+
+    # 预留前缀拓扑检测 (支持 T12 原型前缀自适应加载)
+    if any("proto_prefix" in k for k in raw_keys):
+        config.use_proto_prefix = True
+        print("    [拓扑识别] 检出原型前缀注意力参数 (proto_prefix)")
 
     config.use_erp = any("erp." in k for k in raw_keys)
     config.dataset = "ED"
@@ -127,6 +141,9 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
 
 
 def extract_features_and_logits(model, dataloader, split_name="dev"):
+    """
+    通过注册 Hook 提取特征表征与分类头输出 logits。
+    """
     model.eval()
     captured_logits = []
 
@@ -178,6 +195,9 @@ def extract_features_and_logits(model, dataloader, split_name="dev"):
 
 
 def compute_ncm_logits(proj_norm, proto_norm, valid_mask=None, num_prototypes_per_class=1):
+    """
+    计算 L2 归一化特征与原型矩阵的余弦相似度。
+    """
     N, D = proj_norm.size()
     total_protos, _ = proto_norm.size()
     num_classes = total_protos // num_prototypes_per_class
@@ -205,6 +225,9 @@ def evaluate_accuracy(logits, labels):
 
 
 def grid_search_dpfc(dev_logits, dev_proj, dev_labels, proto_norm, valid_mask, num_protos_per_class, tau_list, alpha_list):
+    """
+    在验证集上执行网格寻优，输出 NCM 最优 tau 与后验融合最优参数（用于历史对照与机制闭环）。
+    """
     print("\n[*] 正在验证集上执行独立参数寻优...")
 
     # 1. NCM-Only 独立最优寻优
@@ -257,6 +280,9 @@ def exact_binomial_test_two_sided(k, n, p=0.5):
 
 
 def mcnemar_test(b, c):
+    """
+    McNemar 配对卡方检验（含 Yates 连续性校正）。
+    """
     total = b + c
     if total == 0:
         return 0.0, 1.0, "Identical"
@@ -270,9 +296,9 @@ def mcnemar_test(b, c):
         return chi2, p_value, "Chi-Square (continuity corrected)"
 
 
-def run_dpfc_evaluation(args):
+def run_ncm_evaluation(args):
     print("=" * 75)
-    print(" CASE-EPCL V9 Trial 10: 阶段 0 DPFC 离线后验融合与统计检验 (终极完善封版)")
+    print(" CASE-EPCL 学术评测流水线: 原型空间 (NCM) 评测与逐样本矩阵落盘")
     print("=" * 75)
 
     model, vocab, dev_set, test_set = safe_load_checkpoint(args.model_path, batch_size=args.batch_size)
@@ -357,7 +383,7 @@ def run_dpfc_evaluation(args):
     d_ncm = int(((corr_lin == False) & (corr_ncm == False)).sum().item())
     stat_ncm, p_ncm, method_ncm = mcnemar_test(b_ncm, c_ncm)
 
-    # L3: 产物矩阵深度落盘
+    # L3: 产物矩阵深度落盘 (同时支持 dpfc_preds.npz 命名与标准输出目录)
     output_dir = os.path.abspath(args.output_dir) if hasattr(args, "output_dir") and args.output_dir else os.path.join(PROJECT_ROOT, "save", "diag")
     os.makedirs(output_dir, exist_ok=True)
     report_json_path = os.path.join(output_dir, "dpfc_eval_results.json")
@@ -418,7 +444,7 @@ def run_dpfc_evaluation(args):
         json.dump(results_dict, f, indent=2, ensure_ascii=False)
 
     print("\n" + "=" * 70)
-    print("                DPFC 离线后验融合测试集最终评测报告")
+    print("                原型与后验融合测试集最终评测报告")
     print("=" * 70)
     print(f" 1. 纯 Linear 分类头准确率:   {test_linear_acc:.2f}% (Dev: {dev_linear_acc:.2f}%)")
     print(f" 2. 纯 NCM 原型分类准确率:    {test_ncm_acc:.2f}% (Dev: {dev_ncm_acc:.2f}%, 专属最优 tau={best_ncm_tau})")
@@ -440,16 +466,16 @@ def run_dpfc_evaluation(args):
 
     # 零传输摩擦: 紧凑 JSON 单行打印
     print("\n" + "=" * 75)
-    print(" [EVAL_DPFC_COMPACT_JSON]")
+    print(" [EVAL_NCM_COMPACT_JSON]")
     print(json.dumps(results_dict, ensure_ascii=False))
     print("=" * 75 + "\n")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="CASE-EPCL DPFC 阶段 0 离线后验融合与统计检验脚本")
-    parser.add_argument("--model_path", type=str, default="save/v9_trial9/CASE_7499_37.7145_composite_best", help="目标检查点路径")
+    parser = argparse.ArgumentParser(description="CASE-EPCL 原型最近邻分类 (NCM) 评测与特征落盘流水线")
+    parser.add_argument("--model_path", type=str, default="save/v9_trial10/CASE_7499_37.3144_composite_best", help="目标检查点路径")
     parser.add_argument("--batch_size", type=int, default=32, help="评估 Batch 大小")
     parser.add_argument("--output_dir", type=str, default="save/diag", help="评测结果与特征 NPZ 保存目录")
     args = parser.parse_args()
 
-    run_dpfc_evaluation(args)
+    run_ncm_evaluation(args)

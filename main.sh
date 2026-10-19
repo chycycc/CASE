@@ -180,7 +180,6 @@ echo "======================================================================"
 echo "[*] 训练完成！自动启动全量学术指标自动化审计..."
 echo "======================================================================"
 
-# 自动调用统一评测流水线进行测试集度量 (PPL, Dist-2, Unique, Alignment, DBI)
 ${pythonpath} src/scripts/eval_pipeline.py \
   --model_path ${OUTPUT_DIR} \
   --results_path "results/v9/${EXP_NAME}_eval.txt" \
@@ -188,7 +187,7 @@ ${pythonpath} src/scripts/eval_pipeline.py \
   --batch_size ${BATCH_SIZE} \
   --gpu ${GPU_ID} \
   --use_arc_margin \
-  ${EXTRA_FLAGS}
+  ${EXTRA_FLAGS} 2>&1 | tee -a ${LOG_FILE}
 
 # 3. 汇总所有需要回传或归档的文件到统一输出目录
 if [ -d "${HOME}/autodl-tmp" ]; then
