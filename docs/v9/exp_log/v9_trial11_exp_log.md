@@ -3,6 +3,9 @@
 > **规范遵循**：遵循 `/exp-log` Record 工作流标准规范与 [`RUN_EXPERIMENT_TEMPLATE.zh-CN.md`](file:///C:/Users/chy/.gemini/config/skills/experiment-log/assets/RUN_EXPERIMENT_TEMPLATE.zh-CN.md)  
 > **前置方案文档**：[`docs/v9/plans/v9_trial11_upgrade_plan.md`](../plans/v9_trial11_upgrade_plan.md)  
 > **学术评测全量报告**：[`docs/v9/reports/v9_trial11_cloud_eval_report.md`](../reports/v9_trial11_cloud_eval_report.md)  
+> **伴随消融实验记录**：  
+> - **T11-A (w/o PCAM 消融)**：[`docs/v9/exp_log/v9_trial11_A_exp_log.md`](v9_trial11_A_exp_log.md) ｜ 审计报告：[`docs/v9/reports/v9_trial11_A_cross_audit.md`](../reports/v9_trial11_A_cross_audit.md)  
+> - **T11-B (gnorm6 伴随消融)**：[`docs/v9/exp_log/v9_trial11_B_exp_log.md`](v9_trial11_B_exp_log.md) ｜ 审计报告：[`docs/v9/reports/v9_trial11_B_cross_audit.md`](../reports/v9_trial11_B_cross_audit.md)  
 
 - **实验编号 (Experiment ID)**: `EXP-V9-TRIAL11-SEED13`
 - **执行日期**: 2026-10-16（经双 Agent 深度交叉复核定稿）
@@ -47,7 +50,7 @@
 - **遴选准则**：`composite_mode='emo_loss'`, `composite_emo_loss_weight=5.0`, 保护期 `min_save_step=3000`；
 - **评估间隔与耐心**：`check_iter=500, patience=6, max_step=10000`；
 - **真实停止条件**：**模型跑满 10,000 步自然退出；patience 停在 5/6 未触发**（方案设想的自参照熔断机制未在代码中实现，无对应代码与日志）；
-- **离线机制检验方法**：使用 `scratch/eval_dpfc_offline.py` 进行 5,255 样本特征提取与 McNemar 连续性校正卡方检验；
+- **离线机制检验方法**：使用 `src/scripts/eval_prototype_ncm.py`（原 `scratch/eval_dpfc_offline.py` 升格）进行 5,255 样本特征提取与 McNemar 连续性校正卡方检验；
 - **管线自校验说明**：本次云端运行**未执行** T9 确定性锚点（37.5804）的管线一致性校验，故本报告的评测数值**未经管线自校验背书**。
 
 ---
@@ -112,3 +115,12 @@
 7. **逐样本预测全量数组**: [`results/cloud_archive/v9_trial11/dpfc_preds.npz`](file:///e:/github/CASE/results/cloud_archive/v9_trial11/dpfc_preds.npz)（1.27 MB，5,255 样本逐例预测与概率矩阵；列联表与 McNemar 统计量已由该原始数组独立复算完全验证：T11 $a=2004, b=194, c=168, d=2889$, stat=1.726519, $p=0.18885602$）
 
 > *注：本归档目录受 `.gitignore:88` 约束，仅本地物理磁盘持久化，不纳入 Git 跟踪。*
+
+---
+
+## 七、 伴随消融实验索引 (Companion Ablations)
+
+| 实验代号 | 实验编号 | 自变量变更 | 核心结论 | 关联文档 |
+| :--- | :--- | :--- | :--- | :--- |
+| **Trial 11-A** | `EXP-V9-TRIAL11-A-NOPCAM-SEED13` | 移除 PCAM 软记忆反哺 (`use_pcam=0`) | Test PPL 恶化 +1.01，验证集 19/20 点劣化 ($p=4.005 \times 10^{-5}$)，多样性塌陷；确证 PCAM 核心地位（Gate G3 闭环） | [实验记录](v9_trial11_A_exp_log.md) ｜ [审计备忘录](../reports/v9_trial11_A_cross_audit.md) |
+| **Trial 11-B** | `EXP-V9-TRIAL11-B-GNORM6-SEED13` | 梯度裁剪阈值松弛 (`max_grad_norm: 2.0→6.0`) | 10000 步全量监控确证 T11 梯度 100% 被截断（有效 LR 0.323）；clip=6.0 切在中位数 6.0091 上，有效 LR 恢复至 0.94；PCGrad 冲突仅 2.28%（否决方案 C，Gate G2 闭环） | [实验记录](v9_trial11_B_exp_log.md) ｜ [审计备忘录](../reports/v9_trial11_B_cross_audit.md) |
