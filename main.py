@@ -26,9 +26,19 @@ def make_model(vocab, emo_num, strategy_num):
     
     # Intialization
     if not is_eval:
+        prefix_before_init = {n: p.detach().clone() for n, p in model.named_parameters()
+                              if "prefix_embed" in n}
         for n, p in model.named_parameters():
-            if p.dim() > 1 and (n != "embedding.lut.weight" and config.pretrain_emb):
+            # [V9 T12 / 关键修复] prefix_embed 必须排除：它是原型先验初始化（KMeans 簇质心），
+            # 被 xavier_uniform_ 覆盖后两个实验会退化成同一随机前缀，T12-C 对照失效。
+            if p.dim() > 1 and (n != "embedding.lut.weight" and config.pretrain_emb) \
+                    and "prefix_embed" not in n:
                 xavier_uniform_(p)
+        for n, p in model.named_parameters():
+            if n in prefix_before_init:
+                if not torch.equal(p.detach(), prefix_before_init[n]):
+                    raise RuntimeError(f"[FATAL T12/P9] 全局初始化覆盖前缀: {n}")
+                print(f"[V9 T12] post-make_model {n}: max|Δ|=0 (before optimizer.step)")
 
     print("# PARAMETERS", count_parameters(model))
 
@@ -330,7 +340,11 @@ def main():
         weights_best = train(model, train_set, dev_set)
         model.epoch = 1
         model.load_state_dict({name: weights_best[name] for name in weights_best})
-        test(model, test_set)
+        print(f"[Test Status] skip_test={getattr(config, 'skip_test', False)}")
+        if not getattr(config, 'skip_test', False):
+            test(model, test_set)
+        else:
+            print("[*] 显式指定 --skip_test: 跳过训练收尾时的 5255 样本全量生成测试。")
 
 if __name__ == '__main__':
     # prepare_data_seq(batch_size=config.batch_size)

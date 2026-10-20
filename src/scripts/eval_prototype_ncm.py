@@ -84,10 +84,14 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
         config.emotion_head_type = "linear"
         print("    [拓扑识别] 检出标准线性分类头 (linear)")
 
-    # 预留前缀拓扑检测 (支持 T12 原型前缀自适应加载)
-    if any("proto_prefix" in k for k in raw_keys):
-        config.use_proto_prefix = True
-        print("    [拓扑识别] 检出原型前缀注意力参数 (proto_prefix)")
+    # T12 实际参数键为 decoder.dec.0.prefix_embed；必须同步重置关闭状态。
+    prefix_keys = [k for k in raw_keys if k.endswith("prefix_embed")]
+    config.use_proto_prefix = bool(prefix_keys)
+    if prefix_keys:
+        model_state = state["model"] if "model" in state else state
+        config.proto_prefix_len = model_state[prefix_keys[0]].shape[0]
+    print(f"    [拓扑识别] use_proto_prefix={config.use_proto_prefix}"
+          f"{', P=' + str(config.proto_prefix_len) if prefix_keys else ''}")
 
     config.use_erp = any("erp." in k for k in raw_keys)
     config.dataset = "ED"

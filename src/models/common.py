@@ -122,6 +122,9 @@ class DecoderLayer(nn.Module):
         layer_dropout=0.0,
         attention_dropout=0.0,
         relu_dropout=0.0,
+        use_proto_prefix=False,
+        proto_prefix_len=4,
+        proto_init=None,
     ):
         """
         Parameters:
@@ -194,6 +197,18 @@ class DecoderLayer(nn.Module):
         self.layer_norm_mha_affection = LayerNorm(hidden_size)
         self.layer_norm_ffn = LayerNorm(hidden_size)
 
+        # [V9 T12] 原型初始化的可学习注意力前缀
+        self.use_proto_prefix = use_proto_prefix
+        if use_proto_prefix:
+            self.prefix_embed = nn.Parameter(torch.zeros(proto_prefix_len, hidden_size))
+            with torch.no_grad():
+                if proto_init is not None:
+                    assert proto_init.shape == (proto_prefix_len, hidden_size), \
+                        f"proto_init 形状不匹配: 期望 ({proto_prefix_len}, {hidden_size}), 实际 {tuple(proto_init.shape)}"
+                    self.prefix_embed.copy_(proto_init)
+                else:
+                    nn.init.normal_(self.prefix_embed, std=0.02)
+
     def forward(self, inputs):
         """
         NOTE: Inputs is a tuple consisting of decoder inputs and encoder output
@@ -202,11 +217,14 @@ class DecoderLayer(nn.Module):
         x, encoder_outputs, attention_weight, mask, cs_enc_outputs, cs_enc_mask, concept_enc_outputs, concept_enc_mask = inputs
         mask_src, dec_mask = mask
 
+        # [V9 T12] 准备前缀 extra_kv（开关关闭时为 None，零副作用）
+        extra_kv = self.prefix_embed if self.use_proto_prefix else None
+
         # Layer Normalization before decoder self attention
         x_norm = self.layer_norm_mha_dec(x)
 
-        # Masked Multi-head attention
-        y, _ = self.multi_head_attention_dec(x_norm, x_norm, x_norm, dec_mask)
+        # Masked Multi-head attention（前缀注入点：self-attention K/V 拼接）
+        y, _ = self.multi_head_attention_dec(x_norm, x_norm, x_norm, dec_mask, extra_kv=extra_kv)
 
         # Dropout and residual after self-attention
         x = self.dropout(x + y)
@@ -491,12 +509,31 @@ class MultiHeadAttention(nn.Module):
             .view(shape[0], shape[2], shape[3] * self.num_heads)
         )
 
-    def forward(self, queries, keys, values, mask):
+    def forward(self, queries, keys, values, mask, extra_kv=None):
 
         # Do a linear for each component
         queries = self.query_linear(queries)
         keys = self.key_linear(keys)
         values = self.value_linear(values)
+
+        # [V9 T12] 原型注意力前缀 K/V 拼接（extra_kv=None 时跳过，零副作用）
+        if extra_kv is not None:
+            # extra_kv: [P, H] 或 [1, P, H]，广播到 batch 维度
+            if extra_kv.dim() == 2:
+                extra_kv = extra_kv.unsqueeze(0)
+            extra_kv = extra_kv.expand(keys.size(0), -1, -1)  # [B, P, H]
+            # 复用文本 K/V 投影（P7-i 方案）
+            k_prefix = self.key_linear(extra_kv)    # [B, P, total_key_depth]
+            v_prefix = self.value_linear(extra_kv)  # [B, P, total_value_depth]
+            keys   = torch.cat([k_prefix, keys],   dim=1)  # 前缀在前
+            values = torch.cat([v_prefix, values], dim=1)
+            # mask 扩展：前缀列全为 False（全可见），拼在最前维度
+            if mask is not None:
+                p = extra_kv.size(1)
+                prefix_mask = torch.zeros(
+                    mask.size(0), mask.size(1), p,
+                    dtype=mask.dtype, device=mask.device)
+                mask = torch.cat([prefix_mask, mask], dim=-1)
 
         # Split into multiple heads
         queries = self._split_heads(queries)
@@ -510,7 +547,7 @@ class MultiHeadAttention(nn.Module):
         logits = torch.matmul(queries, keys.permute(0, 1, 3, 2))
 
         if mask is not None:
-            mask = mask.unsqueeze(1)  # [B, 1, 1, T_values]
+            mask = mask.unsqueeze(1)  # [B, 1, Lq, Lk]
             mask_val = -1e4 if logits.dtype == torch.float16 else -1e18
             logits = logits.masked_fill(mask, mask_val)
 

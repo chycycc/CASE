@@ -738,6 +738,9 @@ class Decoder(nn.Module):
         attention_dropout=0.0,
         relu_dropout=0.0,
         universal=False,
+        use_proto_prefix=False,
+        proto_prefix_len=4,
+        proto_init=None,
     ):
         """
         Parameters:
@@ -754,6 +757,9 @@ class Decoder(nn.Module):
             layer_dropout: Dropout for each layer
             attention_dropout: Dropout probability after attention (Should be non-zero only during training)
             relu_dropout: Dropout probability after relu in FFN (Should be non-zero only during training)
+            use_proto_prefix: [T12] 是否启用原型注意力前缀
+            proto_prefix_len: [T12] 前缀长度 P
+            proto_init: [T12] 前缀初始化张量 (P, hidden_size)，None 时用高斯初始化
         """
 
         super(Decoder, self).__init__()
@@ -779,11 +785,18 @@ class Decoder(nn.Module):
             relu_dropout,
         )
 
+        # [V9 T12] 前缀参数透传给 DecoderLayer（P4：参数内聚在 DecoderLayer，不改 forward 调用点）
+        assert not (universal and use_proto_prefix), \
+            "[V9 T12] universal 模式不支持前缀注入（同一层被重入 num_layers 次，前缀会被重复注入）"
+        prefix_kwargs = dict(use_proto_prefix=use_proto_prefix,
+                             proto_prefix_len=proto_prefix_len,
+                             proto_init=proto_init)
+
         if self.universal:
-            self.dec = DecoderLayer(*params)
+            self.dec = DecoderLayer(*params, **prefix_kwargs)
         else:
             self.dec = nn.Sequential(
-                *[DecoderLayer(*params) for l in range(num_layers)]
+                *[DecoderLayer(*params, **prefix_kwargs) for l in range(num_layers)]
             )
 
         self.embedding_proj = nn.Linear(embedding_size, hidden_size, bias=False)
@@ -1274,6 +1287,10 @@ class CASE(nn.Module):
         self.ctx_merge_lin = MLP()
         
         # Decoder
+        # [V9 T12] 原型注意力前缀初始化（开关关闭时 proto_init=None，零副作用）
+        self.use_proto_prefix = getattr(config, 'use_proto_prefix', False)
+        self.proto_prefix_len = getattr(config, 'proto_prefix_len', 4)
+        proto_init_tensor = self._build_proto_prefix_init() if self.use_proto_prefix else None
         self.decoder = Decoder(
             config.emb_dim,
             hidden_size=config.hidden_dim,
@@ -1282,7 +1299,11 @@ class CASE(nn.Module):
             total_key_depth=config.depth,
             total_value_depth=config.depth,
             filter_size=config.filter,
+            use_proto_prefix=self.use_proto_prefix,
+            proto_prefix_len=self.proto_prefix_len,
+            proto_init=proto_init_tensor,
         )
+        # [V9 T12] 生效打印延后到 __init__ 末尾：PCAM/generator/emo_bias 注册后总量统计才准确
         
         # [V6/V9 Architecture] 原型交叉记忆注意力 (PCAM) 模块初始化
         self.use_pcam = getattr(config, 'use_pcam', False)
@@ -1393,6 +1414,11 @@ class CASE(nn.Module):
         self.is_frozen = False
         self.actual_freeze_step = config.epcl_freeze_step
 
+        # [V9 T12] 铁律 IV 生效打印：此处已注册全部模块（PCAM/generator/emo_bias），总参数统计才准确
+        print(f"[Prefix Status] use_proto_prefix={self.use_proto_prefix}")
+        if self.use_proto_prefix:
+            self._print_proto_prefix_status()
+
     def freeze_emo_head(self, step, best_state=None, best_step=None):
         """[V5 Trial 4b / V8 Trial 4: ACF-BCF] 冻结/软退火情感分类头，支持回滚至验证集历史最佳泛化权重并将退火起点锚定至 step"""
         if not self.is_frozen and self.dataset == "ED":
@@ -1409,6 +1435,139 @@ class CASE(nn.Module):
                 print(f"[Adaptive Soft Freeze] Step {step}: 启用分类头时序软退火 (Soft Freeze, decay={getattr(config, 'freeze_decay_weight', 0.05)})，分类头参数保持温和微调更新！")
             self.is_frozen = True
             self.actual_freeze_step = step
+
+    # ======================================================================
+    # [V9 T12] 原型注意力前缀初始化辅助方法（§6.7 / P5 / P8-A）
+    # ======================================================================
+
+    def _build_proto_prefix_init(self):
+        """返回 (P, hidden) 的初始化张量；不启用时返回 None。
+        评测侧（config.test=True）直接返回 None：前缀参数由 checkpoint 覆盖，
+        禁止再次初始化/落盘（否则会写文件、读 T10 ckpt，且被权重覆盖后初值无意义）。"""
+        if not getattr(config, 'use_proto_prefix', False):
+            return None
+        if getattr(config, 'test', False):
+            # 评测侧早退：前缀由 checkpoint 覆盖，不初始化、不落盘
+            return None
+        P = int(getattr(config, 'proto_prefix_len', 4))
+        mode = getattr(config, 'proto_prefix_init', 'proto')
+        hidden = config.hidden_dim
+
+        if mode == "proto":
+            src = getattr(config, 'proto_prefix_source', 'ckpt')
+            if src == "ckpt":
+                proto = self._load_proto_from_ckpt()                 # A1: (32, 300)
+            else:
+                print("[V9 T12][WARN] P8-B 已否决：live 冷启动原型在 t=0 为随机单位向量")
+                raise RuntimeError("P8 已裁定 (A)：禁止 live 冷启动；仅调试时可显式改 config")
+            init = self._deterministic_project(proto, P)             # A2: (P, 300)
+        else:  # random: T12-C
+            npz = getattr(config, 'proto_prefix_init_npz', '')
+            assert npz and os.path.exists(npz), \
+                f"T12-C 必须提供 --proto_prefix_init_npz（当前值: '{npz}'）"
+            e = torch.from_numpy(np.load(npz)["init"]).float()       # (P, 300)
+            assert e.shape == (P, hidden), \
+                f"npz init 形状不匹配: 期望 ({P}, {hidden}), 实际 {tuple(e.shape)}"
+            # 局部随机源，不动全局 RNG（P8-A2 技术纠正）
+            g = torch.Generator().manual_seed(13)
+            r = torch.randn(e.shape, generator=g) * e.std() + e.mean()
+            # 逐向量缩放对齐 L2 范数
+            r = r / r.norm(dim=1, keepdim=True).clamp_min(1e-8) * e.norm(dim=1, keepdim=True)
+            assert (r.norm(dim=1) - e.norm(dim=1)).abs().max() < 1e-5, \
+                "T12-C 逐向量 L2 未对齐"
+            init = r
+
+        # 落盘（P5 / A3）：仅 proto 模式落盘（T12-C 读的就是 T12 的 npz）
+        if mode == "proto":
+            out_dir = getattr(config, 'save_path', None) or getattr(config, 'model_file_path', None) or f"save/{config.exp_name}"
+            os.makedirs(out_dir, exist_ok=True)
+            npz_path = os.path.join(out_dir, "proto_prefix_init.npz")
+            np.savez(npz_path, init=init.numpy().astype("float32"))
+            print(f"[V9 T12] 初始化落盘: {npz_path} (shape={tuple(init.shape)})")
+
+        # 统计打印（P5 要求）
+        print(f"[V9 T12] E_proto: std={init.std():.4f}, "
+              f"L2={[f'{v:.4f}' for v in init.norm(dim=1).tolist()]}, "
+              f"per-dim std={[f'{v:.4f}' for v in init.std(dim=1).tolist()]}")
+        return init
+
+    def _load_proto_from_ckpt(self):
+        """A1：读先验 checkpoint 的训练后原型，形状 (32, 300)，带脏权重门限。
+
+        默认先验 = T11-B（clip=6.0，与 T12 训练配置完全对齐）；T10（clip=∞）为备选/敏感性对照。
+        无 T11-B 权重时必须显式 --proto_prefix_prior_path 指向可用 prior，不得静默回退 live。
+        """
+        prior = getattr(config, 'proto_prefix_prior_path', '')
+        assert prior, "未提供 --proto_prefix_prior_path"
+        assert os.path.exists(prior), (
+            f"Prior checkpoint not found: {prior}\n"
+            f"  若尚无 T11-B 权重，可用 --proto_prefix_prior_path "
+            f"results/cloud_archive/v9_trial10/CASE_7499_37.3144_composite_best"
+            f"（T10 为 clip=∞ 口径，须在报告中登记）")
+        import inspect
+        load_kwargs = {"map_location": "cpu"}
+        if "weights_only" in inspect.signature(torch.load).parameters:
+            load_kwargs["weights_only"] = False
+        state = torch.load(prior, **load_kwargs)
+        sd = state["model"] if "model" in state else state
+        key = next((k for k in sd if k.endswith("epcl_criterion.prototypes")), None)
+        assert key is not None, \
+            f"未在 {prior} 中找到 epcl_criterion.prototypes（fail-fast，不回退 live）"
+        proto = sd[key].detach().float().clone()   # clone：避免 checkpoint 整包驻留显存/内存
+        assert proto.shape == (32, 300), f"prototypes shape 异常: {tuple(proto.shape)}"
+        # Gram 门限：T10 实测非对角均值 -0.0302；T11-B 尚未实测，故只拦"明显异常"（非半正交）
+        gram = proto @ proto.t()
+        off = gram[~torch.eye(32, dtype=torch.bool)]
+        mean_off, median_off = off.mean().item(), off.median().item()
+        print(f"[V9 T12] prior={prior}")
+        print(f"[V9 T12] 先验原型 Gram 非对角: mean={mean_off:.4f}, median={median_off:.4f}")
+        assert abs(mean_off) < 0.10, \
+            f"Gram 非对角均值 {mean_off:.4f} 明显异常（原型非半正交），疑似脏权重"
+        del state, sd
+        return proto
+
+    def _deterministic_project(self, proto, P):
+        """A2：把 (32, 300) 确定性聚成 (P, 300) 个情绪簇中心。
+
+        方法：KMeans(K=P, random_state=13, n_init=20) 对 32 个训练后原型聚类，
+              取簇质心并 L2 归一化作为前缀初值。
+        - 语义：每个前缀 = 一个情绪簇的中心方向（簇成员由数据决定，不依赖人工簇定义）；
+        - 确定性：固定 random_state 与 n_init，同环境同输入结果一致；
+        - 不污染 RNG：sklearn 用局部 RandomState，不触碰 torch 全局随机源；
+        - 不用 SVD 主轴：SVD 丢掉类别对应关系，只剩无标签方差方向，不能称「情绪先验」。
+        """
+        import sklearn
+        from sklearn.cluster import KMeans
+
+        x = proto.detach().cpu().numpy()
+        print(f"[V9 T12] KMeans 聚类环境: sklearn={sklearn.__version__}, P={P}, random_state=13, n_init=20")
+        km = KMeans(n_clusters=P, random_state=13, n_init=20).fit(x)
+        centers = torch.from_numpy(km.cluster_centers_).float()
+        centers = F.normalize(centers, p=2, dim=1)   # 与原型同处单位球面
+        labels = km.labels_
+        for c in range(P):
+            members = [ED_MAP_EMO[i] for i in range(len(proto)) if labels[i] == c]
+            print(f"[V9 T12] proto-cluster {c}: n={len(members)} members={members}")
+        return centers
+
+    def _print_proto_prefix_status(self):
+        """铁律 IV 生效打印：原型注意力前缀启用状态，参照 [LR Override] 风格。"""
+        P = self.proto_prefix_len
+        mode = getattr(config, 'proto_prefix_init', 'proto')
+        source = getattr(config, 'proto_prefix_source', 'ckpt')
+        # 统计前缀参数量
+        prefix_params = 0
+        for name, param in self.named_parameters():
+            if 'prefix_embed' in name:
+                prefix_params += param.numel()
+        total_params = sum(p.numel() for p in self.parameters())
+        if getattr(config, "test", False):
+            print(f"[V9 T12] 已注册原型前缀: P={P}, init=checkpoint_pending（评测不重建初值）")
+        else:
+            print(f"[V9 T12] 成功启用原型前缀注入: P={P}, init={mode}"
+                  f"{'(KMeans cluster centers)' if mode == 'proto' else '(random, same-scale)'}, source={source}")
+        print(f"[V9 T12] 注入点=DecoderLayer#0 self-attn K/V (复用 key/value_linear, 前缀在前)")
+        print(f"[V9 T12] 新增参数={prefix_params} (prefix_embed) | 总参数={total_params:,}")
 
     def make_encoder(self, emb_dim):
         return Encoder(

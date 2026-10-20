@@ -806,3 +806,13 @@ $\arg\max_c(\mathrm{sim} / \tau) \equiv \arg\max_c(\mathrm{sim})$ 对任意 $\ta
 2. **计算图因果机理**: 分类头前向不经过 PCAM，因而分类准确率不受物理影响（-0.12pp 纯属噪声）；反向语言损失通过 PCAM 注入原型软记忆，失去 PCAM 导致自回归生成失去全局语义支撑，语言建模泛化能力显著受损；
 3. **架构决策（Gate G3 闭环）**: PCAM 确定性归位为 CASE-EPCL 生成底座，Trial 12 及后续演进严禁移除 PCAM，新方案必须在其基础之上叠加。
 
+
+---
+
+## 11. V9 Trial 12：P9 后本地路径复验（2026-10-20，非正式成绩）
+
+- 方案 B2：PCAM 保留，4×300 可学习前缀，T10 先验 KMeans 初始化仅用于本地代码路径验证。详见 [复验报告](reports/v9_trial12_local_validation.md) 与 [方案 v1.6 §6.12](plans/v9_trial12_upgrade_plan.md#612-2026-10-20-接手复验与生产闸门)。
+- on/rand 各 10 微步，训练 batch=4/accum=8，仅 1 次更新；Valid N=5734、实际 batch=4、2 次评估；Test 未测；生成 N=1。MD5 不同、ctx_loss 10/10 点分离、实际 make_model 初始化后 max|Δ|=0，P9 三项新判据通过。产物：results/v9/trial12_handoff_audit/dry_run.json。
+- 9 项 PyTorch 回归与 2 项轻量口径回归分别通过；补充 rand GPU 烟测及合并重跑受 WinError 1455 阻断，未记录为通过。跳过分支的旧 Test/流形占位值不得作为实测。
+- Gate 1：T11-B 权重未到；Gate 2：P9 三项新判据通过；Gate 3：同 prior 的云端 sklearn/实际簇成员预检待完成。正式启动命令须显式包含 --max_grad_norm 6.0 --arc_margin_ramp_steps 2500，不含 --skip_test。
+- 正式口径与判据未变：Test N=5255、batch=1、macro；Valid N=5734、batch=32、macro、shuffle=False；生成 N=500。无正式 T12/T12-C 成绩，无正式 npz，无 McNemar 结论。

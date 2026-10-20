@@ -212,13 +212,13 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
     config.pcam_dropout = 0.1
     config.pcam_gate_bias = -1.0
     config.pcam_tau_attn = 1.5
-    
+
     # 预检检查点拓扑结构，自适应匹配分类头、PCAM 与 ERP，杜绝拓扑错配导致权重漏载
     if os.path.exists(checkpoint_path):
         print(f"[*] 预检检查点权重以自适应对齐模型拓扑: {checkpoint_path}")
         state_preview = torch.load(checkpoint_path, map_location="cpu")
         raw_keys = state_preview["model"].keys() if "model" in state_preview else state_preview.keys()
-        
+
         # 1. 情绪分类头自适应
         if any("emotion_linear.linear_2." in k or "emotion_linear.block." in k for k in raw_keys):
             config.emotion_head_type = "residual_mlp"
@@ -226,7 +226,7 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
         else:
             config.emotion_head_type = "linear"
             print("    [自适应拓扑] 未检测到残差 MLP，配置标准分类头 config.emotion_head_type = 'linear'")
-            
+
         # 2. 原型交叉注意力 (PCAM) 自适应
         if any("pcam." in k for k in raw_keys):
             config.use_pcam = True
@@ -234,7 +234,7 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
         else:
             config.use_pcam = False
             print("    [自适应拓扑] 未检测到 PCAM 权重，配置 config.use_pcam = False")
-            
+
         # 3. 情感响应先验 (ERP) 自适应
         if any("erp." in k for k in raw_keys):
             config.use_erp = True
@@ -242,6 +242,19 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
         else:
             config.use_erp = False
             print("    [自适应拓扑] 未检测到 ERP 权重，配置 config.use_erp = False")
+
+        # 4. 原型注意力前缀自适应（T12 / P1 铁律 IV 防线）
+        prefix_keys = [k for k in raw_keys if k.endswith("prefix_embed")]
+        if prefix_keys:
+            config.use_proto_prefix = True
+            src = state_preview["model"] if "model" in state_preview else state_preview
+            config.proto_prefix_len = src[prefix_keys[0]].shape[0]
+            print(f"    [自适应拓扑] 检测到原型前缀权重 (P={config.proto_prefix_len})，"
+                  f"配置 config.use_proto_prefix = True")
+        else:
+            config.use_proto_prefix = False
+            print("    [自适应拓扑] 未检测到原型前缀权重，配置 config.use_proto_prefix = False")
+
         del state_preview
     else:
         config.emotion_head_type = getattr(config, "emotion_head_type", "linear")
@@ -250,18 +263,18 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
 
     config.erp_hidden_dim = 768
     config.erp_dropout = 0.1
-    
+
     config.use_mcp = use_mcp
     config.mcp_momentum = 0.99
-    
+
     config.use_arc_margin = use_arc_margin
     config.arc_margin = arc_margin
     config.epcl_anchor = epcl_anchor
     config.cls_anchor = cls_anchor
-    
+
     config.use_unlikelihood = use_unlikelihood
     config.unlikelihood_weight = 0.1
-    
+
     # [V8.1 / V8.2 / V8.2 C / V8.2 E] 词表层情感偏置注入、自适应稀疏掩码与时序退火
     config.use_emo_bias = use_emo_bias
     config.use_sparse_emo_bias = use_sparse_emo_bias
@@ -271,7 +284,7 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
     config.bias_anneal_start = 24000
     config.bias_anneal_steps = 10000
     config.bias_min_scale = bias_min_scale
-    
+
     config.test = True
     config.model = "case"
     config.beam_size = 5
@@ -300,27 +313,25 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
     missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
 
     # [E2 修复 / 铁律 IV 规约] 关键拓扑前缀缺失熔断检查 (fail-fast，杜绝掩耳盗铃式假通过)
-    critical_prefixes = ["decoder.", "encoder.", "emotion_linear."]
-    if getattr(config, "use_pcam", False):
-        critical_prefixes.append("pcam.")
-    if hasattr(model, "epcl_criterion"):
-        critical_prefixes.append("epcl_criterion.")
+    critical_prefixes = ["decoder.", "encoder.", "emotion_linear.", "pcam.", "epcl_criterion."]
 
     missing_critical = [p for p in critical_prefixes if any(k.startswith(p) for k in missing_keys)]
-    if missing_critical:
-        raise RuntimeError(f"[FATAL AUDIT / 铁律 IV] 关键拓扑前缀权重缺失: {missing_critical}，拒绝使用残缺模型执行评测！")
+    unexpected_critical = [k for k in unexpected_keys if any(k.startswith(p) for p in critical_prefixes)]
+    if missing_critical or unexpected_critical:
+        raise RuntimeError(f"[FATAL AUDIT / 铁律 IV] 关键拓扑权重不匹配: "
+                           f"missing={missing_critical}, unexpected={unexpected_critical}，拒绝执行评测！")
     print(f"[+] [Weight Audit] 关键拓扑前缀完整性核验通过: {critical_prefixes}")
 
     model.eval()
     model.is_eval = True
-    
+
     # [V8.2 C] 从检查点文件名识别训练保存 Step 赋给 model.current_step，对齐偏置衰减
     fname = os.path.basename(checkpoint_path)
     parts = fname.split("_")
     if len(parts) >= 2 and parts[1].isdigit():
         model.current_step = int(parts[1])
         print(f"[*] [V8.2 C] 成功恢复模型保存 Step={model.current_step}，对应偏置退火因子 w_bias={model.get_bias_scale():.4f}")
-    
+
     if getattr(config, 'use_sparse_emo_bias', False):
         print(f"[*] [V8.2] 正在依据模型权重刷新原型-词向量自适应稀疏偏置掩码...")
         model.update_adaptive_vocab_mask()
@@ -345,12 +356,14 @@ def evaluate_test_set(model, test_set):
     emo_acc_list = []
     epcl_loss_list = []
 
+    evaluated_n = 0
     pbar = tqdm(test_set, desc="Evaluating Test Set", total=len(test_set))
     with torch.no_grad():
         for batch in pbar:
             bow, kl, mim, ctx, ppl, str_loss, str_acc, emo, emo_acc, epcl, dec_emo = model.train_one_batch(
                 batch, 0, train=False
             )
+            evaluated_n += int(batch["program_label"].size(0))
             bow_loss_list.append(bow)
             kl_loss_list.append(kl)
             mim_loss_list.append(mim)
@@ -376,9 +389,20 @@ def evaluate_test_set(model, test_set):
         "Test_BOW_loss": round(mean_bow_loss, 4),
         "Test_MIM_loss": round(mean_mim_loss, 4),
         "Test_KL_loss": round(mean_kl_loss, 4),
+        # [口径显式化 / 铁律 III] 记录本次度量的作用域，随 eval_metrics.json 一并落盘。
+        # 说明：Test_PPL = exp(mean(ctx_loss))，聚合方式为"批内 token 平均 → 批次间算术平均"，
+        #       因此 batch_size 会改变 macro 口径，必须随数值一同记录，否则跨代/跨环境不可比。
+        # batch_size 取 DataLoader 真实属性；若不可得则记 None（严禁猜填）。
+        "_scope": {
+            "n_samples": evaluated_n,
+            "batch_size": getattr(test_set, "batch_size", None),
+            "aggregation": "macro: exp(mean per-batch token CE)",
+            "dataset": "ED test split (full)",
+        },
     }
 
     print(f"[+] 全量测试集评测结果:")
+    print(f"    - 口径 (Scope)     : n={results['_scope']['n_samples']}, batch_size={results['_scope']['batch_size']}, {results['_scope']['aggregation']}")
     print(f"    - Test PPL        : {results['Test_PPL']}")
     print(f"    - Test EMO_acc    : {results['Test_EMO_acc']}%")
     print(f"    - Test EMO_loss   : {results['Test_EMO_loss']}")
@@ -437,7 +461,7 @@ def evaluate_manifold_and_plot(model, test_set, output_png_path="docs/v8/images/
             centroid_c = X_norm[mask_c].mean(axis=0)
             centroid_c_norm = centroid_c / (np.linalg.norm(centroid_c) + 1e-12)
             p_c = P_norm[c]
-            
+
             # 余弦相似度与欧氏距离
             cos_sim = float(np.dot(centroid_c_norm, p_c))
             dist = float(np.linalg.norm(centroid_c_norm - p_c))
@@ -524,8 +548,19 @@ def evaluate_manifold_and_plot(model, test_set, output_png_path="docs/v8/images/
         "CHI": round(chi, 1),
         "Centroid_Alignment": round(mean_cos_align, 4),
         "Centroid_Offset": round(mean_offset, 4),
-        "Plot_Path": output_png_path
+        "Plot_Path": output_png_path,
+        # [口径显式化 / 铁律 III] 流形几何为全量测试集上提取的真实表征度量，
+        # 记入作用域以便与 Test_PPL / 生成多样性（前 N 条）明确区分；batch_size 决定前向分块，
+        # 不影响几何度量本身，但一并记录便于复现。
+        "_scope": {
+            "n_samples": num_samples,
+            "batch_size": getattr(test_set, "batch_size", None),
+            "source": "full test set (feature extraction)",
+            "metric_space": "L2-normalized unit hypersphere (samples & prototypes co-scaled)",
+            "tsne": {"perplexity": 30, "random_state": 42, "init": "pca"},
+        },
     }
+    print(f"[+] 流形口径 (Scope)      : n={manifold_results['_scope']['n_samples']}, batch_size={manifold_results['_scope']['batch_size']}, source={manifold_results['_scope']['source']}")
     return manifold_results
 
 
@@ -545,18 +580,23 @@ def calc_distinct_n(n, candidates):
 
 
 
-def evaluate_generation_diversity(model, vocab, test_set, num_samples=500):
+def evaluate_generation_diversity(model, vocab, test_set, num_samples):
     """
     运行 Greedy, Beam Search, 核采样并度量生成多样性指标
+    num_samples: 解码样本数（必填）。调用方负责把 0/负数 转换为 len(test_set) 后再传入，
+                 避免"默认值"与"命令行默认值"两处口径互相遮掩（铁律 III）。
     """
     print(f"\n=======================================================")
-    print(f"  [Step 5/5] 多解码模式生成多样性评测 (样本数: {num_samples})")
+    print(f"  [Step 5/5] 多解码模式生成多样性评测 (样本数: {num_samples}, 来源: 测试集前 N 个, 非随机抽样)")
     print(f"=======================================================")
 
     translator = Translator(model, vocab)
-    
-    # 重新构造 batch_size=1 用于解码
-    _, _, test_set_single, _, _, _ = prepare_data_seq(batch_size=1)
+
+    # loader 已保证 Test batch=1；复用现有数据，避免再次加载整套 Train/Valid/Test。
+    if getattr(test_set, "batch_size", None) == 1:
+        test_set_single = test_set
+    else:
+        _, _, test_set_single, _, _, _ = prepare_data_seq(batch_size=1)
 
     greedy_cands = []
     beam_cands = []
@@ -615,7 +655,16 @@ def evaluate_generation_diversity(model, vocab, test_set, num_samples=500):
         "Greedy": greedy_res,
         "Beam": beam_res,
         "Sampling": sampling_res,
-        "Sampling_0.8": sampling_08_res
+        "Sampling_0.8": sampling_08_res,
+        # [口径显式化 / 铁律 III] 生成多样性指标默认仅在前 500 条样本上解码（非全量、非随机），
+        # 该作用域必须随数值落盘，否则读者会误以为与 Test_PPL 同为全量口径。
+        # 注意：解码固定使用 batch_size=1（见本函数内 prepare_data_seq(batch_size=1)），与传入的 args.batch_size 无关。
+        "_scope": {
+            "n_samples": count,
+            "sampling": "first-N of test set (sequential, not random)",
+            "decode_batch_size": 1,
+            "note": "Dist-2/Unique 均为该子集内统计",
+        },
     }
 
 
@@ -626,7 +675,8 @@ def main():
     parser.add_argument("--batch_size", type=int, default=32, help="测试集前向评测批次大小 (默认 32)")
     parser.add_argument("--gpu", type=str, default="0", help="GPU 设备编号")
     parser.add_argument("--dry_run_clean", action="store_true", help="是否仅模拟磁盘清理")
-    parser.add_argument("--skip_test_eval", action="store_true", help="是否跳过测试集 PPL 评估以复用已知结果")
+    parser.add_argument("--skip_test_eval", action="store_true", help="是否跳过测试集 PPL 评估（未测指标留空，不复用历史数值）")
+    parser.add_argument("--skip_manifold", action="store_true", help="是否跳过测试集流形表征提取与 t-SNE 绘图（用于快速 dry run 验证）")
     parser.add_argument("--skip_generation", action="store_true", help="是否跳过解码评测以加快速度")
     parser.add_argument("--gen_samples", type=int, default=500, help="解码生成评测样本数")
     parser.add_argument("--epcl_anchor", type=str, default="fine_emotion", choices=["fine_emotion", "emotion_enc"], help="EPCL 挂载锚点")
@@ -644,6 +694,9 @@ def main():
     args, unknown = parser.parse_known_args()
     if unknown:
         print(f"[*] [Eval Pipeline] 忽略未定义参数: {unknown}")
+
+    print(f"[Evaluation Status] skip_test_eval={args.skip_test_eval} | "
+          f"skip_manifold={args.skip_manifold} | skip_generation={args.skip_generation}")
 
     # 0. 设备与 GPU 设置
     if args.gpu is not None:
@@ -732,24 +785,24 @@ def main():
     if not args.skip_test_eval:
         test_metrics = evaluate_test_set(model, test_set)
     else:
-        print("\n[*] 跳过测试集 PPL 评估 (复用训练收尾时测得的官方测试集结果)...")
-        test_metrics = {
-            "Test_PPL": 32.83,
-            "Test_EMO_loss": 2.4158,
-            "Test_EMO_acc": 39.39,
-            "Test_BOW_loss": 5.1206,
-            "Test_MIM_loss": 0.0000,  # [A5 修复] bsz=1 负样本退化伪常数 1.1378 已消除
-            "Test_KL_loss": 0.0720,
-        }
+        print("\n[*] 显式指定 --skip_test_eval: Test 未测，指标留空。")
+        test_metrics = {}
 
     # 4. 流形与原型物理质心度量 + 绘制 t-SNE
-    manifold_metrics = evaluate_manifold_and_plot(
-        model, test_set, output_png_path=args.plot_path, exp_name=getattr(args, 'exp_name', None)
-    )
+    if not args.skip_manifold:
+        manifold_metrics = evaluate_manifold_and_plot(
+            model, test_set, output_png_path=args.plot_path, exp_name=getattr(args, 'exp_name', None)
+        )
+    else:
+        print("[*] 显式指定 --skip_manifold: 跳过 5255 样本的流形表征提取与 t-SNE 绘图。")
+        manifold_metrics = {}
 
     # 5. 生成多样性评测
     if not args.skip_generation:
-        gen_metrics = evaluate_generation_diversity(model, vocab, test_set, num_samples=args.gen_samples)
+        # [口径修正 / 铁律 III] 把 --gen_samples<=0 归一为全量，在调用点完成转换，
+        # 使函数签名的语义唯一（避免"形参默认值"与"命令行默认值"互相遮掩）。
+        gen_n = args.gen_samples if args.gen_samples > 0 else len(test_set)
+        gen_metrics = evaluate_generation_diversity(model, vocab, test_set, num_samples=gen_n)
     else:
         gen_metrics = None
 
@@ -757,8 +810,12 @@ def main():
     print(f"  CASE-EPCL 学术评测流水线全流程执行完毕！")
     print(f"=======================================================")
     print(f"评估权重: {best_ckpt}")
-    print(f"Test PPL: {test_metrics['Test_PPL']} | EMO_acc: {test_metrics['Test_EMO_acc']}% | EMO_loss: {test_metrics['Test_EMO_loss']}")
-    print(f"Silhouette: {manifold_metrics['Silhouette_Cosine']} | DBI: {manifold_metrics['DBI']} | 原型对齐: {manifold_metrics['Centroid_Alignment']}")
+    print(f"Test PPL: {test_metrics.get('Test_PPL', 'N/A')} | "
+          f"EMO_acc: {test_metrics.get('Test_EMO_acc', 'N/A')}% | "
+          f"EMO_loss: {test_metrics.get('Test_EMO_loss', 'N/A')}")
+    print(f"Silhouette: {manifold_metrics.get('Silhouette_Cosine', 'N/A')} | "
+          f"DBI: {manifold_metrics.get('DBI', 'N/A')} | "
+          f"原型对齐: {manifold_metrics.get('Centroid_Alignment', 'N/A')}")
     if gen_metrics:
         print(f"Sampling Dist-2: {gen_metrics['Sampling']['Dist-2']}% | Unique: {gen_metrics['Sampling']['Unique']}%")
 
@@ -777,7 +834,6 @@ def main():
         f"Test EMO_acc    : {test_metrics.get('Test_EMO_acc', 'N/A')}%",
         f"Test EMO_loss   : {test_metrics.get('Test_EMO_loss', 'N/A')}",
         f"Test BOW_loss   : {test_metrics.get('Test_BOW_loss', 'N/A')}",
-        f"Test MIM_loss   : {test_metrics.get('Test_MIM_loss', 'N/A')}",
         "-" * 70,
         f"流形余弦轮廓 (Sil): {manifold_metrics.get('Silhouette_Cosine', 'N/A')}",
         f"Davies-Bouldin (DBI): {manifold_metrics.get('DBI', 'N/A')}",
@@ -824,6 +880,22 @@ def main():
         combined_metrics = {
             "checkpoint": best_ckpt,
             "eval_time": time.strftime('%Y-%m-%d %H:%M:%S'),
+            "evaluation_protocol": {
+                "test": {"status": "skipped" if args.skip_test_eval else "computed",
+                         "dataset_n": len(test_set.dataset),
+                         "evaluated_n": 0 if args.skip_test_eval else test_metrics.get("_scope", {}).get("n_samples", None),
+                         "batch_size": test_set.batch_size,
+                         "ppl_aggregation": "macro: exp(mean per-batch token CE)"},
+                "manifold": {"status": "skipped" if args.skip_manifold else "computed",
+                             # [口径补全 / 铁律 III] 原仅有 status，现补记规模与分块，保持三阶段口径对称。
+                             "evaluated_n": 0 if args.skip_manifold else manifold_metrics.get("_scope", {}).get("n_samples", None),
+                             "batch_size": manifold_metrics.get("_scope", {}).get("batch_size", None)},
+                "generation": {"status": "skipped" if args.skip_generation else "computed",
+                               # [口径修正 / 铁律 III] 原为 min(args.gen_samples, len(test_set.dataset))，
+                               # 在 --gen_samples<=0（全量语义）时会错记为 0；改为从函数内实际计数取值。
+                               "evaluated_n": 0 if (args.skip_generation or not gen_metrics) else gen_metrics.get("_scope", {}).get("n_samples", None),
+                               "batch_size": 1},
+            },
             "test_metrics": test_metrics,
             "manifold_metrics": manifold_metrics,
             "generation_metrics": gen_metrics

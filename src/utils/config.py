@@ -252,6 +252,26 @@ def get_args():
     parser.add_argument("--composite_emo_loss_weight", type=float, default=8.0,
                         help="[V8.2 D] 帕累托 emo_loss 复合评分中情感损失的权衡系数 alpha "
                              "(composite_score = PPL + alpha * EMO_loss, 默认 8.0 保持历史行为)")
+    # V9 Trial 12: 原型初始化的可学习注意力前缀 (Prototype-Initialized Learnable Attention Prefix)
+    parser.add_argument("--use_proto_prefix", action="store_true", default=False,
+                        help="[T12] 启用原型注意力前缀注入（默认关闭）")
+    parser.add_argument("--proto_prefix_len", type=int, default=4,
+                        help="[T12] 前缀长度 P（默认 4）")
+    parser.add_argument("--proto_prefix_init", type=str, default="proto",
+                        choices=["proto", "random"],
+                        help="[T12] 前缀初始化方式: proto(先验原型KMeans簇质心) / random(同尺度高斯,T12-C用)")
+    parser.add_argument("--proto_prefix_init_npz", type=str, default="",
+                        help="[T12-C] T12-C 随机初始化时必须提供的 T12 初始化 npz 路径")
+    parser.add_argument("--proto_prefix_source", type=str, default="ckpt",
+                        choices=["live", "ckpt"],
+                        help="[T12/P8-A] 原型来源: ckpt(从显式先验checkpoint读训练后原型) / live(当前模型冷启动原型,已否决)")
+    parser.add_argument("--proto_prefix_prior_path", type=str,
+                        default="results/cloud_archive/v9_trial11_B_gnorm6/CASE_7499_37.5058_composite_best",
+                        help="[T12/P8-A] 初始化原型来源 checkpoint（只读 prototypes，不加载其他参数）。"
+                             "默认 T11-B（clip=6.0，与 T12 口径对齐）；无 T11-B 权重时可指向 "
+                             "results/cloud_archive/v9_trial10/CASE_7499_37.3144_composite_best（clip=∞，须登记）")
+    parser.add_argument("--skip_test", action="store_true", default=False,
+                        help="是否跳过训练收尾时的 5255 样本全量生成测试（用于快速 dry run 验证）")
     # V9 大批次训练生命周期与早停步数重标定
     parser.add_argument("--check_iter", type=int, default=500,
                         help="[V9] 验证集评估步数间隔 (默认 500 步，适配 Batch 64 密集评估)")
