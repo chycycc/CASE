@@ -601,15 +601,39 @@ EXTRA_FLAGS="--use_proto_prefix --proto_prefix_len 4 --proto_prefix_init proto -
 **正式命令修正（Git Bash / 云端 bash，三闸门满足后才执行）**：main.sh 未显式传 clip/ramp，config.py 默认 2.0 / 0，因此两组都必须补齐以下参数；main.sh 保持原状。
 
 ```bash
+cd ~/CASE
 PRIOR="results/cloud_archive/v9_trial11_B_gnorm6/CASE_7499_37.5058_composite_best"
+test -f "$PRIOR" || { echo "GATE1 FAIL: prior 不存在"; exit 1; }
+
+# ---- 阶段 A：T12（先验原型前缀）----
 EXTRA_FLAGS="--max_grad_norm 6.0 --arc_margin_ramp_steps 2500 --use_proto_prefix --proto_prefix_len 4 --proto_prefix_init proto --proto_prefix_source ckpt --proto_prefix_prior_path $PRIOR" \
   bash main.sh 24G v9_trial12
 
+# ---- 阶段 B：T12-C（等尺度随机前缀对照；须待阶段 A 的 npz 落盘后再启动）----
 EXTRA_FLAGS="--max_grad_norm 6.0 --arc_margin_ramp_steps 2500 --use_proto_prefix --proto_prefix_len 4 --proto_prefix_init random --proto_prefix_init_npz save/v9_trial12/proto_prefix_init.npz" \
   bash main.sh 24G v9_trial12_C
 ```
 
 `--skip_test` 不进入正式 EXTRA_FLAGS。正式 T12-C 必须读取正式 T12 的 npz；不得用本地 dry-run npz 替代。
+
+**启动后核对点（以代码实际打印为准，tag 为 `[V9 T12]`，非 `[ProtoPrefix]`）**：
+
+```bash
+head -n 60 logs/v9_trial12.log
+```
+
+| 核对项 | 预期 | 说明 |
+| :--- | :--- | :--- |
+| `[V9 T12] prior=` | 指向 T11-B 路径 | 先验来源正确 |
+| `[V9 T12] 先验原型 Gram 非对角` | `\|mean\| < 0.10` | 本地预检实测 T11-B：`mean=-0.0301, median=-0.0621` |
+| `[V9 T12] KMeans 聚类环境` | `sklearn=<版本>, P=4, random_state=13, n_init=20` | **记录云端 sklearn 版本**，与本地 `1.0.2` 比对 |
+| `[V9 T12] proto-cluster N:` × 4 | **记录云端真实成员** | 本地预检（同 SHA256 `aa559e7e…`）为 **8/7/9/8**；若云端不同，先查 sklearn 版本 |
+| `[V9 T12] E_proto: std=…, L2=…` | L2 逐项 ≈ `1.0000` | 前缀为归一化方向 |
+| `[V9 T12] 初始化落盘:` | `save/v9_trial12/proto_prefix_init.npz (shape=(4, 300))` | 该文件是阶段 B 的输入 |
+| `# PARAMETERS` | **以实际输出为准，须记录** | T11-B 为 `30,336,257`。**关键：T12 与 T12-C 的该值必须完全相等**（同架构、仅换 init） |
+
+> 注：`# PARAMETERS` 由 `main.py:43` 的 `count_parameters(model)` 输出。此前转述的 `30,337,457` 未获实测支持，**不得当作预期值**——若两组各自打印且相等即可，绝对值以日志为准。
+> 注：簇成员名单是**同 SHA256 下才可逐字比较**的量；本地名单不得反过来要求云端一致，只能用"本地 8/7/9/8 vs 云端 X"来判断环境是否等价。
 
 ---
 
