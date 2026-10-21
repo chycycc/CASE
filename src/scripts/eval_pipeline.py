@@ -255,6 +255,17 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
             config.use_proto_prefix = False
             print("    [自适应拓扑] 未检测到原型前缀权重，配置 config.use_proto_prefix = False")
 
+        gate_keys = [k for k in raw_keys if k.endswith("prefix_gate")]
+        if gate_keys and not prefix_keys:
+            raise RuntimeError("Gate weights found without prefix embeddings")
+        declared_mode = state_preview.get("prefix_attention_mode")
+        if declared_mode is not None:
+            if declared_mode not in ("none", "legacy_joint_softmax", "separate_softmax_residual"):
+                raise RuntimeError("Unknown checkpoint prefix_attention_mode")
+            if bool(gate_keys) != (declared_mode == "separate_softmax_residual") or bool(prefix_keys) != (declared_mode != "none"):
+                raise RuntimeError("Checkpoint prefix metadata/weights disagree; refusing topology fallback")
+        config.use_proto_prefix_gate = bool(gate_keys)
+        print(f"    [自适应拓扑] use_proto_prefix_gate={config.use_proto_prefix_gate}")
         del state_preview
     else:
         config.emotion_head_type = getattr(config, "emotion_head_type", "linear")
@@ -324,6 +335,7 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
 
     model.eval()
     model.is_eval = True
+    model.print_proto_prefix_gate_status(stage="checkpoint_restored")  # print restored gate, not constructor defaults
 
     # [V8.2 C] 从检查点文件名识别训练保存 Step 赋给 model.current_step，对齐偏置衰减
     fname = os.path.basename(checkpoint_path)

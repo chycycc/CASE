@@ -27,12 +27,12 @@ def make_model(vocab, emo_num, strategy_num):
     # Intialization
     if not is_eval:
         prefix_before_init = {n: p.detach().clone() for n, p in model.named_parameters()
-                              if "prefix_embed" in n}
+                              if "prefix_embed" in n or n.endswith("prefix_gate")}
         for n, p in model.named_parameters():
             # [V9 T12 / 关键修复] prefix_embed 必须排除：它是原型先验初始化（KMeans 簇质心），
             # 被 xavier_uniform_ 覆盖后两个实验会退化成同一随机前缀，T12-C 对照失效。
             if p.dim() > 1 and (n != "embedding.lut.weight" and config.pretrain_emb) \
-                    and "prefix_embed" not in n:
+                    and "prefix_embed" not in n and not n.endswith("prefix_gate"):
                 xavier_uniform_(p)
         for n, p in model.named_parameters():
             if n in prefix_before_init:
@@ -77,12 +77,12 @@ def train(model, train_set, dev_set):
     max_step = getattr(config, "max_step", 10000)
     try:
         model.train()
-        best_ppl = 1000
-        best_score = 1000.0
+        best_ppl = float("inf")
+        best_score = float("inf")
         best_score_step = 0
-        best_composite_ppl = 1000.0
+        best_composite_ppl = float("inf")
         patient = 0
-        best_ppl_only = 1000.0       # 纯 PPL 最优，独立于复合评分
+        best_ppl_only = float("inf")  # 纯 PPL 最优，独立于复合评分
         weights_best_ppl_only = None
         best_ppl_only_step = 0
         # [V5 Trial 4 / Trial 4b] 自适应分类头冻结监控与最佳状态缓存 (BCF)
@@ -131,6 +131,7 @@ def train(model, train_set, dev_set):
             if (n_iter + 1) % check_iter == 0:
                 model.eval()
                 model.epoch = n_iter
+                model.print_proto_prefix_gate_status()
                 bow_loss_val, kl_loss_val, mim_loss_val, ctx_loss_val, ppl_val, str_loss_val, str_acc_val, emo_loss_val, emo_acc_val, _ = evaluate(
                     model, dev_set, ty="valid", max_dec_step=50
                 )

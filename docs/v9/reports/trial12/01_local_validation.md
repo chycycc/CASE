@@ -1,5 +1,7 @@
 # V9 Trial 12 本地实装与复验记录（2026-10-20）
 
+> **后续状态（2026-10-21）**：本文保留本地复验时点记录。正式T12/C已回传并审计，最新成绩与执行指导见[正式审计](02_formal_audit.md)；本页“正式未执行/等待权重”不代表当前状态。
+
 > 结论：P9 三项新增判据通过；正式 T12 尚未执行。T11-B 权重与同 prior 的云端聚类预检仍是启动条件。所有改动留工作区，无 commit；main.sh 与 .agents/rules/ 未修改。
 
 ## 1. 口径与判定边界
@@ -53,7 +55,7 @@ T12_PYTHON="E:/Dev/condaData/envs_dirs/cem_env/python.exe"
 export NLTK_DATA="C:/Users/chy/AppData/Roaming/nltk_data"
 "$T12_PYTHON" -X utf8 tests/test_trial12_prefix.py -v
 "$T12_PYTHON" -X utf8 tests/test_trial12_scope.py -v
-"$T12_PYTHON" -X utf8 src/scripts/audit_trial12_dry_run.py --output results/v9/trial12_handoff_audit/dry_run.json
+# 历史命令的脚本已移除；保留当时产物 results/v9/trial12_handoff_audit/dry_run.json 作为证据。
 "$T12_PYTHON" -X utf8 scratch/_t12_xavier_check.py
 "$T12_PYTHON" -X utf8 scratch/_t12_ncm_smoke.py save/v9_trial12_on/CASE_9_21624.4067_composite_best results/v9/trial12_handoff_audit/ncm_smoke_one_sample.json
 ```
@@ -66,7 +68,7 @@ export NLTK_DATA="C:/Users/chy/AppData/Roaming/nltk_data"
 - Gate 2：P9 三项新增判据通过；仅代表本地 T10 初始化的代码路径验证。
 - Gate 3：先核对同一 prior 文件 SHA256，再比较本地/云端 sklearn 与实际 4 行簇成员。13/7/7/5 仅是本地 T10 的事实，不能当作 T11-B 或云端结论。云端 npz 是正式 T12-C 的唯一初始化尺度来源。
 
-**生产参数缺口已发现**：main.sh 未传 max_grad_norm/ramp，config.py 默认 2.0 / 0。正式两组必须显式传 **--max_grad_norm 6.0 --arc_margin_ramp_steps 2500**。完整命令见 [方案 §6.12](../plans/v9_trial12_upgrade_plan.md#612-2026-10-20-接手复验与生产闸门)；正式 EXTRA_FLAGS 不含 --skip_test。
+**生产参数缺口已发现**：main.sh 未传 max_grad_norm/ramp，config.py 默认 2.0 / 0。正式两组必须显式传 **--max_grad_norm 6.0 --arc_margin_ramp_steps 2500**。完整命令见 [方案 §6.12](../../plans/v9_trial12_upgrade_plan.md#612-2026-10-20-接手复验与生产闸门)；正式 EXTRA_FLAGS 不含 --skip_test。
 
 云端在训练前执行的只读预检（先替换为实际 T11-B 路径）：
 
@@ -97,4 +99,4 @@ T12 vs T12-C 配对时必须核对两份 true_labels 长度均为 5255、顺序�
 - strict=False 关键 missing/unexpected：src/scripts/eval_pipeline.py:316。
 - NCM 实际前缀键检测：src/scripts/eval_prototype_ncm.py:88。
 - clip/ramp 默认值：src/utils/config.py:61、src/utils/config.py:185；main.sh:123 与 main.sh:183 为训练/独立评测入口。
-- 所有实际曲线与日志行号：results/v9/trial12_handoff_audit/dry_run.json；复跑入口：src/scripts/audit_trial12_dry_run.py。
+- 所有实际曲线与日志行号：results/v9/trial12_handoff_audit/dry_run.json；历史审计脚本已移除，不作为当前可执行入口；当前诊断与烟测工具统一在scratch/trial12/。

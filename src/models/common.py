@@ -125,6 +125,8 @@ class DecoderLayer(nn.Module):
         use_proto_prefix=False,
         proto_prefix_len=4,
         proto_init=None,
+        use_proto_prefix_gate=False,
+        proto_prefix_gate_init=0.0,
     ):
         """
         Parameters:
@@ -199,6 +201,14 @@ class DecoderLayer(nn.Module):
 
         # [V9 T12] 原型初始化的可学习注意力前缀
         self.use_proto_prefix = use_proto_prefix
+        self.use_proto_prefix_gate = use_proto_prefix_gate
+        if use_proto_prefix_gate and not use_proto_prefix:
+            raise ValueError("Prefix gate requires use_proto_prefix=True")
+        if not math.isfinite(proto_prefix_gate_init):
+            raise ValueError("proto_prefix_gate_init must be finite")
+        if use_proto_prefix_gate:
+            # One deterministic scalar per head; no global RNG draw.
+            self.prefix_gate = nn.Parameter(torch.full((num_heads,), float(proto_prefix_gate_init)))
         if use_proto_prefix:
             self.prefix_embed = nn.Parameter(torch.zeros(proto_prefix_len, hidden_size))
             with torch.no_grad():
@@ -224,7 +234,10 @@ class DecoderLayer(nn.Module):
         x_norm = self.layer_norm_mha_dec(x)
 
         # Masked Multi-head attention（前缀注入点：self-attention K/V 拼接）
-        y, _ = self.multi_head_attention_dec(x_norm, x_norm, x_norm, dec_mask, extra_kv=extra_kv)
+        prefix_gate = self.prefix_gate.tanh() if self.use_proto_prefix_gate else None
+        y, _ = self.multi_head_attention_dec(
+            x_norm, x_norm, x_norm, dec_mask,
+            extra_kv=extra_kv, extra_kv_gate=prefix_gate)
 
         # Dropout and residual after self-attention
         x = self.dropout(x + y)
@@ -509,7 +522,12 @@ class MultiHeadAttention(nn.Module):
             .view(shape[0], shape[2], shape[3] * self.num_heads)
         )
 
-    def forward(self, queries, keys, values, mask, extra_kv=None):
+    def forward(self, queries, keys, values, mask, extra_kv=None, extra_kv_gate=None):
+
+        if extra_kv_gate is not None:
+            if extra_kv is None:
+                raise ValueError("A residual prefix gate requires prefix K/V")
+            return self._forward_gated_prefix(queries, keys, values, mask, extra_kv, extra_kv_gate)
 
         # Do a linear for each component
         queries = self.query_linear(queries)
@@ -570,6 +588,38 @@ class MultiHeadAttention(nn.Module):
         outputs = self.output_linear(contexts)
 
         return outputs, attetion_weights
+
+
+    def _forward_gated_prefix(self, queries, keys, values, mask, extra_kv, gate):
+        """Text softmax plus a separately normalized, bounded prefix residual.
+
+        Gate=0 recovers ordinary attention in eval mode (including its mask).
+        Prefix keys never enter the text softmax denominator. Default/old
+        checkpoints take the unchanged joint-softmax forward path above.
+        """
+        if gate.shape != (self.num_heads,):
+            raise ValueError("prefix gate must have one scalar per attention head")
+        if extra_kv.dim() == 2:
+            extra_kv = extra_kv.unsqueeze(0)
+        if extra_kv.dim() != 3 or extra_kv.size(1) == 0:
+            raise ValueError("prefix K/V must have shape [P,D] or [1/B,P,D], P>0")
+        extra_kv = extra_kv.expand(queries.size(0), -1, -1)
+        q = self._split_heads(self.query_linear(queries)) * self.query_scale
+        k = self._split_heads(self.key_linear(keys))
+        v = self._split_heads(self.value_linear(values))
+        pk = self._split_heads(self.key_linear(extra_kv))
+        pv = self._split_heads(self.value_linear(extra_kv))
+        text_logits = torch.matmul(q, k.transpose(-1, -2))
+        if mask is not None:
+            mask_val = -1e4 if text_logits.dtype == torch.float16 else -1e18
+            text_logits = text_logits.masked_fill(mask.unsqueeze(1), mask_val)
+        text_weights = F.softmax(text_logits, dim=-1)
+        prefix_weights = F.softmax(torch.matmul(q, pk.transpose(-1, -2)), dim=-1)
+        text_context = torch.matmul(self.dropout(text_weights), v)
+        prefix_context = torch.matmul(self.dropout(prefix_weights), pv)
+        contexts = text_context + gate.to(dtype=q.dtype).view(1, self.num_heads, 1, 1) * prefix_context
+        outputs = self.output_linear(self._merge_heads(contexts))
+        return outputs, text_logits.sum(dim=1) / self.num_heads
 
 
 class Conv(nn.Module):

@@ -107,6 +107,35 @@ else
     # LOG_FILE="logs/${EXP_NAME}_orig16.log"
 fi
 
+# Trial12 gate variants use this same entry point; no extra launcher.
+case "$EXP_NAME" in
+    v9_trial12_gate_proto|v9_trial12_gate_rand)
+        if [ -n "$EXTRA_FLAGS" ]; then
+            echo "[T12] This named profile fixes EXTRA_FLAGS; unset inherited overrides first." >&2
+            exit 1
+        fi
+        if [ -e "$OUTPUT_DIR" ] || [ -e "$LOG_FILE" ]; then
+            echo "[T12] Output already exists: $EXP_NAME; refusing to overwrite." >&2
+            exit 1
+        fi
+        T12_INIT="${T12_INIT_NPZ:-save/v9_trial12/proto_prefix_init.npz}"
+        "$pythonpath" - "$T12_INIT" <<'PY'
+import hashlib, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+if not p.is_file():
+    raise FileNotFoundError("Original T12 initializer required: " + str(p))
+if hashlib.sha256(p.read_bytes()).hexdigest() != "341ce94027ce7af25bdb55f2f14cd2b8353098932f0ced76136575d9d908f898":
+    raise RuntimeError("T12 initializer hash mismatch; do not recompute KMeans")
+print("[T12] Frozen original initializer verified:", p)
+PY
+        T12_MODE=proto
+        [ "$EXP_NAME" = "v9_trial12_gate_rand" ] && T12_MODE=random
+        T12_ARC_RAMP=2500
+        [ "$ENV_MODE" = "4G" ] && T12_ARC_RAMP=20000
+        EXTRA_FLAGS="--max_grad_norm 6.0 --arc_margin_ramp_steps $T12_ARC_RAMP --use_proto_prefix --proto_prefix_len 4 --use_proto_prefix_gate --proto_prefix_gate_init 0.0 --proto_prefix_init $T12_MODE --proto_prefix_source artifact --proto_prefix_init_npz $T12_INIT"
+        ;;
+esac
+
 # 2. 建立独立日志与实验产出目录
 mkdir -p logs
 mkdir -p results/v9
@@ -201,6 +230,15 @@ cp -f "${OUTPUT_DIR}/eval_metrics.json" "${DOWNLOAD_DIR}/" 2>/dev/null || true
 cp -f "results/v9/${EXP_NAME}_eval.txt" "${DOWNLOAD_DIR}/" 2>/dev/null || true
 cp -f "results/v9/${EXP_NAME}_manifold.png" "${DOWNLOAD_DIR}/" 2>/dev/null || true
 cp -f "results/v9/${EXP_NAME}_results.txt" "${DOWNLOAD_DIR}/" 2>/dev/null || true
+for INIT_FILE in proto_prefix_init.npz prefix_init_metadata.json; do
+    if [ -f "${OUTPUT_DIR}/${INIT_FILE}" ]; then
+        cp -f "${OUTPUT_DIR}/${INIT_FILE}" "${DOWNLOAD_DIR}/"
+    fi
+done
+if [ -f "${OUTPUT_DIR}/prefix_init_metadata.json" ]; then
+    sha256sum "${OUTPUT_DIR}"/CASE_*_best > "${DOWNLOAD_DIR}/checkpoint_sha256.txt"
+    sha256sum main.sh main.py src/models/common.py src/models/CASE/model.py src/utils/config.py src/scripts/eval_pipeline.py > "${DOWNLOAD_DIR}/source_sha256.txt"
+fi
 
 echo "======================================================================"
 echo "[*] 全部完成！产出文件已汇总至:"

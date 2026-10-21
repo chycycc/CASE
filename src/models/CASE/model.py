@@ -1,5 +1,7 @@
 ### TAKEN FROM https://github.com/kolloldas/torchnlp
 import os
+import hashlib
+import json
 import contextlib
 import warnings
 warnings.filterwarnings('ignore')
@@ -741,6 +743,8 @@ class Decoder(nn.Module):
         use_proto_prefix=False,
         proto_prefix_len=4,
         proto_init=None,
+        use_proto_prefix_gate=False,
+        proto_prefix_gate_init=0.0,
     ):
         """
         Parameters:
@@ -790,7 +794,9 @@ class Decoder(nn.Module):
             "[V9 T12] universal 模式不支持前缀注入（同一层被重入 num_layers 次，前缀会被重复注入）"
         prefix_kwargs = dict(use_proto_prefix=use_proto_prefix,
                              proto_prefix_len=proto_prefix_len,
-                             proto_init=proto_init)
+                             proto_init=proto_init,
+                             use_proto_prefix_gate=use_proto_prefix_gate,
+                             proto_prefix_gate_init=proto_prefix_gate_init)
 
         if self.universal:
             self.dec = DecoderLayer(*params, **prefix_kwargs)
@@ -1290,6 +1296,9 @@ class CASE(nn.Module):
         # [V9 T12] 原型注意力前缀初始化（开关关闭时 proto_init=None，零副作用）
         self.use_proto_prefix = getattr(config, 'use_proto_prefix', False)
         self.proto_prefix_len = getattr(config, 'proto_prefix_len', 4)
+        self.use_proto_prefix_gate = getattr(config, 'use_proto_prefix_gate', False)
+        if self.use_proto_prefix_gate and not self.use_proto_prefix:
+            raise ValueError('use_proto_prefix_gate requires use_proto_prefix')
         proto_init_tensor = self._build_proto_prefix_init() if self.use_proto_prefix else None
         self.decoder = Decoder(
             config.emb_dim,
@@ -1302,6 +1311,8 @@ class CASE(nn.Module):
             use_proto_prefix=self.use_proto_prefix,
             proto_prefix_len=self.proto_prefix_len,
             proto_init=proto_init_tensor,
+            use_proto_prefix_gate=self.use_proto_prefix_gate,
+            proto_prefix_gate_init=getattr(config, "proto_prefix_gate_init", 0.0),
         )
         # [V9 T12] 生效打印延后到 __init__ 末尾：PCAM/generator/emo_bias 注册后总量统计才准确
         
@@ -1416,6 +1427,7 @@ class CASE(nn.Module):
 
         # [V9 T12] 铁律 IV 生效打印：此处已注册全部模块（PCAM/generator/emo_bias），总参数统计才准确
         print(f"[Prefix Status] use_proto_prefix={self.use_proto_prefix}")
+        self.print_proto_prefix_gate_status(stage="constructor_pending_restore" if getattr(config, "test", False) else "initialized")
         if self.use_proto_prefix:
             self._print_proto_prefix_status()
 
@@ -1455,19 +1467,18 @@ class CASE(nn.Module):
 
         if mode == "proto":
             src = getattr(config, 'proto_prefix_source', 'ckpt')
-            if src == "ckpt":
+            if src == "artifact":
+                init = self._read_proto_prefix_npz(P, hidden)
+                print(f"[V9 T12] exact artifact init={config.proto_prefix_init_npz}; KMeans bypassed")
+            elif src == "ckpt":
                 proto = self._load_proto_from_ckpt()                 # A1: (32, 300)
             else:
                 print("[V9 T12][WARN] P8-B 已否决：live 冷启动原型在 t=0 为随机单位向量")
                 raise RuntimeError("P8 已裁定 (A)：禁止 live 冷启动；仅调试时可显式改 config")
-            init = self._deterministic_project(proto, P)             # A2: (P, 300)
+            if src != "artifact":
+                init = self._deterministic_project(proto, P)         # A2: (P, 300)
         else:  # random: T12-C
-            npz = getattr(config, 'proto_prefix_init_npz', '')
-            assert npz and os.path.exists(npz), \
-                f"T12-C 必须提供 --proto_prefix_init_npz（当前值: '{npz}'）"
-            e = torch.from_numpy(np.load(npz)["init"]).float()       # (P, 300)
-            assert e.shape == (P, hidden), \
-                f"npz init 形状不匹配: 期望 ({P}, {hidden}), 实际 {tuple(e.shape)}"
+            e = self._read_proto_prefix_npz(P, hidden)
             # 局部随机源，不动全局 RNG（P8-A2 技术纠正）
             g = torch.Generator().manual_seed(13)
             r = torch.randn(e.shape, generator=g) * e.std() + e.mean()
@@ -1477,19 +1488,50 @@ class CASE(nn.Module):
                 "T12-C 逐向量 L2 未对齐"
             init = r
 
-        # 落盘（P5 / A3）：仅 proto 模式落盘（T12-C 读的就是 T12 的 npz）
-        if mode == "proto":
-            out_dir = getattr(config, 'save_path', None) or getattr(config, 'model_file_path', None) or f"save/{config.exp_name}"
-            os.makedirs(out_dir, exist_ok=True)
-            npz_path = os.path.join(out_dir, "proto_prefix_init.npz")
-            np.savez(npz_path, init=init.numpy().astype("float32"))
-            print(f"[V9 T12] 初始化落盘: {npz_path} (shape={tuple(init.shape)})")
+        # Save the actual tensor for BOTH proto and random; no inferred random init later.
+        out_dir = getattr(config, 'save_path', None) or f"save/{config.exp_name}"
+        os.makedirs(out_dir, exist_ok=True)
+        npz_path = os.path.join(out_dir, "proto_prefix_init.npz")
+        np.savez(npz_path, init=init.numpy().astype("float32"))
+        metadata = {"mode": mode, "source": getattr(config, "proto_prefix_source", "ckpt"),
+                    "source_npz": getattr(config, "proto_prefix_init_npz", ""),
+                    "prior_checkpoint": getattr(config, "proto_prefix_prior_path", "") if mode == "proto" and getattr(config, "proto_prefix_source", "ckpt") == "ckpt" else None,
+                    "actual_init_tensor_sha256": hashlib.sha256(init.numpy().astype("float32").tobytes()).hexdigest(),
+                    "shape": list(init.shape), "row_l2": init.norm(dim=1).tolist(),
+                    "use_proto_prefix_gate": self.use_proto_prefix_gate,
+                    "gate_raw_init": float(getattr(config, "proto_prefix_gate_init", 0.0))}
+        source_npz = metadata["source_npz"]
+        if source_npz:
+            with open(source_npz, "rb") as source_file:
+                metadata["source_npz_sha256"] = hashlib.sha256(source_file.read()).hexdigest()
+            print(f"[V9 T12] source_npz_sha256={metadata['source_npz_sha256']}")
+        with open(os.path.join(out_dir, "prefix_init_metadata.json"), "w", encoding="utf-8") as f:
+            json.dump(metadata, f, ensure_ascii=False, indent=2)
+        print(f"[V9 T12] 初始化落盘: {npz_path} (shape={tuple(init.shape)}, mode={mode})")
 
         # 统计打印（P5 要求）
         print(f"[V9 T12] E_proto: std={init.std():.4f}, "
               f"L2={[f'{v:.4f}' for v in init.norm(dim=1).tolist()]}, "
               f"per-dim std={[f'{v:.4f}' for v in init.std(dim=1).tolist()]}")
         return init
+
+    def _read_proto_prefix_npz(self, length, hidden):
+        path = getattr(config, "proto_prefix_init_npz", "")
+        if not path or not os.path.isfile(path):
+            raise FileNotFoundError(f"Explicit prefix init npz required: {path}")
+        with np.load(path, allow_pickle=False) as data:
+            init = torch.from_numpy(data["init"].copy()).float()
+        if tuple(init.shape) != (length, hidden) or not torch.isfinite(init).all():
+            raise ValueError(f"Invalid prefix artifact shape/values: {tuple(init.shape)}")
+        if (init.norm(dim=1) <= 0).any():
+            raise ValueError("Prefix artifact contains a zero vector")
+        return init
+
+    def print_proto_prefix_gate_status(self, stage="current"):
+        gates = {name: param.detach().tanh().cpu().tolist()
+                 for name, param in self.named_parameters() if name.endswith("prefix_gate")}
+        print(f"[Prefix Gate Status] stage={stage} | use_proto_prefix_gate={self.use_proto_prefix_gate} | "
+              f"mode={'separate_softmax_residual' if self.use_proto_prefix_gate else 'legacy_joint_softmax' if self.use_proto_prefix else 'none'} | tanh_gate={gates}")
 
     def _load_proto_from_ckpt(self):
         """A1：读先验 checkpoint 的训练后原型，形状 (32, 300)，带脏权重门限。
@@ -1566,8 +1608,10 @@ class CASE(nn.Module):
         else:
             print(f"[V9 T12] 成功启用原型前缀注入: P={P}, init={mode}"
                   f"{'(KMeans cluster centers)' if mode == 'proto' else '(random, same-scale)'}, source={source}")
-        print(f"[V9 T12] 注入点=DecoderLayer#0 self-attn K/V (复用 key/value_linear, 前缀在前)")
-        print(f"[V9 T12] 新增参数={prefix_params} (prefix_embed) | 总参数={total_params:,}")
+        mechanism = "separate softmax + per-head residual gate" if self.use_proto_prefix_gate else "joint softmax, prefix columns first"
+        print(f"[V9 T12] 注入点=DecoderLayer#0 self-attn K/V (shared key/value_linear; {mechanism})")
+        gate_params = sum(p.numel() for n, p in self.named_parameters() if n.endswith("prefix_gate"))
+        print(f"[V9 T12] 新增参数={prefix_params + gate_params} (prefix_embed={prefix_params}, gate={gate_params}) | 总参数={total_params:,}")
 
     def make_encoder(self, emb_dim):
         return Encoder(
@@ -1640,6 +1684,8 @@ class CASE(nn.Module):
             "current_loss": running_avg_ppl,
             "model": self.state_dict(),
             "tag": tag,
+            "prefix_attention_mode": ("separate_softmax_residual" if self.use_proto_prefix_gate
+                                      else "legacy_joint_softmax" if self.use_proto_prefix else "none"),
         }
         if tag:
             ckpt_name = "CASE_{}_{:.4f}_{}".format(iter, running_avg_ppl, tag)

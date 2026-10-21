@@ -811,8 +811,39 @@ $\arg\max_c(\mathrm{sim} / \tau) \equiv \arg\max_c(\mathrm{sim})$ 对任意 $\ta
 
 ## 11. V9 Trial 12：P9 后本地路径复验（2026-10-20，非正式成绩）
 
-- 方案 B2：PCAM 保留，4×300 可学习前缀，T10 先验 KMeans 初始化仅用于本地代码路径验证。详见 [复验报告](reports/v9_trial12_local_validation.md) 与 [方案 v1.6 §6.12](plans/v9_trial12_upgrade_plan.md#612-2026-10-20-接手复验与生产闸门)。
+- 方案 B2：PCAM 保留，4×300 可学习前缀，T10 先验 KMeans 初始化仅用于本地代码路径验证。详见 [复验报告](reports/trial12/01_local_validation.md) 与 [方案 v1.6 §6.12](plans/v9_trial12_upgrade_plan.md#612-2026-10-20-接手复验与生产闸门)。
 - on/rand 各 10 微步，训练 batch=4/accum=8，仅 1 次更新；Valid N=5734、实际 batch=4、2 次评估；Test 未测；生成 N=1。MD5 不同、ctx_loss 10/10 点分离、实际 make_model 初始化后 max|Δ|=0，P9 三项新判据通过。产物：results/v9/trial12_handoff_audit/dry_run.json。
 - 9 项 PyTorch 回归与 2 项轻量口径回归分别通过；补充 rand GPU 烟测及合并重跑受 WinError 1455 阻断，未记录为通过。跳过分支的旧 Test/流形占位值不得作为实测。
 - Gate 1：T11-B 权重未到；Gate 2：P9 三项新判据通过；Gate 3：同 prior 的云端 sklearn/实际簇成员预检待完成。正式启动命令须显式包含 --max_grad_norm 6.0 --arc_margin_ramp_steps 2500，不含 --skip_test。
 - 正式口径与判据未变：Test N=5255、batch=1、macro；Valid N=5734、batch=32、macro、shuffle=False；生成 N=500。无正式 T12/T12-C 成绩，无正式 npz，无 McNemar 结论。
+
+
+### 11.1 Trial12 首轮正式结果（2026-10-21）
+
+- 原始产物：results/cloud_archive/v9_trial12/、v9_trial12_C/；[正式审计](reports/trial12/02_formal_audit.md)，[下一步指导](reports/trial12/README.md)。
+- Test N=5255、batch=1，macro PPL=exp(平均逐样本token CE)，Acc为样本级：T11-B **32.56 / 42.21%**；T12 **32.96 / 41.43%**；C **32.59 / 41.35%**。两组均未达到冻结双门槛，保留B基线。
+- Valid N=5734、batch=32、macro、shuffle=False；T12−C完整20点11差/9好，描述性符号p=0.8238，不能将Test +0.37宣称为已证结构性退化。生成前N500、batch1，Unique与Distinct方向混合，详表见审计。
+- 原生dpfc npz缺失，但三组文本各5255条身份与顺序完全一致；已派生带源SHA256的预测npz，真实McNemar：T12−C独对455/451，p=0.9206；未检出差异不等于统计等价。对B保留冻结独立两比例近似并补充文本配对检验。
+- T12 composite选6999、ppl_best在7499，后者未独立评测。下一步 **v9_trial12_ppl_audit**，仅补评已有权重、隔离输出；所有后续仍归Trial12，不新开Trial13。未启动新训练，未commit。
+- 可复跑：scratch/trial12/audit_trial12_formal.py；派生证据：results/v9/trial12_formal_audit/。前节“正式未执行/无McNemar”是2026-10-20历史状态，本节为最新事实。
+
+
+### 11.2 Trial12 正式权重本地补评（2026-10-21）
+
+- 五份权重全部完成全Test/流形与四路生成；Test N5255、batch1、macro PPL/样本级Acc；生成前N500/batch1/max40；历史Valid N5734/batch32/macro、shuffleFalse，本次未重算。
+- T12-comp **32.952267/41.43%**，T12-ppl **32.571706/42.57%**，C-ppl **32.586992/41.35%**，B-comp **32.564646/42.21%**，B-ppl **32.523071/40.93%**。T12候选两位数32.57仍未通过冻结32.56门槛；原正式判决保留。
+- T12选择7499而非6999：PPL−0.380561、Acc+1.1418pp；B选择8999而非7499：PPL−0.041575、Acc−1.2750pp。不能将PPL选择器一概视作改进。
+- T12-ppl对C：独对454/390，ΔAcc+1.2179pp、McNemar p=0.030057，五项Holm后0.090170；对B-comp：独对429/410，ΔAcc+0.3616pp、p=0.534342。完整区间、五项比较与生成取舍见[本地补评审计](E:/github/CASE/docs/v9/reports/trial12/03_local_eval_audit.md)。
+- 三组原始分类预测与云端文本各5255/5255一致；PPL/生成未逐值跨环境复现，差异来源未定位。权重与源码hash运行前后未变，四路候选复算通过。证据目录results/v9/trial12_local_eval；scratch/trial12/analyze_trial12_local.py可复算。
+- 正式prefix训练后漂移已测；attention质量尚未测。后续仍属v9_trial12_XXX，按[下一步指导](E:/github/CASE/docs/v9/reports/trial12/README.md)先诊断与预注册，再决定新训练；本次无新训练、无commit。前节“权重缺失/尚未补评”现为历史状态。
+
+
+### 11.3 Trial12 seed13 残差门控优化（2026-10-21，未正式训练）
+
+- 用户决定：暂不多种子，先单种子优化。诊断Valid顺序前N256/batch4，原T12-ppl前缀质量head均值49.31%/5.28%，C-ppl48.87%/11.25%；首位置仅1.03%/2.09%。不是全Valid N5734/batch32成绩，不把诊断当训练因果。原Test N5255/batch1与生成N500/batch1结果不变。
+- 新机制为独立softmax+按head零初始化tanh残差门控，PCAM与其他训练配置不变；+2参数，总30,337,459。冻结原T12初值artifact并保存proto/random真实初值。它是组合注入机制变化，不是纯门控标量效应。
+- 已通过22项串行回归与两组真实CASE烟测：Train/Valid各N32、batch4/accum8、24主微步=3更新；Test未测、生成N0。初值零差，公共初始参数hash一致，首次更新后轨迹分离，prefix/gate更新且checkpoint恢复逐元素一致。
+- 修复best=1000冷启动保存上限为inf；不归因于原正式成绩。新分支尚无正式性能，不能声称达标。
+- 云端入口已简化为main.sh 24G v9_trial12_gate_proto / v9_trial12_gate_rand，主composite不变，ppl_best回传后按需本地补评；[原因与实施](E:/github/CASE/docs/v9/reports/trial12/04_gate_optimization.md)。产物证据results/v9/trial12_gate_validation/。无commit、未改.agents/rules/。
+
+- **交付流程修订**：按用户要求，只使用Git拉取与main.sh；临时脚本移至scratch/trial12/，报告集中到docs/v9/reports/trial12/。旧补丁包与额外启动器已撤回。

@@ -1,7 +1,13 @@
-# CASE-EPCL V9 Trial 12 架构演进方案（v1.6 ｜ P9 复验通过 ｜ 正式训练等待 Gate 1/3）
+# CASE-EPCL V9 Trial 12 架构演进方案（v1.9 ｜ 单种子门控优化已实装与验收）
+
+> **最新决定与实现（2026-10-21）**：按用户要求暂不推进多种子。已实现v9_trial12_gate_proto / gate_rand：独立softmax前缀残差、每head零初始化tanh gate；+2参数、总30,337,459，直接复用原云端4×300初值。22项回归与两组4G/3次更新烟测通过，尚无该分支正式Test成绩。诊断Valid前N256/batch4，不是全Valid N5734/batch32；正式Test仍N5255/batch1/macro，生成N500/batch1。原因边界、代码锚点、云端脚本与停止条件见[门控优化报告](E:/github/CASE/docs/v9/reports/trial12/04_gate_optimization.md)，执行见[下一步](E:/github/CASE/docs/v9/reports/trial12/README.md)。旧多种子/旋转路线现不执行。
+
+> **2026-10-21 P0补评完成**：五份正式权重已在本地统一流程评测。T12-ppl Test=32.571706/42.57%，原T12-comp=32.952267/41.43%；B-comp=32.564646/42.21%，B-ppl=32.523071/40.93%，C-ppl=32.586992/41.35%。Test N5255/batch1/macro PPL与样本Acc；历史Valid N5734/batch32/macro、此次未重算；生成N500/batch1。T12仍未通过冻结PPL门槛。相对C的Acc McNemar原始p=0.0301、五项Holm后0.0902；不宣称稳定先验收益。详见[本地补评审计](E:/github/CASE/docs/v9/reports/trial12/03_local_eval_audit.md)。原正式composite判决不被补评覆盖。
+
+> **2026-10-21 正式结果更新**：T12/C 已完成；Test N=5255、batch=1、macro PPL / 样本级 Acc 分别为 **32.96 / 41.43%**、**32.59 / 41.35%**，均未达冻结双门槛。Valid N=5734、batch=32、macro、shuffle=False；生成前 N=500、batch=1。T12−C Valid 全20点为11差/9好，符号p=0.8238，不满足结构性判据。三组5255条结果文本已核验身份、顺序并派生npz，T12/C真实McNemar p=0.9206；原文“缺npz不可检验”是此前状态，现已有文本恢复路径。详见[正式审计](../reports/trial12/02_formal_audit.md)与[下一步指导](../reports/trial12/README.md)。后续命名 v9_trial12_ppl_audit 等，仍属Trial12。
 
 > **文档性质**：Trial 12 方案的事前登记、机制论证、接口冻结与实施计划。本版为**整理重构版 + P8 裁定版 + 代码审查定盘版**（v1.6），整理明细见第七部分。
-> **方案状态**：✅ **已核准执行（Gate G5 闭环）**：P1–P6 经交叉审查通过、用户放行。**代码已实装并完成首轮审查修订（2026-10-19）**：`config.py`（6 参数注册）、`common.py`（DecoderLayer 前缀参数 + MHA extra_kv 拼接）、`model.py`（Decoder 透传 + CASE 构造 + 4 辅助方法）、`eval_pipeline.py`（自适应拓扑第 4 项）。审查后已修 B1（生效打印时机）、B2（全局 RNG）、B3（`weights_only`）、B4（`clone`）、B5（Gram 死绑），并将先验来源与投影方法定盘为 **T11-B 原型 + KMeans 簇质心**。**P9 后 4G on/rand dry run 已复验：MD5 不同、10 个训练微步的 loss 曲线分离、实际 make_model 初始化后前缀零差。该轮用 T10 先验，仅验证代码路径；正式 T12 仍等待 T11-B 权重与云端聚类核对。**
+> **方案状态**：✅ **已核准执行（Gate G5 闭环）**：P1–P6 经交叉审查通过、用户放行。**代码已实装并完成首轮审查修订（2026-10-19）**：`config.py`（6 参数注册）、`common.py`（DecoderLayer 前缀参数 + MHA extra_kv 拼接）、`model.py`（Decoder 透传 + CASE 构造 + 4 辅助方法）、`eval_pipeline.py`（自适应拓扑第 4 项）。审查后已修 B1（生效打印时机）、B2（全局 RNG）、B3（`weights_only`）、B4（`clone`）、B5（Gram 死绑），并将先验来源与投影方法定盘为 **T11-B 原型 + KMeans 簇质心**。**P9 后 4G on/rand dry run 已复验：MD5 不同、10 个训练微步的 loss 曲线分离、实际 make_model 初始化后前缀零差。该轮用 T10 先验，仅验证代码路径；当时正式 T12 等待 T11-B 权重与云端聚类核对；2026-10-21 已回传正式结果，最新结论见下方更新。**
 > **P8 已裁定（2026-10-19）：采纳 (A) — 用先验 checkpoint 的训练后原型作初始化先验。** 先验默认 **T11-B**（clip=6.0 与 T12 对齐）；T10（clip=∞）为备选 + 敏感性对照。投影取 **KMeans(K=4) 簇质心**（保留类别语义，不取 SVD 主轴）。见 [§0.4 P8 处置](#04-受理前置接口回正清单p1p8)。
 > **方法论约束**：[case-epcl-experiment-audit-rules.md](../../../.agents/rules/case-epcl-experiment-audit-rules.md) 四条铁律（I 因果对齐 ｜ II 验证基准确定性 ｜ III 口径显式化 ｜ 铁律 IV 开关生效性）
 > **主方案**：**B2 — 原型前缀引导解码（注意力级 K/V 注入）**
@@ -591,7 +597,7 @@ EXTRA_FLAGS="--use_proto_prefix --proto_prefix_len 4 --proto_prefix_init proto -
 ### 6.12 2026-10-20 接手复验与生产闸门
 
 - **Gate 1 待到货**：T11-B 归档目前仍为 5 文件，无生产权重；正式 T12 不启动。
-- **Gate 2 三项新增判据通过**：独立产物审计见 [本轮验证报告](../reports/v9_trial12_local_validation.md) 与 `results/v9/trial12_handoff_audit/dry_run.json`。on/rand 各 10 个训练微步、batch=4、accum=8，仅 1 次优化器更新；Valid N=5734、实际 batch=4、2 次评估；Test 未测；生成仅 N=1。不可称为训练收敛或正式质量验证。
+- **Gate 2 三项新增判据通过**：独立产物审计见 [本轮验证报告](../reports/trial12/01_local_validation.md) 与 `results/v9/trial12_handoff_audit/dry_run.json`。on/rand 各 10 个训练微步、batch=4、accum=8，仅 1 次优化器更新；Valid N=5734、实际 batch=4、2 次评估；Test 未测；生成仅 N=1。不可称为训练收敛或正式质量验证。
 - **Gate 3 待云端预检**：核对同一 prior SHA256、sklearn 版本和 4 行实际簇成员。T10 本地名单不能用于要求 T11-B 聚类一致；须先收到 T11-B 后建立同输入的本地参照，再核对云端。
 - **铁律 IV 修补**：评测同时拦截关键权重 missing/unexpected；NCM 按实际 `prefix_embed` 键识别并重置开关；关闭状态用 `[Prefix Status] use_proto_prefix=False` 打印，仍不出现 `[V9 T12]`；make_model 在全局初始化后增加 P9 零差断言。
 - **未测值隔离**：`--skip_test_eval` 原实现写入 32.83 / 39.39 等硬编码值，`--skip_manifold` 原实现写入零占位；均不能当实测。修补后留空并附 status/样本数，旧 JSON 证据保存在 `results/v9/trial12_handoff_audit/{on,rand}_eval_before_fix.json`。
@@ -602,17 +608,21 @@ EXTRA_FLAGS="--use_proto_prefix --proto_prefix_len 4 --proto_prefix_init proto -
 
 ```bash
 cd ~/CASE
-PRIOR="results/cloud_archive/v9_trial11_B_gnorm6/CASE_7499_37.5058_composite_best"
-test -f "$PRIOR" || { echo "GATE1 FAIL: prior 不存在"; exit 1; }
+# 云端 T11-B 生产权重的真实路径（不是本地归档 results/cloud_archive/...）
+PRIOR="../autodl-tmp/CASE/save/v9_trial11_B_gnorm6/CASE_7499_37.5058_composite_best"
+test -f "$PRIOR" || { echo "GATE1 FAIL: $PRIOR"; exit 1; }
+ls -l "$PRIOR"; sha256sum "$PRIOR"
 
 # ---- 阶段 A：T12（先验原型前缀）----
 EXTRA_FLAGS="--max_grad_norm 6.0 --arc_margin_ramp_steps 2500 --use_proto_prefix --proto_prefix_len 4 --proto_prefix_init proto --proto_prefix_source ckpt --proto_prefix_prior_path $PRIOR" \
   bash main.sh 24G v9_trial12
 
-# ---- 阶段 B：T12-C（等尺度随机前缀对照；须待阶段 A 的 npz 落盘后再启动）----
+# ---- 阶段 B：T12-C（等尺度随机前缀对照；须待阶段 A 训练及评测完整结束、核验 npz 后再启动）----
 EXTRA_FLAGS="--max_grad_norm 6.0 --arc_margin_ramp_steps 2500 --use_proto_prefix --proto_prefix_len 4 --proto_prefix_init random --proto_prefix_init_npz save/v9_trial12/proto_prefix_init.npz" \
   bash main.sh 24G v9_trial12_C
 ```
+
+> **路径说明**：云端 T11-B 权重位于 `~/autodl-tmp/CASE/save/v9_trial11_B_gnorm6/`（即从项目根 `~/CASE` 出发的 `../autodl-tmp/CASE/save/...`）。本地归档副本 `results/cloud_archive/v9_trial11_B_gnorm6/` 仅供本地比对，不得写入云端命令。
 
 `--skip_test` 不进入正式 EXTRA_FLAGS。正式 T12-C 必须读取正式 T12 的 npz；不得用本地 dry-run npz 替代。
 
@@ -693,4 +703,4 @@ head -n 60 logs/v9_trial12.log
 - 合并函数内 _scope 记录，并修正聚合公式、实际完成数量与生成 loader 复用。
 - 正式命令明确 clip=6.0、ramp=2500；保留 Gate 1/3，记录额外烟测受系统提交内存阻断，未声称所有补充验证通过。
 
-> **版本**：v1.6 ｜ **更新**：2026-10-20 ｜ **状态**：P9 三项新增判据已通过；T10 本地代码路径验证有效；T11-B 权重与云端聚类预检待完成；无正式 T12 / T12-C 质量结论。
+> **版本**：v1.7 ｜ **更新**：2026-10-21 ｜ **状态**：首轮正式 T12/C 均未达到冻结双门槛；优先执行 Trial12 内既有 ppl_best 补评，原 composite 判决保留。历史闸门记录按其当时日期理解。

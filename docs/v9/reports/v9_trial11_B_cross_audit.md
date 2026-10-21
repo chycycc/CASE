@@ -1,5 +1,7 @@
 # CASE-EPCL V9 Trial 11-B 因果审计技术备忘录（第三版 · 交叉审计终版）
 
+> **证据补充（2026-10-21）**：本报告§3.4(3)原生dpfc_preds.npz缺失的事实保留；本轮发现归档结果文本含完整5255条预测，已与T12/C按Context、Ref、真实标签逐条配对并重建带来源的npz。当前可做文本配对McNemar，见[Trial12正式审计§3](trial12/02_formal_audit.md)。不追溯改变本报告当时的冻结判据。
+
 > **文件性质**：Trial 11-B 实验的终审定性与统计审计，兼作 Trial 12 架构选型的决策依据
 > **版本**：v3 Final — 已并入三方交叉审计意见（R1–R5 事实错误 / Y1–Y7 关键缺失 / N1–N4 瑕疵）
 > **审计基准**：[`case-epcl-experiment-audit-rules.md`](../../../.agents/rules/case-epcl-experiment-audit-rules.md) 四条铁律（I 因果对齐 ｜ II 验证基准确定性 ｜ III 口径显式化 ｜ IV 开关生效性）

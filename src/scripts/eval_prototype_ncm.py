@@ -93,6 +93,17 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
     print(f"    [拓扑识别] use_proto_prefix={config.use_proto_prefix}"
           f"{', P=' + str(config.proto_prefix_len) if prefix_keys else ''}")
 
+    gate_keys = [k for k in raw_keys if k.endswith("prefix_gate")]
+    if gate_keys and not prefix_keys:
+        raise RuntimeError("Gate weights found without prefix embeddings")
+    declared_mode = state.get("prefix_attention_mode")
+    if declared_mode is not None:
+        if declared_mode not in ("none", "legacy_joint_softmax", "separate_softmax_residual"):
+            raise RuntimeError("Unknown checkpoint prefix_attention_mode")
+        if bool(gate_keys) != (declared_mode == "separate_softmax_residual") or bool(prefix_keys) != (declared_mode != "none"):
+            raise RuntimeError("Checkpoint prefix metadata/weights disagree; refusing topology fallback")
+    config.use_proto_prefix_gate = bool(gate_keys)
+    print(f"    [拓扑识别] use_proto_prefix_gate={config.use_proto_prefix_gate}")
     config.use_erp = any("erp." in k for k in raw_keys)
     config.dataset = "ED"
     config.batch_size = batch_size
@@ -140,6 +151,7 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
 
     model.eval()
     model.is_eval = True
+    model.print_proto_prefix_gate_status(stage="checkpoint_restored")
     print("[+] H1 拓扑断言通过，权重加载就绪！")
     return model, vocab, dev_set, test_set
 

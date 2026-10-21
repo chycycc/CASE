@@ -123,10 +123,13 @@ class PrefixAttentionTests(unittest.TestCase):
             np.savez(path, init=e.numpy())
             with patch.multiple(config, use_proto_prefix=True, test=False,
                                 proto_prefix_len=4, hidden_dim=300,
-                                proto_prefix_init="random", proto_prefix_init_npz=path):
+                                proto_prefix_init="random", proto_prefix_init_npz=path, save_path=directory):
                 before = torch.get_rng_state().clone()
                 with contextlib.redirect_stdout(io.StringIO()):
-                    random = CASE._build_proto_prefix_init(None)
+                    holder = CASE.__new__(CASE)
+                    nn.Module.__init__(holder)
+                    holder.use_proto_prefix_gate = False
+                    random = holder._build_proto_prefix_init()
                 self.assertTrue(torch.equal(before, torch.get_rng_state()))
                 self.assertFalse(torch.equal(e, random))
                 self.assertLess((e.norm(dim=1) - random.norm(dim=1)).abs().max().item(), 1e-5)
@@ -146,18 +149,23 @@ class PrefixAttentionTests(unittest.TestCase):
 
 
 class EvaluationAuditTests(unittest.TestCase):
-    def loader(self, file, fn, prefix, unexpected=()):
+    def loader(self, file, fn, prefix, unexpected=(), gate=False, missing=(), declared_mode=None):
         cfg = SimpleNamespace(device="cpu", use_proto_prefix=not prefix)
         state = {"model": {"epcl_criterion.prototypes": torch.zeros(32, 300),
                            "emotion_linear.weight": torch.zeros(32, 300)}}
         if prefix:
             state["model"]["decoder.dec.0.prefix_embed"] = torch.zeros(4, 300)
+        if declared_mode is not None:
+            state["prefix_attention_mode"] = declared_mode
+        if gate:
+            state["model"]["decoder.dec.0.prefix_gate"] = torch.zeros(2)
         class Model:
             epcl_criterion = object()
             def to(self, device): return self
             def eval(self): pass
+            def print_proto_prefix_gate_status(self, **kwargs): pass
             def load_state_dict(self, sd, strict):
-                return [], list(unexpected)
+                return list(missing), list(unexpected)
         namespace = dict(os=os, config=cfg, torch=torch, CASE=lambda *a, **kw: Model(),
                          PROJECT_ROOT=str(ROOT), set_seed=lambda: None,
                          prepare_data_seq=lambda **kw: (None, None, None, None, 32, 8))
@@ -166,6 +174,25 @@ class EvaluationAuditTests(unittest.TestCase):
             with patch.object(torch, "load", return_value=state), contextlib.redirect_stdout(io.StringIO()):
                 result = loader(f.name)
         return cfg, result
+
+    def test_gate_topology_is_detected_and_reset_in_both_loaders(self):
+        for file, fn in [("src/scripts/eval_pipeline.py", "load_v8_model"),
+                         ("src/scripts/eval_prototype_ncm.py", "safe_load_checkpoint")]:
+            for gate in (True, False):
+                cfg, _ = self.loader(file, fn, True, gate=gate)
+                self.assertEqual(cfg.use_proto_prefix_gate, gate)
+
+    def test_declared_gate_cannot_silently_fall_back_when_all_gate_keys_missing(self):
+        for file, fn in [("src/scripts/eval_pipeline.py", "load_v8_model"),
+                         ("src/scripts/eval_prototype_ncm.py", "safe_load_checkpoint")]:
+            with self.assertRaises(RuntimeError):
+                self.loader(file, fn, True, gate=False,
+                            declared_mode="separate_softmax_residual")
+
+    def test_missing_gate_weight_fails_critical_audit(self):
+        with self.assertRaises(RuntimeError):
+            self.loader("src/scripts/eval_pipeline.py", "load_v8_model", True,
+                        gate=True, missing=["decoder.dec.0.prefix_gate"])
 
     def test_ncm_detects_real_prefix_key_and_resets_false(self):
         for prefix in (True, False):
