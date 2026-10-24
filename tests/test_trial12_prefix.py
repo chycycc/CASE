@@ -129,6 +129,7 @@ class PrefixAttentionTests(unittest.TestCase):
                     holder = CASE.__new__(CASE)
                     nn.Module.__init__(holder)
                     holder.use_proto_prefix_gate = False
+                    holder.use_proto_prefix_norm = False
                     random = holder._build_proto_prefix_init()
                 self.assertTrue(torch.equal(before, torch.get_rng_state()))
                 self.assertFalse(torch.equal(e, random))
@@ -149,7 +150,9 @@ class PrefixAttentionTests(unittest.TestCase):
 
 
 class EvaluationAuditTests(unittest.TestCase):
-    def loader(self, file, fn, prefix, unexpected=(), gate=False, missing=(), declared_mode=None):
+    def loader(self, file, fn, prefix, unexpected=(), gate=False, missing=(), declared_mode=None,
+               norm_mode=None, norm_marker=False):
+        from src.utils.prefix_runtime import checkpoint_prefix_norm
         cfg = SimpleNamespace(device="cpu", use_proto_prefix=not prefix)
         state = {"model": {"epcl_criterion.prototypes": torch.zeros(32, 300),
                            "emotion_linear.weight": torch.zeros(32, 300)}}
@@ -159,6 +162,10 @@ class EvaluationAuditTests(unittest.TestCase):
             state["prefix_attention_mode"] = declared_mode
         if gate:
             state["model"]["decoder.dec.0.prefix_gate"] = torch.zeros(2)
+        if norm_mode is not None:
+            state["prefix_norm_mode"] = norm_mode
+        if norm_marker:
+            state["model"]["decoder.dec.0.prefix_norm_version"] = torch.tensor(1)
         class Model:
             epcl_criterion = object()
             def to(self, device): return self
@@ -167,6 +174,7 @@ class EvaluationAuditTests(unittest.TestCase):
             def load_state_dict(self, sd, strict):
                 return list(missing), list(unexpected)
         namespace = dict(os=os, config=cfg, torch=torch, CASE=lambda *a, **kw: Model(),
+                         checkpoint_prefix_norm=checkpoint_prefix_norm,
                          PROJECT_ROOT=str(ROOT), set_seed=lambda: None,
                          prepare_data_seq=lambda **kw: (None, None, None, None, 32, 8))
         loader = source_function(file, fn, namespace)
@@ -174,6 +182,20 @@ class EvaluationAuditTests(unittest.TestCase):
             with patch.object(torch, "load", return_value=state), contextlib.redirect_stdout(io.StringIO()):
                 result = loader(f.name)
         return cfg, result
+
+    def test_norm_metadata_and_marker_are_required_in_both_loaders(self):
+        from src.utils.prefix_runtime import PREFIX_NORM_MODE
+        for file, fn in [("src/scripts/eval_pipeline.py", "load_v8_model"),
+                         ("src/scripts/eval_prototype_ncm.py", "safe_load_checkpoint")]:
+            cfg, _ = self.loader(file, fn, True, gate=True,
+                                declared_mode="separate_softmax_residual", norm_mode=PREFIX_NORM_MODE, norm_marker=True)
+            self.assertTrue(cfg.use_proto_prefix_norm)
+            cfg, _ = self.loader(file, fn, True, gate=True)
+            self.assertFalse(cfg.use_proto_prefix_norm)
+            for mode, marker in [(PREFIX_NORM_MODE, False), (None, True), ("bad_mode", True)]:
+                with self.assertRaises(RuntimeError):
+                    self.loader(file, fn, True, gate=True, declared_mode="separate_softmax_residual",
+                                norm_mode=mode, norm_marker=marker)
 
     def test_gate_topology_is_detected_and_reset_in_both_loaders(self):
         for file, fn in [("src/scripts/eval_pipeline.py", "load_v8_model"),

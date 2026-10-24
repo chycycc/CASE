@@ -29,6 +29,7 @@ from src.models.common import (
     Attention
 )
 from src.utils.config import config
+from src.utils.prefix_runtime import PREFIX_NORM_MODE, FROZEN_INIT_SHA256, checkpoint_prefix_norm
 from src.utils.constants import ESC_MAP_EMO, ESC_MAP_STRATEGY, ED_MAP_EMO
 
 from sklearn.metrics import accuracy_score
@@ -745,6 +746,7 @@ class Decoder(nn.Module):
         proto_init=None,
         use_proto_prefix_gate=False,
         proto_prefix_gate_init=0.0,
+        use_proto_prefix_norm=False,
     ):
         """
         Parameters:
@@ -796,7 +798,8 @@ class Decoder(nn.Module):
                              proto_prefix_len=proto_prefix_len,
                              proto_init=proto_init,
                              use_proto_prefix_gate=use_proto_prefix_gate,
-                             proto_prefix_gate_init=proto_prefix_gate_init)
+                             proto_prefix_gate_init=proto_prefix_gate_init,
+                             use_proto_prefix_norm=use_proto_prefix_norm)
 
         if self.universal:
             self.dec = DecoderLayer(*params, **prefix_kwargs)
@@ -1294,9 +1297,20 @@ class CASE(nn.Module):
         
         # Decoder
         # [V9 T12] 原型注意力前缀初始化（开关关闭时 proto_init=None，零副作用）
+        direct_checkpoint = None
+        if model_file_path is not None:
+            direct_checkpoint = torch.load(model_file_path, map_location="cpu")
+            config.use_proto_prefix_norm = checkpoint_prefix_norm(direct_checkpoint)
+            if config.use_proto_prefix_norm:
+                config.use_proto_prefix = config.use_proto_prefix_gate = True
+                prefix_keys = [k for k in direct_checkpoint["model"] if k.endswith("prefix_embed")]
+                config.proto_prefix_len = direct_checkpoint["model"][prefix_keys[0]].shape[0]
         self.use_proto_prefix = getattr(config, 'use_proto_prefix', False)
         self.proto_prefix_len = getattr(config, 'proto_prefix_len', 4)
         self.use_proto_prefix_gate = getattr(config, 'use_proto_prefix_gate', False)
+        self.use_proto_prefix_norm = getattr(config, 'use_proto_prefix_norm', False)
+        if self.use_proto_prefix_norm and not (self.use_proto_prefix and self.use_proto_prefix_gate):
+            raise ValueError('use_proto_prefix_norm requires prefix and residual gate')
         if self.use_proto_prefix_gate and not self.use_proto_prefix:
             raise ValueError('use_proto_prefix_gate requires use_proto_prefix')
         proto_init_tensor = self._build_proto_prefix_init() if self.use_proto_prefix else None
@@ -1313,6 +1327,7 @@ class CASE(nn.Module):
             proto_init=proto_init_tensor,
             use_proto_prefix_gate=self.use_proto_prefix_gate,
             proto_prefix_gate_init=getattr(config, "proto_prefix_gate_init", 0.0),
+            use_proto_prefix_norm=self.use_proto_prefix_norm,
         )
         # [V9 T12] 生效打印延后到 __init__ 末尾：PCAM/generator/emo_bias 注册后总量统计才准确
         
@@ -1403,7 +1418,7 @@ class CASE(nn.Module):
         
         if model_file_path is not None:
             print("loading weights")
-            state = torch.load(model_file_path, map_location=config.device)
+            state = direct_checkpoint
             self.load_state_dict(state["model"])
             if load_optim:
                 self.optimizer.load_state_dict(state["optimizer"])
@@ -1427,9 +1442,12 @@ class CASE(nn.Module):
 
         # [V9 T12] 铁律 IV 生效打印：此处已注册全部模块（PCAM/generator/emo_bias），总参数统计才准确
         print(f"[Prefix Status] use_proto_prefix={self.use_proto_prefix}")
+        print(f"[Prefix Diagnostic Status] enabled={getattr(config, 'prefix_diagnostics', False)} | Valid first256/batch4")
         self.print_proto_prefix_gate_status(stage="constructor_pending_restore" if getattr(config, "test", False) else "initialized")
         if self.use_proto_prefix:
             self._print_proto_prefix_status()
+        if direct_checkpoint is not None:
+            self.print_proto_prefix_gate_status(stage="checkpoint_restored")
 
     def freeze_emo_head(self, step, best_state=None, best_step=None):
         """[V5 Trial 4b / V8 Trial 4: ACF-BCF] 冻结/软退火情感分类头，支持回滚至验证集历史最佳泛化权重并将退火起点锚定至 step"""
@@ -1465,7 +1483,14 @@ class CASE(nn.Module):
         mode = getattr(config, 'proto_prefix_init', 'proto')
         hidden = config.hidden_dim
 
-        if mode == "proto":
+        source = getattr(config, 'proto_prefix_source', 'ckpt')
+        if source == "frozen":
+            init = self._read_proto_prefix_npz(P, hidden)
+            actual_hash = hashlib.sha256(init.numpy().astype("float32").tobytes()).hexdigest()
+            if actual_hash != FROZEN_INIT_SHA256[mode]:
+                raise ValueError(f"Frozen {mode} initializer hash mismatch: {actual_hash}")
+            print(f"[V9 T12] frozen actual {mode} init={config.proto_prefix_init_npz}; tensor_sha256={actual_hash}")
+        elif mode == "proto":
             src = getattr(config, 'proto_prefix_source', 'ckpt')
             if src == "artifact":
                 init = self._read_proto_prefix_npz(P, hidden)
@@ -1499,6 +1524,7 @@ class CASE(nn.Module):
                     "actual_init_tensor_sha256": hashlib.sha256(init.numpy().astype("float32").tobytes()).hexdigest(),
                     "shape": list(init.shape), "row_l2": init.norm(dim=1).tolist(),
                     "use_proto_prefix_gate": self.use_proto_prefix_gate,
+                    "prefix_norm_mode": PREFIX_NORM_MODE if self.use_proto_prefix_norm else "none",
                     "gate_raw_init": float(getattr(config, "proto_prefix_gate_init", 0.0))}
         source_npz = metadata["source_npz"]
         if source_npz:
@@ -1532,6 +1558,8 @@ class CASE(nn.Module):
                  for name, param in self.named_parameters() if name.endswith("prefix_gate")}
         print(f"[Prefix Gate Status] stage={stage} | use_proto_prefix_gate={self.use_proto_prefix_gate} | "
               f"mode={'separate_softmax_residual' if self.use_proto_prefix_gate else 'legacy_joint_softmax' if self.use_proto_prefix else 'none'} | tanh_gate={gates}")
+        print(f"[Prefix Norm Status] stage={stage} | use_proto_prefix_norm={self.use_proto_prefix_norm} | "
+              f"mode={PREFIX_NORM_MODE if self.use_proto_prefix_norm else 'none'}")
 
     def _load_proto_from_ckpt(self):
         """A1：读先验 checkpoint 的训练后原型，形状 (32, 300)，带脏权重门限。
@@ -1686,6 +1714,7 @@ class CASE(nn.Module):
             "tag": tag,
             "prefix_attention_mode": ("separate_softmax_residual" if self.use_proto_prefix_gate
                                       else "legacy_joint_softmax" if self.use_proto_prefix else "none"),
+            "prefix_norm_mode": PREFIX_NORM_MODE if getattr(self, "use_proto_prefix_norm", False) else "none",
         }
         if tag:
             ckpt_name = "CASE_{}_{:.4f}_{}".format(iter, running_avg_ppl, tag)

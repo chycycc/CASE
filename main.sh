@@ -109,7 +109,7 @@ fi
 
 # Trial12 gate variants use this same entry point; no extra launcher.
 case "$EXP_NAME" in
-    v9_trial12_gate_proto|v9_trial12_gate_rand)
+    v9_trial12_gate_proto|v9_trial12_gate_rand|v9_trial12_gate_norm_proto|v9_trial12_gate_norm_rand)
         if [ -n "$EXTRA_FLAGS" ]; then
             echo "[T12] This named profile fixes EXTRA_FLAGS; unset inherited overrides first." >&2
             exit 1
@@ -118,21 +118,47 @@ case "$EXP_NAME" in
             echo "[T12] Output already exists: $EXP_NAME; refusing to overwrite." >&2
             exit 1
         fi
-        T12_INIT="${T12_INIT_NPZ:-save/v9_trial12/proto_prefix_init.npz}"
-        "$pythonpath" - "$T12_INIT" <<'PY'
+        T12_MODE=proto
+        case "$EXP_NAME" in *_rand) T12_MODE=random ;; esac
+        T12_SOURCE=artifact
+        T12_NORM_FLAGS=""
+        T12_DEFAULT_INIT="save/v9_trial12/proto_prefix_init.npz"
+        case "$EXP_NAME" in
+            v9_trial12_gate_norm_*)
+                T12_SOURCE=frozen
+                T12_NORM_FLAGS="--use_proto_prefix_norm --prefix_diagnostics"
+                T12_PARENT=v9_trial12_gate_proto
+                [ "$T12_MODE" = "random" ] && T12_PARENT=v9_trial12_gate_rand
+                T12_DEFAULT_INIT="save/${T12_PARENT}/proto_prefix_init.npz"
+                if [ ! -f "$T12_DEFAULT_INIT" ]; then
+                    T12_DEFAULT_INIT="results/cloud_archive/${T12_PARENT}/proto_prefix_init.npz"
+                fi
+                ;;
+        esac
+        T12_INIT="${T12_INIT_NPZ:-$T12_DEFAULT_INIT}"
+        "$pythonpath" - "$T12_INIT" "$T12_SOURCE" "$T12_MODE" <<'PY'
 import hashlib, pathlib, sys
 p = pathlib.Path(sys.argv[1])
 if not p.is_file():
-    raise FileNotFoundError("Original T12 initializer required: " + str(p))
-if hashlib.sha256(p.read_bytes()).hexdigest() != "341ce94027ce7af25bdb55f2f14cd2b8353098932f0ced76136575d9d908f898":
+    raise FileNotFoundError("Archived T12 initializer required: " + str(p))
+if sys.argv[2] == "frozen":
+    import numpy as np
+    # 预检只导入numpy；导入训练模块会额外加载CUDA动态库。
+    expected = {
+        "proto": "f061c61c9499c202e82586018cf6755364683c434ca013eafe6ec8b20d414169",
+        "random": "c079bcb310653061f3c704140eda6d367dffdaf3d309178066b571a355c0de94",
+    }
+    with np.load(str(p), allow_pickle=False) as data:
+        init = data["init"].astype("float32")
+    if init.shape != (4, 300) or hashlib.sha256(init.tobytes()).hexdigest() != expected[sys.argv[3]]:
+        raise RuntimeError("Actual initializer mismatch; do not regenerate either group")
+elif hashlib.sha256(p.read_bytes()).hexdigest() != "341ce94027ce7af25bdb55f2f14cd2b8353098932f0ced76136575d9d908f898":
     raise RuntimeError("T12 initializer hash mismatch; do not recompute KMeans")
-print("[T12] Frozen original initializer verified:", p)
+print("[T12] Frozen initializer verified:", p, "mode=" + sys.argv[3], "source=" + sys.argv[2])
 PY
-        T12_MODE=proto
-        [ "$EXP_NAME" = "v9_trial12_gate_rand" ] && T12_MODE=random
         T12_ARC_RAMP=2500
         [ "$ENV_MODE" = "4G" ] && T12_ARC_RAMP=20000
-        EXTRA_FLAGS="--max_grad_norm 6.0 --arc_margin_ramp_steps $T12_ARC_RAMP --use_proto_prefix --proto_prefix_len 4 --use_proto_prefix_gate --proto_prefix_gate_init 0.0 --proto_prefix_init $T12_MODE --proto_prefix_source artifact --proto_prefix_init_npz $T12_INIT"
+        EXTRA_FLAGS="--max_grad_norm 6.0 --arc_margin_ramp_steps $T12_ARC_RAMP --use_proto_prefix --proto_prefix_len 4 --use_proto_prefix_gate --proto_prefix_gate_init 0.0 --proto_prefix_init $T12_MODE --proto_prefix_source $T12_SOURCE --proto_prefix_init_npz $T12_INIT $T12_NORM_FLAGS"
         ;;
 esac
 
@@ -230,14 +256,14 @@ cp -f "${OUTPUT_DIR}/eval_metrics.json" "${DOWNLOAD_DIR}/" 2>/dev/null || true
 cp -f "results/v9/${EXP_NAME}_eval.txt" "${DOWNLOAD_DIR}/" 2>/dev/null || true
 cp -f "results/v9/${EXP_NAME}_manifold.png" "${DOWNLOAD_DIR}/" 2>/dev/null || true
 cp -f "results/v9/${EXP_NAME}_results.txt" "${DOWNLOAD_DIR}/" 2>/dev/null || true
-for INIT_FILE in proto_prefix_init.npz prefix_init_metadata.json; do
+for INIT_FILE in proto_prefix_init.npz prefix_init_metadata.json prefix_diagnostics.jsonl; do
     if [ -f "${OUTPUT_DIR}/${INIT_FILE}" ]; then
         cp -f "${OUTPUT_DIR}/${INIT_FILE}" "${DOWNLOAD_DIR}/"
     fi
 done
 if [ -f "${OUTPUT_DIR}/prefix_init_metadata.json" ]; then
     sha256sum "${OUTPUT_DIR}"/CASE_*_best > "${DOWNLOAD_DIR}/checkpoint_sha256.txt"
-    sha256sum main.sh main.py src/models/common.py src/models/CASE/model.py src/utils/config.py src/scripts/eval_pipeline.py > "${DOWNLOAD_DIR}/source_sha256.txt"
+    sha256sum main.sh main.py src/models/common.py src/models/CASE/model.py src/utils/config.py src/utils/prefix_runtime.py src/utils/data/loader.py src/scripts/eval_pipeline.py src/scripts/eval_prototype_ncm.py > "${DOWNLOAD_DIR}/source_sha256.txt"
 fi
 
 echo "======================================================================"

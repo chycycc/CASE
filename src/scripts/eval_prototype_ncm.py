@@ -35,6 +35,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.utils.config import config
+from src.utils.prefix_runtime import checkpoint_prefix_norm
 from src.utils.common import set_seed
 from src.models.CASE.model import CASE
 from src.utils.data.loader import prepare_data_seq
@@ -103,6 +104,8 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
         if bool(gate_keys) != (declared_mode == "separate_softmax_residual") or bool(prefix_keys) != (declared_mode != "none"):
             raise RuntimeError("Checkpoint prefix metadata/weights disagree; refusing topology fallback")
     config.use_proto_prefix_gate = bool(gate_keys)
+    config.use_proto_prefix_norm = checkpoint_prefix_norm(state)
+    print(f"    [拓扑识别] use_proto_prefix_norm={config.use_proto_prefix_norm}")
     print(f"    [拓扑识别] use_proto_prefix_gate={config.use_proto_prefix_gate}")
     config.use_erp = any("erp." in k for k in raw_keys)
     config.dataset = "ED"

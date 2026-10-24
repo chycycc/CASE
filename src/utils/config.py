@@ -261,10 +261,10 @@ def get_args():
                         choices=["proto", "random"],
                         help="[T12] 前缀初始化方式: proto(先验原型KMeans簇质心) / random(同尺度高斯,T12-C用)")
     parser.add_argument("--proto_prefix_init_npz", type=str, default="",
-                        help="[T12] random的尺度来源，或source=artifact时逐元素加载的原型npz路径")
+                        help="[T12] random尺度来源；artifact原型或frozen两组实际初值NPZ路径")
     parser.add_argument("--proto_prefix_source", type=str, default="ckpt",
-                        choices=["live", "ckpt", "artifact"],
-                        help="[T12/P8-A] 原型来源: ckpt(从显式先验checkpoint读训练后原型) / live(当前模型冷启动原型,已否决) / artifact(读取proto_prefix_init_npz原始张量)")
+                        choices=["live", "ckpt", "artifact", "frozen"],
+                        help="[T12/P8-A] ckpt先验 / live已否决 / artifact原型或随机尺度 / frozen两组实际初值按hash原样恢复")
     parser.add_argument("--proto_prefix_prior_path", type=str,
                         default="results/cloud_archive/v9_trial11_B_gnorm6/CASE_7499_37.5058_composite_best",
                         help="[T12/P8-A] 初始化原型来源 checkpoint（只读 prototypes，不加载其他参数）。"
@@ -274,6 +274,10 @@ def get_args():
                         help="[T12-G] Separate prefix softmax with zero-init per-head residual gate")
     parser.add_argument("--proto_prefix_gate_init", type=float, default=0.0,
                         help="[T12-G] Raw tanh gate initial value; 0 preserves text attention at initialization")
+    parser.add_argument("--use_proto_prefix_norm", action="store_true", default=False,
+                        help="[T12-N] Prefix standardization shares text gamma, excludes beta")
+    parser.add_argument("--prefix_diagnostics", action="store_true", default=False,
+                        help="[T12-N] State-isolated Valid first256/batch4 prefix observations")
     parser.add_argument("--skip_test", action="store_true", default=False,
                         help="是否跳过训练收尾时的 5255 样本全量生成测试（用于快速 dry run 验证）")
     # V9 大批次训练生命周期与早停步数重标定

@@ -1,42 +1,30 @@
-# Trial12 报告归档与当前执行
+# Trial12 报告归档与当前状态
 
-当前路线：seed13的前缀残差门控优化，暂不多种子。生产训练唯一入口为main.sh。最新原因、代码变更与验收证据见[04_gate_optimization.md](04_gate_optimization.md)。
+更新：2026-10-24。门控实验的正式结论见[05 门控结果审计](05_gate_results_audit.md)；新一轮归一化代码已完成本地验收，云端操作与证据统一见[07 实装与运行](07_prefix_norm_implementation.md)。新一轮尚无正式成绩。
 
-## 云端只做这几步
+## 当前结果
 
-代码推送v9-clean后，在现有CASE目录：
+Test N=5255、batch=1，样本macro PPL / 样本micro准确率 / EMO_loss：门控原型 **32.53 / 42.19% / 2.3939**，门控随机 **32.34 / 41.47% / 2.3910**。两组均未通过PPL≤32.56且Acc≥42.21%的冻结双门槛。原型相对随机的分类McNemar p=0.185761，先验额外价值未确认。
 
-~~~bash
-cd /root/autodl-tmp/CASE
-git pull --ff-only origin v9-clean
-bash main.sh 24G v9_trial12_gate_proto
-~~~
+正式Valid N=5734/batch32/macro/shuffleFalse；生成前N=500/batch1/max40，完整指标与取舍见05报告。原型ppl_best本地补评为32.44 /41.01%，更换检查点没有解决双目标问题。只读诊断另用Valid前N=256/batch4，两组实际前缀残差都极弱；这不是已证训练因果。
 
-完成后运行同seed对照：
+## 下一步
 
-~~~bash
-bash main.sh 24G v9_trial12_gate_rand
-~~~
+T11-B继续作为基线。下一轮按[06方案v3](06_prefix_norm_plan.md)检验前缀逐行标准化、共享正文gamma且不加beta，原型/随机各自复用上一轮实际初值。A选择双侧95%区间下界>−1.5pp的辅助预算；B四路RNG与模型状态隔离、C零门控原始梯度检查、D加权标签观测均已落地。多种子与旋转第三组本轮均不执行。
 
-无需额外启动脚本、补丁包或EXTRA_FLAGS。若shell中有遗留EXTRA_FLAGS，先unset EXTRA_FLAGS。原云端save/v9_trial12/proto_prefix_init.npz须保留，main.sh会验证它的SHA256；不重新聚类。命令固定batch32/accum1、FP32、clip6、Arc ramp2500、P4、PCAM，前缀增加两个零初始化gate，总参数30,337,459。
-
-结束后回传download/实验名/目录，以及save/实验名/下的composite_best和ppl_best两份权重。继续按原composite独立评测；PPL最优权重保留，本地需要时补评。云端不再执行额外工具链。
-
-## 当前判断与验收
-
-- 已确认交付对选择器敏感：T12原composite=32.952267/41.43%，ppl_best=32.571706/42.57%（Test N5255/batch1/macro PPL、样本级Acc）；后者仍未过冻结PPL≤32.56门槛。
-- 机制诊断只覆盖Valid前N256/batch4，发现head分配差异与K/V尺度差；不是已证训练退化原因。新机制为独立softmax+零初始化的逐head残差门控，尚无新正式Test成绩。
-- 22项串行回归与两组最终源码CASE短烟测通过。短烟测Train/Valid各N32、batch4/accum8、3次主阶段更新，Test未测、生成N0；不当作正式性能。
-- 正式判据与口径保持：Test N5255/batch1/macro PPL≤32.56且样本Acc≥42.21%；Valid N5734/batch32/macro、shuffleFalse；生成N500/batch1。Test_MIM_loss不进表。
+四组本地各100次更新、30项回归及8种启动配置预检通过；训练N32/batch4/accum8，诊断Valid前N256/batch4，Test N0、生成N0。主入口仍为main.sh，两个新命名配置为`v9_trial12_gate_norm_proto`、`v9_trial12_gate_norm_rand`；完整拉取/启动/回传步骤见07。旧门控命令保留在04作为历史，已有输出不得覆盖。
 
 ## 报告索引
 
 | 文档 | 用途 |
 | :--- | :--- |
-| [04 门控优化](04_gate_optimization.md) | 当前原因判断、代码变更、验收和下一轮判读 |
-| [03 本地五权重补评](03_local_eval_audit.md) | 选择器敏感性、配对检验与区间 |
+| [07 实装与运行](07_prefix_norm_implementation.md) | 当前代码改动、本地验收证据、云端main.sh命令与回传清单 |
+| [06 前缀归一化方案](06_prefix_norm_plan.md) | v3事前判据、唯一变量、固定公式、控制条件；实装已完成 |
+| [05 门控结果审计](05_gate_results_audit.md) | 当前正式结论、配对检验、检查点补评、机制诊断与下一步 |
+| [04 门控优化](04_gate_optimization.md) | 2026-10-21的机制方案、代码变更、工程验收和原启动命令 |
+| [03 本地五权重补评](03_local_eval_audit.md) | 旧版选择器敏感性与配对区间 |
 | [02 首轮正式审计](02_formal_audit.md) | 原T12/C首轮云端结果与轨迹 |
-| [01 P9本地复验](01_local_validation.md) | 历史代码路径验证，不是正式成绩 |
-| [方案文档](../../plans/v9_trial12_upgrade_plan.md) | 事前计划和接口历史 |
+| [01 P9本地复验](01_local_validation.md) | 历史代码路径验证 |
+| [方案文档](../../plans/v9_trial12_upgrade_plan.md) | 事前判据和接口历史 |
 
-临时脚本统一在scratch/trial12/，实测产物在results/v9/，生产代码只保留训练模型和正式评测入口。旧补丁包/额外启动器流程已撤回，不再使用。
+原始回传在results/cloud_archive/；门控审计证据在results/v9/trial12_gate_audit/，归一化工程验收在results/v9/trial12_norm_validation/。临时脚本统一在scratch/trial12/，不放入src/scripts生产目录。

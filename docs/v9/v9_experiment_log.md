@@ -847,3 +847,22 @@ $\arg\max_c(\mathrm{sim} / \tau) \equiv \arg\max_c(\mathrm{sim})$ 对任意 $\ta
 - 云端入口已简化为main.sh 24G v9_trial12_gate_proto / v9_trial12_gate_rand，主composite不变，ppl_best回传后按需本地补评；[原因与实施](E:/github/CASE/docs/v9/reports/trial12/04_gate_optimization.md)。产物证据results/v9/trial12_gate_validation/。无commit、未改.agents/rules/。
 
 - **交付流程修订**：按用户要求，只使用Git拉取与main.sh；临时脚本移至scratch/trial12/，报告集中到docs/v9/reports/trial12/。旧补丁包与额外启动器已撤回。
+
+### 11.4 Trial12 门控正式回传与补评（2026-10-23）
+
+- 已回传`results/cloud_archive/v9_trial12_gate_proto/`及`v9_trial12_gate_rand/`，包括两组完整日志、实际初始化、四份权重和源码/权重SHA清单；6个清单源文件匹配已交付23a8afa，4/4权重哈希通过。两组配置除初始化内容与输出路径外一致。详见[05门控结果审计](reports/trial12/05_gate_results_audit.md)。
+- 正式Test N5255/batch1/macro PPL与样本级Acc/EMO_loss：原型 **32.53 /42.19% /2.3939**，随机 **32.34 /41.47% /2.3910**，均未通过冻结双门槛；正确数分别2217、2179，B为2218。原型相对随机独对410/372，真实McNemar双侧p=0.185761，ΔAcc+0.7231pp、逐样本95%区间[−0.3197,+1.7659]pp，尚未确认先验增益。
+- 正式Valid N5734/batch32/macro/shuffleFalse；原型−随机全20点8好/12差，描述性符号p=0.503445；Test PPL+0.19处于原0.10/0.20经验线之间，不能判平台等价或稳定结构性差异。
+- 正式生成前N500/batch1/max40：原型Greedy Dist-2/Unique、Beam Dist-2/Unique为18.77/64.80/13.34/44.60%；随机18.10/59.00/13.03/39.00%。相对B方向存在取舍，不以PPL一项宣称整体质量提升。
+- 三份不同模型已本地完整Test补评（同N5255/batch1，生成N0）：原型composite32.529411/42.19%，原型ppl_best32.443233/41.01%，随机32.347186/41.47%。两组主模型分类预测各与云端5255/5255一致，PPL末位有跨环境差异，正式主表仍使用云端值。随机两种best文件的模型tensor完全相同；原型切换ppl_best少答对62条，不能靠换检查点解决。
+- 本地只读诊断Valid前N256/batch4：原型、随机前缀残差/正文context范数比均值分别8.471e−6、9.661e−6；观察包装与重建注意力输出精确一致，权重哈希不变。说明该切片内直接信号很弱，不是训练因果证明。候选下一步是仅检验前缀输入归一化尺度，未实装、未启动；暂不重复当前配置或做多种子。
+- 证据统一在`results/v9/trial12_gate_audit/`，只读工具在`scratch/trial12/`。本轮未修改生产模型或main.sh，未提交Git、未改审计规则。此前§11.3“尚未正式训练”是2026-10-21历史状态。
+
+### 11.5 Trial12 前缀标准化实装与工程验收（2026-10-24）
+
+- 基于23a8afa新增共享正文gamma、无beta的前缀逐行标准化；原型/随机各自冻结复用上一轮实际初值，不再聚类或抽样。可学习参数四组均30,337,459。新命名配置`v9_trial12_gate_norm_proto`、`v9_trial12_gate_norm_rand`统一走main.sh；[事前方案v3](reports/trial12/06_prefix_norm_plan.md)、[实施与云端步骤](reports/trial12/07_prefix_norm_implementation.md)。
+- 第二轮审查决策：A采用配对Acc双侧95%区间下界>−1.5pp作为额外研究预算；B四路RNG与模型状态隔离；C检查零门控时每个损失分支在PCGrad和裁剪前的原始非门控梯度；D增加样本等权、类频加权的情绪标签选择观测，仅描述。主线冻结双门槛不变。
+- 本地四组proto/off、proto/on、random/off、random/on均完成训练前N32/batch4/accum8、4轮预训练及100次主更新；固定诊断Valid前N256/batch4、每组5点。公共初始化与预训练末权重哈希一致；两对首步loss和非门控原始梯度一致；prefix更新、四路RNG恢复与真实checkpoint评测恢复均通过。Test N0、生成N0。
+- 诊断按非padding head-query等权平均：100次更新后H为proto off/on 1.377921/0.560703、random off/on 1.378547/0.493383；R为0.00008023/0.01437383、0.00031295/0.01200702。共256样本、每头4160个query；该局部工程对照仅证实支路行为变化，不能预测正式任务收益。
+- 30项回归、8组新旧启动配置、7个生产文件py_compile及bash语法检查通过。证据`results/v9/trial12_norm_validation/verification.json`、`profile_checks.json`；临时工具仍在`scratch/trial12/`，生产诊断支持在`src/utils/prefix_runtime.py`。
+- 云端新轮尚未运行；正式口径保持Test N5255/batch1/样本macro PPL与micro Acc、Valid N5734/batch32/batch macro/shuffleFalse、生成前N500/batch1/max40。此前§11.4“未实装”保留为门控结果审计时点，不代表当前代码状态。

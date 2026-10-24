@@ -127,6 +127,7 @@ class DecoderLayer(nn.Module):
         proto_init=None,
         use_proto_prefix_gate=False,
         proto_prefix_gate_init=0.0,
+        use_proto_prefix_norm=False,
     ):
         """
         Parameters:
@@ -202,6 +203,11 @@ class DecoderLayer(nn.Module):
         # [V9 T12] 原型初始化的可学习注意力前缀
         self.use_proto_prefix = use_proto_prefix
         self.use_proto_prefix_gate = use_proto_prefix_gate
+        self.use_proto_prefix_norm = use_proto_prefix_norm
+        if use_proto_prefix_norm and not (use_proto_prefix and use_proto_prefix_gate):
+            raise ValueError("Prefix normalization requires prefix and residual gate")
+        if use_proto_prefix_norm:
+            self.register_buffer("prefix_norm_version", torch.tensor(1, dtype=torch.int64))
         if use_proto_prefix_gate and not use_proto_prefix:
             raise ValueError("Prefix gate requires use_proto_prefix=True")
         if not math.isfinite(proto_prefix_gate_init):
@@ -232,6 +238,8 @@ class DecoderLayer(nn.Module):
 
         # Layer Normalization before decoder self attention
         x_norm = self.layer_norm_mha_dec(x)
+        if self.use_proto_prefix_norm:
+            extra_kv = self.layer_norm_mha_dec(extra_kv, add_bias=False)
 
         # Masked Multi-head attention（前缀注入点：self-attention K/V 拼接）
         prefix_gate = self.prefix_gate.tanh() if self.use_proto_prefix_gate else None
@@ -619,6 +627,9 @@ class MultiHeadAttention(nn.Module):
         prefix_context = torch.matmul(self.dropout(prefix_weights), pv)
         contexts = text_context + gate.to(dtype=q.dtype).view(1, self.num_heads, 1, 1) * prefix_context
         outputs = self.output_linear(self._merge_heads(contexts))
+        observer = getattr(self, "_prefix_observer", None)
+        if observer is not None:
+            observer(prefix_weights, text_context, prefix_context, gate)
         return outputs, text_logits.sum(dim=1) / self.num_heads
 
 
@@ -721,10 +732,11 @@ class LayerNorm(nn.Module):
         self.beta = nn.Parameter(torch.zeros(features))
         self.eps = eps
 
-    def forward(self, x):
+    def forward(self, x, add_bias=True):
         mean = x.mean(-1, keepdim=True)
         std = x.std(-1, keepdim=True)
-        return self.gamma * (x - mean) / (std + self.eps) + self.beta
+        normalized = self.gamma * (x - mean) / (std + self.eps)
+        return normalized + self.beta if add_bias else normalized
 
 
 def _gen_bias_mask(max_length):

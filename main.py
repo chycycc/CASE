@@ -11,6 +11,7 @@ from src.utils.common import set_seed
 from src.models.CASE.model import CASE
 from src.utils.data.loader import prepare_data_seq
 from src.models.common import evaluate, count_parameters, make_infinite
+from src.utils.prefix_runtime import observe_prefix
 
 def make_model(vocab, emo_num, strategy_num):
     is_eval = config.test
@@ -135,6 +136,9 @@ def train(model, train_set, dev_set):
                 bow_loss_val, kl_loss_val, mim_loss_val, ctx_loss_val, ppl_val, str_loss_val, str_acc_val, emo_loss_val, emo_acc_val, _ = evaluate(
                     model, dev_set, ty="valid", max_dec_step=50
                 )
+                if getattr(config, "prefix_diagnostics", False):
+                    observe_prefix(model, dev_set, n_iter,
+                                   output_path=os.path.join(config.save_path, "prefix_diagnostics.jsonl"))
                 writer.add_scalars("bow_loss", {"bow_loss_valid": bow_loss_val}, n_iter)
                 writer.add_scalars("kl_loss", {"kl_loss_valid": kl_loss_val}, n_iter)
                 writer.add_scalars("mim_loss", {"mim_loss_valid": mim_loss_val}, n_iter)
