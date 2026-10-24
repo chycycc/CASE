@@ -10,10 +10,73 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 PREFIX_NORM_MODE = "shared_gamma_std_no_beta_v1"
+DEC_EMO_HEAD_MODE = "separate_linear_v1"
 FROZEN_INIT_SHA256 = {
     "proto": "f061c61c9499c202e82586018cf6755364683c434ca013eafe6ec8b20d414169",
     "random": "c079bcb310653061f3c704140eda6d367dffdaf3d309178066b571a355c0de94",
 }
+
+
+def checkpoint_separate_dec_emo_head(checkpoint):
+    """识别并交叉校验检查点中的独立解码端情绪分类头拓扑与元数据（铁律 IV）。"""
+    state = checkpoint.get("model", checkpoint)
+    dec_keys = {k for k in state if k.startswith("dec_emotion_linear.")}
+    mode = checkpoint.get("dec_emo_head_mode")
+    if mode not in (None, "shared", DEC_EMO_HEAD_MODE):
+        raise RuntimeError("Unknown checkpoint dec_emo_head_mode: " + str(mode))
+    if dec_keys:
+        expected_keys = {"dec_emotion_linear.weight", "dec_emotion_linear.bias"}
+        if dec_keys != expected_keys:
+            raise RuntimeError("Incomplete or unexpected dec_emotion_linear keys: " + str(sorted(dec_keys)))
+        if mode == "shared":
+            raise RuntimeError("Checkpoint dec_emo_head_mode='shared' contradicts dec_emotion_linear weights")
+        w_dec = state["dec_emotion_linear.weight"]
+        b_dec = state["dec_emotion_linear.bias"]
+        if not (isinstance(w_dec, torch.Tensor) and isinstance(b_dec, torch.Tensor)
+                and w_dec.ndim == 2 and b_dec.ndim == 1 and w_dec.size(0) == b_dec.size(0)
+                and torch.isfinite(w_dec).all() and torch.isfinite(b_dec).all()):
+            raise RuntimeError("Invalid dec_emotion_linear tensor shape or non-finite values")
+        if "emotion_linear.weight" in state and "emotion_linear.bias" in state:
+            if (tuple(w_dec.shape) != tuple(state["emotion_linear.weight"].shape)
+                    or tuple(b_dec.shape) != tuple(state["emotion_linear.bias"].shape)):
+                raise RuntimeError("dec_emotion_linear shape mismatch against emotion_linear")
+        return True
+    if mode == DEC_EMO_HEAD_MODE:
+        raise RuntimeError("Checkpoint dec_emo_head_mode='separate_linear_v1' missing dec_emotion_linear weights")
+    return False
+
+
+@torch.no_grad()
+def compute_dec_emo_head_divergence(model):
+    """只读计算主分类头与解码端辅助分类头的逐行余弦相似度及参数偏离度。"""
+    if getattr(model, "use_separate_dec_emo_head", False) and getattr(model, "dec_emotion_linear", None) is not None:
+        w_enc = model.emotion_linear.weight.detach().double()
+        w_dec = model.dec_emotion_linear.weight.detach().double()
+        b_enc = model.emotion_linear.bias.detach().double()
+        b_dec = model.dec_emotion_linear.bias.detach().double()
+        cos = torch.nn.functional.cosine_similarity(w_enc, w_dec, dim=-1)
+        if not torch.isfinite(cos).all():
+            raise RuntimeError("Non-finite cosine similarity between emotion_linear and dec_emotion_linear")
+        return {
+            "head_mode": DEC_EMO_HEAD_MODE,
+            "row_cosine_mean": float(cos.mean().item()),
+            "row_cosine_median": float(torch.quantile(cos, 0.5).item()),
+            "row_cosine_min": float(cos.min().item()),
+            "row_cosine_max": float(cos.max().item()),
+            "bias_l2_distance": float(torch.norm(b_enc - b_dec, p=2).item()),
+            "weight_max_abs_diff": float((w_enc - w_dec).abs().max().item()),
+            "bias_max_abs_diff": float((b_enc - b_dec).abs().max().item()),
+        }
+    return {
+        "head_mode": "shared",
+        "row_cosine_mean": 1.0,
+        "row_cosine_median": 1.0,
+        "row_cosine_min": 1.0,
+        "row_cosine_max": 1.0,
+        "bias_l2_distance": 0.0,
+        "weight_max_abs_diff": 0.0,
+        "bias_max_abs_diff": 0.0,
+    }
 
 
 def checkpoint_prefix_norm(checkpoint):
@@ -78,7 +141,7 @@ def isolated_model_observation(model):
               for p in model.parameters()]
     buffers = [(m, name, b, b.detach().clone()) for m in model.modules()
                for name, b in m._buffers.items() if b is not None]
-    attrs = ("word_freq", "current_pred_emotion", "current_projected_emotion", "current_emo_vocab_bias")
+    attrs = ("word_freq", "current_pred_emotion", "current_projected_emotion", "current_emo_vocab_bias", "_last_eval_dec_emo_stats")
     present = {k: hasattr(model, k) for k in attrs}
     saved = {k: copy.deepcopy(getattr(model, k)) for k in attrs if present[k]}
     try:

@@ -1,0 +1,71 @@
+{
+  "scope": "Train first32, four pretrain epochs, batch4/accum1, first main update; independent replay",
+  "environment": {
+    "python": "3.8.20 (default, Oct  3 2024, 15:19:54) [MSC v.1929 64 bit (AMD64)]",
+    "torch": "1.12.1+cu113",
+    "cuda": "11.3",
+    "gpu": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+    "zero_grad_signature": "(set_to_none: bool = False)"
+  },
+  "stages": {
+    "before_projection": {
+      "grads_gen": {
+        "common_parameter_count": 161,
+        "max_abs_error": 0.0
+      },
+      "grads_emo": {
+        "common_parameter_count": 155,
+        "max_abs_error": 0.0
+      },
+      "shared_head_names_off": [],
+      "shared_head_names_on": []
+    },
+    "after_projection": {
+      "grads_gen": {
+        "common_parameter_count": 161,
+        "max_abs_error": 0.0
+      },
+      "grads_emo": {
+        "common_parameter_count": 155,
+        "max_abs_error": 0.0
+      },
+      "shared_head_names_off": [],
+      "shared_head_names_on": []
+    }
+  },
+  "loss_abs_errors": {
+    "bow_loss": 0.0,
+    "kl_loss": 0.0,
+    "mim_loss": 0.0,
+    "ctx_loss": 0.0,
+    "div_loss": 0.0,
+    "emotion_loss": 0.0,
+    "emotion_loss_raw": 0.0,
+    "epcl_loss": 0.0,
+    "dec_emo_loss": 0.0,
+    "loss_gen": 0.0,
+    "loss_emo": 0.0
+  },
+  "local_post_update_default_zero_grad_probe": {
+    "off": {
+      "emotion_linear.weight": false,
+      "emotion_linear.bias": false
+    },
+    "on": {
+      "emotion_linear.weight": false,
+      "emotion_linear.bias": false,
+      "dec_emotion_linear.weight": false,
+      "dec_emotion_linear.bias": false
+    }
+  },
+  "source_sha256": {
+    "main.py": "8680120d7aeed5f0b631d14ef61b21412b6163fb680c9c40c8623f7bd13689a8",
+    "main.sh": "bc83e945976b14becb02c8f6b9423edf00148a09aa09ceab598d0e10e8feb30f",
+    "src/models/CASE/model.py": "ed43d6d7f3d11b137eb93deb34bdb5f7761d7fed3fe06e753c8f55f9957605a4",
+    "src/models/common.py": "d369763a2a6e25318796967a946ec33a7af092ce3341f29c05fc8bbc43fc292d",
+    "src/utils/config.py": "8e1467179d4456dbe59495ddae4c5324ce93612cd510a10f5d63a770f84b736a",
+    "src/utils/prefix_runtime.py": "6333819640a534bd9a5e281d6256632c06b195d161e1c700200e8db9a5ab9f22",
+    "src/scripts/eval_pipeline.py": "e6881f1f4ebfb4f06b94187e18c74fdde0cb165877c89059f58281ec39bedd0c",
+    "src/scripts/eval_prototype_ncm.py": "478a04c9eedebdd5b1f7584c03a9bbd4b6eceada102c138528812ebc4f643bb3"
+  }
+}

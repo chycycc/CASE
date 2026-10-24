@@ -32,9 +32,18 @@ def make_model(vocab, emo_num, strategy_num):
         for n, p in model.named_parameters():
             # [V9 T12 / 关键修复] prefix_embed 必须排除：它是原型先验初始化（KMeans 簇质心），
             # 被 xavier_uniform_ 覆盖后两个实验会退化成同一随机前缀，T12-C 对照失效。
+            # [V10 T1 / 关键隔离] dec_emotion_linear. 必须排除，防止消耗全局 RNG 并保证与主头同源复制。
             if p.dim() > 1 and (n != "embedding.lut.weight" and config.pretrain_emb) \
-                    and "prefix_embed" not in n and not n.endswith("prefix_gate"):
+                    and "prefix_embed" not in n and not n.endswith("prefix_gate") \
+                    and not n.startswith("dec_emotion_linear."):
                 xavier_uniform_(p)
+        if getattr(model, "use_separate_dec_emo_head", False):
+            with torch.no_grad():
+                model.dec_emotion_linear.load_state_dict(model.emotion_linear.state_dict())
+            if not (torch.equal(model.dec_emotion_linear.weight, model.emotion_linear.weight)
+                    and torch.equal(model.dec_emotion_linear.bias, model.emotion_linear.bias)):
+                raise RuntimeError("[FATAL V10 T1] dec_emotion_linear 与 emotion_linear 初始权重未逐位对齐")
+            model.print_dec_emo_head_status(stage="post_make_model")
         for n, p in model.named_parameters():
             if n in prefix_before_init:
                 if not torch.equal(p.detach(), prefix_before_init[n]):
@@ -133,6 +142,7 @@ def train(model, train_set, dev_set):
                 model.eval()
                 model.epoch = n_iter
                 model.print_proto_prefix_gate_status()
+                model.print_dec_emo_head_status(stage=f"valid_step_{n_iter}")
                 bow_loss_val, kl_loss_val, mim_loss_val, ctx_loss_val, ppl_val, str_loss_val, str_acc_val, emo_loss_val, emo_acc_val, _ = evaluate(
                     model, dev_set, ty="valid", max_dec_step=50
                 )
@@ -315,11 +325,12 @@ def test(model, test_set):
             f.write(r)
     print(f"[*] 实验权重目录测试结果已保存至: {file_summary}")
 
-    # 2. 同步独立存档至 results/v9/ (例如 results/v9/v9_trial2_results.txt)，彻底消除覆盖混淆
+    # 2. 同步独立存档至 results/v10/ 或 results/v9/，按实验代号前缀自动路由
     exp_name = getattr(config, 'exp_name', None) or os.path.basename(os.path.normpath(config.save_path))
-    results_v9_dir = os.path.join("results", "v9")
-    os.makedirs(results_v9_dir, exist_ok=True)
-    exp_results_file = os.path.join(results_v9_dir, f"{exp_name}_results.txt")
+    series_subdir = "v10" if str(exp_name).startswith("v10_") else "v9"
+    results_series_dir = os.path.join("results", series_subdir)
+    os.makedirs(results_series_dir, exist_ok=True)
+    exp_results_file = os.path.join(results_series_dir, f"{exp_name}_results.txt")
     try:
         shutil.copyfile(file_summary, exp_results_file)
         print(f"[*] 实验全量测试生成记录已同步持久化至: {exp_results_file}")

@@ -1,6 +1,7 @@
 ### MOST OF IT TAKEN FROM https://github.com/kolloldas/torchnlp
 ## MINOR CHANGES
 import os
+import json
 import math
 import torch
 import numpy as np
@@ -1085,6 +1086,10 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
     emo_loss = []
     emo_acc = []
     epcl_loss_list = []
+    dec_emo_ce_batches = []
+    dec_emo_ce_sum = 0.0
+    dec_emo_correct_sum = 0
+    dec_emo_sample_count = 0
     
     pbar = tqdm(enumerate(data), total=len(data))
 
@@ -1096,6 +1101,12 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
                 bow, kl, mim, ctx, ppl, strat_l, acc, emotion, emotion_acc, epcl, dec_emo = model.train_one_batch(
                     batch, 0, train=False
                 )
+                if getattr(model, "_last_eval_dec_emo_stats", None) is not None:
+                    stats = model._last_eval_dec_emo_stats
+                    dec_emo_ce_batches.append(float(stats["batch_ce"]))
+                    dec_emo_ce_sum += float(stats["ce_sum"])
+                    dec_emo_correct_sum += int(stats["correct"])
+                    dec_emo_sample_count += int(stats["batch_size"])
             else:
                 # loss, ppl, bce_prog, acc_prog = model.train_one_batch(batch, 0, train=False)
                 raise ValueError(config.model + " Error!")
@@ -1165,6 +1176,33 @@ def evaluate(model, data, ty="valid", max_dec_step=30):
 
     print("EVAL\tBOW_Loss\tKL_Loss\tMIM_Loss\tCTX_Loss\tPPL\tSTR_loss\tSTR_acc\tEMO_loss\tEMO_acc\tEPCL_loss\n")
     print("{}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\t{:.4f}\n".format(ty, bow_loss, kl_loss, mim_loss, ctx_loss, math.exp(ctx_loss), str_loss, str_acc, emo_loss, emo_acc, epcl_loss_val))
+
+    if ty == "valid" and config.model == "case" and dec_emo_sample_count > 0:
+        from src.utils.prefix_runtime import compute_dec_emo_head_divergence
+        div_info = compute_dec_emo_head_divergence(model)
+        diag_record = {
+            "step": int(getattr(model, "epoch", 0)),
+            "scope": {
+                "split": "Valid full",
+                "evaluated_n": int(dec_emo_sample_count),
+                "num_batches": int(len(dec_emo_ce_batches)),
+                "batch_size": getattr(data, "batch_size", None),
+                "teacher_forcing": True,
+                "training": False,
+            },
+            "dec_emo_ce_sample_mean": float(dec_emo_ce_sum / dec_emo_sample_count),
+            "dec_emo_ce_batch_macro": float(np.mean(dec_emo_ce_batches)),
+            "dec_emo_acc_sample_micro": float(dec_emo_correct_sum / dec_emo_sample_count),
+            "dec_emo_correct": int(dec_emo_correct_sum),
+            "head_divergence": div_info,
+        }
+        save_dir = getattr(config, "save_path", None)
+        if save_dir:
+            os.makedirs(save_dir, exist_ok=True)
+            diag_path = os.path.join(save_dir, "dec_emo_diagnostics.jsonl")
+            with open(diag_path, "a", encoding="utf-8") as df:
+                df.write(json.dumps(diag_record, ensure_ascii=False) + "\n")
+        print("[Dec Emo Diagnostic] " + json.dumps(diag_record, ensure_ascii=False))
     
     return bow_loss, kl_loss, mim_loss, ctx_loss, math.exp(ctx_loss), str_loss, str_acc, emo_loss, emo_acc, results
 

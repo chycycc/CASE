@@ -1,0 +1,2 @@
+a90fb4556362656b7bc71330f811e475ae64bec5a150b3b1f8a9773cb48fd51a *E:/github/CASE/results/v10/trial1_correction/smoke_on/CASE_399_671.7620_composite_best
+89c659ca6403e7e4975f1838ebb888a4f370a195f93115a169d8ff5f30b6a3ff *E:/github/CASE/results/v10/trial1_correction/smoke_on/CASE_399_671.7620_ppl_best

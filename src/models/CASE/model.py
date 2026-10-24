@@ -29,7 +29,15 @@ from src.models.common import (
     Attention
 )
 from src.utils.config import config
-from src.utils.prefix_runtime import PREFIX_NORM_MODE, FROZEN_INIT_SHA256, checkpoint_prefix_norm
+from src.utils.prefix_runtime import (
+    PREFIX_NORM_MODE,
+    DEC_EMO_HEAD_MODE,
+    FROZEN_INIT_SHA256,
+    checkpoint_prefix_norm,
+    checkpoint_separate_dec_emo_head,
+    isolated_rng,
+    compute_dec_emo_head_divergence,
+)
 from src.utils.constants import ESC_MAP_EMO, ESC_MAP_STRATEGY, ED_MAP_EMO
 
 from sklearn.metrics import accuracy_score
@@ -1301,6 +1309,7 @@ class CASE(nn.Module):
         if model_file_path is not None:
             direct_checkpoint = torch.load(model_file_path, map_location="cpu")
             config.use_proto_prefix_norm = checkpoint_prefix_norm(direct_checkpoint)
+            config.use_separate_dec_emo_head = checkpoint_separate_dec_emo_head(direct_checkpoint)
             if config.use_proto_prefix_norm:
                 config.use_proto_prefix = config.use_proto_prefix_gate = True
                 prefix_keys = [k for k in direct_checkpoint["model"] if k.endswith("prefix_embed")]
@@ -1392,6 +1401,17 @@ class CASE(nn.Module):
         self.activation = nn.Softmax(dim=1)
         self.tanh = nn.Tanh()
         self.dropout = nn.Dropout(config.dropout)
+
+        # [V10 Trial 1] 解码端辅助情绪分类独立线性头（构造期使用 isolated_rng 保护，不消耗全局 RNG）
+        self.use_separate_dec_emo_head = bool(getattr(config, "use_separate_dec_emo_head", False))
+        if self.use_separate_dec_emo_head:
+            if getattr(config, "emotion_head_type", "linear") == "residual_mlp":
+                raise ValueError("use_separate_dec_emo_head 仅支持标准线性分类头 (emotion_head_type='linear')")
+            with isolated_rng():
+                self.dec_emotion_linear = nn.Linear(config.emb_dim, self.emotion_num)
+        else:
+            self.dec_emotion_linear = None
+        self._last_eval_dec_emo_stats = None
         
         if config.weight_sharing:
             self.generator.proj.weight = self.embedding.lut.weight
@@ -1444,10 +1464,12 @@ class CASE(nn.Module):
         print(f"[Prefix Status] use_proto_prefix={self.use_proto_prefix}")
         print(f"[Prefix Diagnostic Status] enabled={getattr(config, 'prefix_diagnostics', False)} | Valid first256/batch4")
         self.print_proto_prefix_gate_status(stage="constructor_pending_restore" if getattr(config, "test", False) else "initialized")
+        self.print_dec_emo_head_status(stage="constructor_pending_restore" if getattr(config, "test", False) else "initialized")
         if self.use_proto_prefix:
             self._print_proto_prefix_status()
         if direct_checkpoint is not None:
             self.print_proto_prefix_gate_status(stage="checkpoint_restored")
+            self.print_dec_emo_head_status(stage="checkpoint_restored")
 
     def freeze_emo_head(self, step, best_state=None, best_step=None):
         """[V5 Trial 4b / V8 Trial 4: ACF-BCF] 冻结/软退火情感分类头，支持回滚至验证集历史最佳泛化权重并将退火起点锚定至 step"""
@@ -1560,6 +1582,19 @@ class CASE(nn.Module):
               f"mode={'separate_softmax_residual' if self.use_proto_prefix_gate else 'legacy_joint_softmax' if self.use_proto_prefix else 'none'} | tanh_gate={gates}")
         print(f"[Prefix Norm Status] stage={stage} | use_proto_prefix_norm={self.use_proto_prefix_norm} | "
               f"mode={PREFIX_NORM_MODE if self.use_proto_prefix_norm else 'none'}")
+
+    def print_dec_emo_head_status(self, stage="current"):
+        """[V10 T1 / 铁律 IV] 显式打印解码端辅助情绪分类头启用状态、新增参数量与两头偏离度。"""
+        dec_params = (sum(p.numel() for p in self.dec_emotion_linear.parameters() if p.requires_grad)
+                      if (getattr(self, "use_separate_dec_emo_head", False) and getattr(self, "dec_emotion_linear", None) is not None)
+                      else 0)
+        total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        div = compute_dec_emo_head_divergence(self)
+        print(
+            f"[Dec Emo Head Status] stage={stage} | use_separate_dec_emo_head={self.use_separate_dec_emo_head} | "
+            f"mode={div['head_mode']} | added_params={dec_params} | total_trainable_params={total_params} | "
+            f"row_cos_mean={div['row_cosine_mean']:.6f} | max_abs_diff={div['weight_max_abs_diff']:.6e}"
+        )
 
     def _load_proto_from_ckpt(self):
         """A1：读先验 checkpoint 的训练后原型，形状 (32, 300)，带脏权重门限。
@@ -1715,6 +1750,7 @@ class CASE(nn.Module):
             "prefix_attention_mode": ("separate_softmax_residual" if self.use_proto_prefix_gate
                                       else "legacy_joint_softmax" if self.use_proto_prefix else "none"),
             "prefix_norm_mode": PREFIX_NORM_MODE if getattr(self, "use_proto_prefix_norm", False) else "none",
+            "dec_emo_head_mode": DEC_EMO_HEAD_MODE if getattr(self, "use_separate_dec_emo_head", False) else "shared",
         }
         if tag:
             ckpt_name = "CASE_{}_{:.4f}_{}".format(iter, running_avg_ppl, tag)
@@ -2363,13 +2399,31 @@ class CASE(nn.Module):
             )
             div_loss /= target_tokens
         
-            # [V4 Trial 8] Decoder MIM Loss (全周期软约束激活，修复分类头冻结后断开的 Bug)
+            # [V4 Trial 8 / V10 Trial 1] Decoder MIM Loss（支持共享 emotion_linear 或独立 dec_emotion_linear）
             if self.dataset == "ED":
                 mask_bool = mask_trg.squeeze(1) # [bsz, seq_len]
                 valid_lens = (~mask_bool).sum(dim=-1, keepdim=True).float().clamp(min=1.0)
                 pooled_dec = ((~mask_bool).unsqueeze(-1).float() * pre_logit).sum(dim=1) / valid_lens
-                dec_emo_logits = self.emotion_linear(self.emo_dropout(pooled_dec))
-                dec_emo_loss = self.criterion_ce(dec_emo_logits, batch["program_label"]) if train else torch.tensor(0.0, device=config.device)
+                dec_emo_head = (self.dec_emotion_linear
+                                if (getattr(self, "use_separate_dec_emo_head", False) and self.dec_emotion_linear is not None)
+                                else self.emotion_linear)
+                dec_emo_logits = dec_emo_head(self.emo_dropout(pooled_dec))
+                if train:
+                    dec_emo_loss = self.criterion_ce(dec_emo_logits, batch["program_label"])
+                else:
+                    dec_emo_loss = torch.tensor(0.0, device=config.device)
+                    with torch.no_grad():
+                        labels_eval = batch["program_label"]
+                        bsz_eval = int(labels_eval.numel())
+                        ce_sum_eval = float(F.cross_entropy(dec_emo_logits.detach(), labels_eval, reduction="sum").item())
+                        preds_dec_eval = torch.argmax(dec_emo_logits.detach(), dim=-1)
+                        correct_dec_eval = int((preds_dec_eval == labels_eval).sum().item())
+                        self._last_eval_dec_emo_stats = {
+                            "batch_ce": ce_sum_eval / max(1, bsz_eval),
+                            "batch_size": bsz_eval,
+                            "ce_sum": ce_sum_eval,
+                            "correct": correct_dec_eval,
+                        }
             else:
                 dec_emo_loss = torch.tensor(0.0, device=config.device)
         

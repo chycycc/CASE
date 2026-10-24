@@ -278,6 +278,9 @@ def get_args():
                         help="[T12-N] Prefix standardization shares text gamma, excludes beta")
     parser.add_argument("--prefix_diagnostics", action="store_true", default=False,
                         help="[T12-N] State-isolated Valid first256/batch4 prefix observations")
+    # V10 Trial 1: 主情绪分类头与解码端辅助分类头解耦
+    parser.add_argument("--use_separate_dec_emo_head", action="store_true", default=False,
+                        help="[V10 T1] 解码端辅助情绪分类使用独立线性分类头 dec_emotion_linear（默认关闭，共享 emotion_linear）")
     parser.add_argument("--skip_test", action="store_true", default=False,
                         help="是否跳过训练收尾时的 5255 样本全量生成测试（用于快速 dry run 验证）")
     # V9 大批次训练生命周期与早停步数重标定

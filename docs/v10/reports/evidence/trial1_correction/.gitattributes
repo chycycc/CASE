@@ -1,0 +1,2 @@
+# Preserve captured bytes so archived SHA256 evidence survives cross-platform checkout.
+* -text -whitespace

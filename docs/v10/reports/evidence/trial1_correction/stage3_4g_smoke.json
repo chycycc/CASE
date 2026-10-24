@@ -1,0 +1,239 @@
+{
+  "note": "Stage 3 4G (batch=4, accum=8) is an engineering pipeline and stability smoke test only; Stage 2 (batch=4, accum=1) provides the exact non-accumulated PCGrad equivalence proof.",
+  "common_init_and_pretrain_hashes_equal": true,
+  "off": {
+    "arm": "off",
+    "scope": {
+      "mode": "4G_engineering_smoke",
+      "train_subset_n": 32,
+      "valid_subset_n": 256,
+      "batch_size": 4,
+      "accum_steps": 8,
+      "main_microsteps": 800,
+      "main_updates": 100,
+      "test_n": 0,
+      "generation_n": 0
+    },
+    "parameter_count": 30336257,
+    "init_common_sha256": "693eec96086af8704f31c7bb4d35303ff234d2b573721a14fde32e979252a4a7",
+    "post_pretrain_common_sha256": "ec49df5c6a95f526156461d3ee42bdbb258779bd2807ff8bff3f583ee7db68d5",
+    "checkpoint_composite_best": "CASE_399_693.3319_composite_best",
+    "checkpoint_composite_sha256": "a6ce6443661de9e9a3213b6ea6d7f9335655f2e2a8db4b57e8e9a9bc305ed2ca",
+    "checkpoint_ppl_best": "CASE_399_693.3319_ppl_best",
+    "checkpoint_ppl_sha256": "be58ca7822e1d6d06ad0f721acc1dca26e98e1f0a0e5a3f59dcea69ab12961eb",
+    "dec_emo_head_mode_in_ckpt": "shared",
+    "eval_pipeline_restore_exact": true,
+    "eval_ncm_restore_exact": true,
+    "diagnostic_steps": [
+      199,
+      399,
+      599,
+      799
+    ],
+    "first_diagnostic": {
+      "step": 199,
+      "scope": {
+        "split": "Valid full",
+        "evaluated_n": 256,
+        "num_batches": 64,
+        "batch_size": 4,
+        "teacher_forcing": true,
+        "training": false
+      },
+      "dec_emo_ce_sample_mean": 4.43618044257164,
+      "dec_emo_ce_batch_macro": 4.43618044257164,
+      "dec_emo_acc_sample_micro": 0.0703125,
+      "dec_emo_correct": 18,
+      "head_divergence": {
+        "head_mode": "shared",
+        "row_cosine_mean": 1.0,
+        "row_cosine_median": 1.0,
+        "row_cosine_min": 1.0,
+        "row_cosine_max": 1.0,
+        "bias_l2_distance": 0.0,
+        "weight_max_abs_diff": 0.0,
+        "bias_max_abs_diff": 0.0
+      }
+    },
+    "last_diagnostic": {
+      "step": 799,
+      "scope": {
+        "split": "Valid full",
+        "evaluated_n": 256,
+        "num_batches": 64,
+        "batch_size": 4,
+        "teacher_forcing": true,
+        "training": false
+      },
+      "dec_emo_ce_sample_mean": 4.924604682251811,
+      "dec_emo_ce_batch_macro": 4.924604682251811,
+      "dec_emo_acc_sample_micro": 0.0546875,
+      "dec_emo_correct": 14,
+      "head_divergence": {
+        "head_mode": "shared",
+        "row_cosine_mean": 1.0,
+        "row_cosine_median": 1.0,
+        "row_cosine_min": 1.0,
+        "row_cosine_max": 1.0,
+        "bias_l2_distance": 0.0,
+        "weight_max_abs_diff": 0.0,
+        "bias_max_abs_diff": 0.0
+      }
+    },
+    "first_update": {
+      "update": 1,
+      "microstep": 7,
+      "ctx_loss": 10.182731628417969,
+      "emotion_loss": 4.810194969177246,
+      "dec_emo_loss": 2.8229005336761475,
+      "grad_finite": true,
+      "emo_grad_max": 0.11187639832496643,
+      "dec_emo_grad_max": null,
+      "row_cosine_mean": 1.0,
+      "weight_max_abs_diff": 0.0
+    },
+    "last_update": {
+      "update": 100,
+      "microstep": 799,
+      "ctx_loss": 0.1559583842754364,
+      "emotion_loss": 2.01162420125911e-05,
+      "dec_emo_loss": 0.03779148310422897,
+      "grad_finite": true,
+      "emo_grad_max": 0.0021423492580652237,
+      "dec_emo_grad_max": null,
+      "row_cosine_mean": 1.0,
+      "weight_max_abs_diff": 0.0
+    },
+    "actual_optimizer_step_count": 100,
+    "finite_microstep_count": 800,
+    "all_model_tensors_restored_exactly_both_loaders": true,
+    "packaging": {
+      "production_main_sh_functions": true,
+      "manifest_counts": {
+        "source_sha256.txt": 9,
+        "checkpoint_sha256.txt": 2
+      },
+      "env_and_diagnostics_copy_exact": true,
+      "no_prefix_initializer_required": true,
+      "download_dir": "E:\\github\\CASE\\results\\v10\\trial1_correction\\download_off"
+    }
+  },
+  "on": {
+    "arm": "on",
+    "scope": {
+      "mode": "4G_engineering_smoke",
+      "train_subset_n": 32,
+      "valid_subset_n": 256,
+      "batch_size": 4,
+      "accum_steps": 8,
+      "main_microsteps": 800,
+      "main_updates": 100,
+      "test_n": 0,
+      "generation_n": 0
+    },
+    "parameter_count": 30345889,
+    "init_common_sha256": "693eec96086af8704f31c7bb4d35303ff234d2b573721a14fde32e979252a4a7",
+    "post_pretrain_common_sha256": "ec49df5c6a95f526156461d3ee42bdbb258779bd2807ff8bff3f583ee7db68d5",
+    "checkpoint_composite_best": "CASE_399_671.7620_composite_best",
+    "checkpoint_composite_sha256": "a90fb4556362656b7bc71330f811e475ae64bec5a150b3b1f8a9773cb48fd51a",
+    "checkpoint_ppl_best": "CASE_399_671.7620_ppl_best",
+    "checkpoint_ppl_sha256": "89c659ca6403e7e4975f1838ebb888a4f370a195f93115a169d8ff5f30b6a3ff",
+    "dec_emo_head_mode_in_ckpt": "separate_linear_v1",
+    "eval_pipeline_restore_exact": true,
+    "eval_ncm_restore_exact": true,
+    "diagnostic_steps": [
+      199,
+      399,
+      599,
+      799
+    ],
+    "first_diagnostic": {
+      "step": 199,
+      "scope": {
+        "split": "Valid full",
+        "evaluated_n": 256,
+        "num_batches": 64,
+        "batch_size": 4,
+        "teacher_forcing": true,
+        "training": false
+      },
+      "dec_emo_ce_sample_mean": 5.494282362982631,
+      "dec_emo_ce_batch_macro": 5.494282362982631,
+      "dec_emo_acc_sample_micro": 0.05859375,
+      "dec_emo_correct": 15,
+      "head_divergence": {
+        "head_mode": "separate_linear_v1",
+        "row_cosine_mean": 0.989641266116279,
+        "row_cosine_median": 0.9879707762491835,
+        "row_cosine_min": 0.9836832272640335,
+        "row_cosine_max": 0.9977602914105252,
+        "bias_l2_distance": 0.03839565140339644,
+        "weight_max_abs_diff": 0.022663384675979614,
+        "bias_max_abs_diff": 0.010779077187180519
+      }
+    },
+    "last_diagnostic": {
+      "step": 799,
+      "scope": {
+        "split": "Valid full",
+        "evaluated_n": 256,
+        "num_batches": 64,
+        "batch_size": 4,
+        "teacher_forcing": true,
+        "training": false
+      },
+      "dec_emo_ce_sample_mean": 5.554155759513378,
+      "dec_emo_ce_batch_macro": 5.554155759513378,
+      "dec_emo_acc_sample_micro": 0.05859375,
+      "dec_emo_correct": 15,
+      "head_divergence": {
+        "head_mode": "separate_linear_v1",
+        "row_cosine_mean": 0.9632673591405058,
+        "row_cosine_median": 0.9579555008261161,
+        "row_cosine_min": 0.9355075926508889,
+        "row_cosine_max": 0.9880556895051812,
+        "bias_l2_distance": 0.08591044664145127,
+        "weight_max_abs_diff": 0.053714949637651443,
+        "bias_max_abs_diff": 0.026712278835475445
+      }
+    },
+    "first_update": {
+      "update": 1,
+      "microstep": 7,
+      "ctx_loss": 10.182731628417969,
+      "emotion_loss": 4.810194969177246,
+      "dec_emo_loss": 2.8229005336761475,
+      "grad_finite": true,
+      "emo_grad_max": 0.11138539016246796,
+      "dec_emo_grad_max": 0.006543621886521578,
+      "row_cosine_mean": 0.9999444809868554,
+      "weight_max_abs_diff": 0.0011520087718963623
+    },
+    "last_update": {
+      "update": 100,
+      "microstep": 799,
+      "ctx_loss": 0.1523691564798355,
+      "emotion_loss": 2.8102920623496175e-05,
+      "dec_emo_loss": 0.031765688210725784,
+      "grad_finite": true,
+      "emo_grad_max": 0.0012573142303153872,
+      "dec_emo_grad_max": 0.00316214538179338,
+      "row_cosine_mean": 0.9632673591405058,
+      "weight_max_abs_diff": 0.053714949637651443
+    },
+    "actual_optimizer_step_count": 100,
+    "finite_microstep_count": 800,
+    "all_model_tensors_restored_exactly_both_loaders": true,
+    "packaging": {
+      "production_main_sh_functions": true,
+      "manifest_counts": {
+        "source_sha256.txt": 9,
+        "checkpoint_sha256.txt": 2
+      },
+      "env_and_diagnostics_copy_exact": true,
+      "no_prefix_initializer_required": true,
+      "download_dir": "E:\\github\\CASE\\results\\v10\\trial1_correction\\download_on"
+    }
+  },
+  "all_passed": true
+}

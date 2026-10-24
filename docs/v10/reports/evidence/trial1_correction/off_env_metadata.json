@@ -1,0 +1,29 @@
+{
+  "python": "3.8.20 (default, Oct  3 2024, 15:19:54) [MSC v.1929 64 bit (AMD64)]",
+  "platform": "Windows-10-10.0.19042-SP0",
+  "torch": "1.12.1+cu113",
+  "numpy": "1.24.4",
+  "sklearn": "1.0.2",
+  "cuda_version": "11.3",
+  "cudnn_version": 8302,
+  "cuda_available": true,
+  "gpu_name": "NVIDIA GeForce RTX 3050 Ti Laptop GPU",
+  "hardware_mode": "4G",
+  "experiment": "v10_trial1_sep_dec_head",
+  "recorded_before_training": true,
+  "optimizer_zero_grad": [
+    {
+      "device": "cpu",
+      "signature": "(set_to_none: bool = False)",
+      "grad_is_none": false,
+      "grad_is_zero_tensor": true
+    },
+    {
+      "device": "cuda:0",
+      "signature": "(set_to_none: bool = False)",
+      "grad_is_none": false,
+      "grad_is_zero_tensor": true
+    }
+  ],
+  "runtime_contract_passed": true
+}

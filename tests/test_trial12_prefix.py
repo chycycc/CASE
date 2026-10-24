@@ -178,9 +178,11 @@ class EvaluationAuditTests(unittest.TestCase):
                          PROJECT_ROOT=str(ROOT), set_seed=lambda: None,
                          prepare_data_seq=lambda **kw: (None, None, None, None, 32, 8))
         loader = source_function(file, fn, namespace)
-        with tempfile.NamedTemporaryFile(dir=ROOT / "scratch") as f:
+        with tempfile.TemporaryDirectory(dir=ROOT / "scratch") as directory:
+            checkpoint_path = Path(directory) / "checkpoint.pt"
+            checkpoint_path.touch()
             with patch.object(torch, "load", return_value=state), contextlib.redirect_stdout(io.StringIO()):
-                result = loader(f.name)
+                result = loader(str(checkpoint_path))
         return cfg, result
 
     def test_norm_metadata_and_marker_are_required_in_both_loaders(self):

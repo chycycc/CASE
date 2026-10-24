@@ -43,7 +43,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.utils.config import config
-from src.utils.prefix_runtime import checkpoint_prefix_norm
+from src.utils.prefix_runtime import checkpoint_prefix_norm, checkpoint_separate_dec_emo_head
 from src.utils.common import set_seed
 from src.utils.constants import ED_MAP_EMO
 from src.models.CASE.model import CASE
@@ -267,13 +267,17 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
                 raise RuntimeError("Checkpoint prefix metadata/weights disagree; refusing topology fallback")
         config.use_proto_prefix_gate = bool(gate_keys)
         config.use_proto_prefix_norm = checkpoint_prefix_norm(state_preview)
+        from src.utils.prefix_runtime import checkpoint_separate_dec_emo_head
+        config.use_separate_dec_emo_head = checkpoint_separate_dec_emo_head(state_preview)
         print(f"    [自适应拓扑] use_proto_prefix_norm={config.use_proto_prefix_norm}")
         print(f"    [自适应拓扑] use_proto_prefix_gate={config.use_proto_prefix_gate}")
+        print(f"    [自适应拓扑] use_separate_dec_emo_head={config.use_separate_dec_emo_head}")
         del state_preview
     else:
         config.emotion_head_type = getattr(config, "emotion_head_type", "linear")
         config.use_pcam = getattr(config, "use_pcam", False)
         config.use_erp = use_erp
+        config.use_separate_dec_emo_head = getattr(config, "use_separate_dec_emo_head", False)
 
     config.erp_hidden_dim = 768
     config.erp_dropout = 0.1
@@ -328,6 +332,10 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
 
     # [E2 修复 / 铁律 IV 规约] 关键拓扑前缀缺失熔断检查 (fail-fast，杜绝掩耳盗铃式假通过)
     critical_prefixes = ["decoder.", "encoder.", "emotion_linear.", "pcam.", "epcl_criterion."]
+    if getattr(config, "use_separate_dec_emo_head", False):
+        critical_prefixes.append("dec_emotion_linear.")
+    elif any(k.startswith("dec_emotion_linear.") for k in unexpected_keys):
+        raise RuntimeError("[FATAL AUDIT / 铁律 IV] 共享分类头模式下检出多余 dec_emotion_linear 权重，拒绝执行评测！")
 
     missing_critical = [p for p in critical_prefixes if any(k.startswith(p) for k in missing_keys)]
     unexpected_critical = [k for k in unexpected_keys if any(k.startswith(p) for p in critical_prefixes)]
@@ -339,6 +347,8 @@ def load_v8_model(checkpoint_path, batch_size=32, use_mcp=True, use_erp=True, us
     model.eval()
     model.is_eval = True
     model.print_proto_prefix_gate_status(stage="checkpoint_restored")  # print restored gate, not constructor defaults
+    if hasattr(model, "print_dec_emo_head_status"):
+        model.print_dec_emo_head_status(stage="checkpoint_restored")
 
     # [V8.2 C] 从检查点文件名识别训练保存 Step 赋给 model.current_step，对齐偏置衰减
     fname = os.path.basename(checkpoint_path)

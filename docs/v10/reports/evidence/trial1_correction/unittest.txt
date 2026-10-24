@@ -1,0 +1,131 @@
+......................................................  0%|          | 0/3 [00:00<?, ?it/s]loss:3.5000 ppl:33.1:   0%|          | 0/3 [00:00<?, ?it/s]loss:3.5000 ppl:33.1:   0%|          | 0/3 [00:00<?, ?it/s]loss:3.5000 ppl:33.1:   0%|          | 0/3 [00:00<?, ?it/s]loss:3.5000 ppl:33.1: 100%|██████████| 3/3 [00:00<?, ?it/s]
+.......
+----------------------------------------------------------------------
+Ran 61 tests in 3.473s
+
+OK
+================================================================================
+                                      Opts                                      
+--------------------------------------------------------------------------------
+                               data_dir: data                                   
+                                dataset: ED                                     
+                             comet_file: data/Comet                             
+                         max_num_dialog: 9                                      
+                            concept_num: 3                                      
+                      total_concept_num: 10                                     
+                                 cs_num: 5                                      
+                               emb_file: vectors/glove.6B.300d.txt              
+                              save_path: save/test                              
+                             model_path: save/test                              
+                      save_path_dataset: save/                                  
+                                PAD_idx: 1                                      
+                                EOS_idx: 2                                      
+                                SOS_idx: 3                                      
+                                USR_idx: 4                                      
+                                SYS_idx: 5                                      
+                                CLS_idx: 6                                      
+                                 KG_idx: 7                                      
+                                SEP_idx: 8                                      
+                              self_loop: 2                                      
+                                contain: 3                                      
+                              temporary: 4                                      
+                             intent_idx: 5                                      
+                               need_idx: 6                                      
+                               want_idx: 7                                      
+                             effect_idx: 8                                      
+                              react_idx: 9                                      
+                           relation_num: 10                                     
+                             batch_size: 16                                     
+                            accum_steps: 1                                      
+                              precision: fp32                                   
+                                     lr: 0.0001                                 
+                             hidden_dim: 300                                    
+                                emb_dim: 300                                    
+                          max_grad_norm: 2.0                                    
+                              beam_size: 5                                      
+                          basic_learner: 1                                      
+                                   topk: 5                                      
+                                softmax: 1                                      
+                               schedule: 10000                                  
+                                    hop: 1                                      
+                                  heads: 2                                      
+                                  depth: 100                                    
+                                 filter: 300                                    
+                        graph_layer_num: 1                                      
+                      graph_ffn_emb_dim: 300                                    
+                        graph_num_heads: 2                                      
+                                   seed: 13                                     
+                                  model: case                                   
+                                   cuda: 1                                      
+                        split_data_seed: 13                                     
+                               pretrain: 1                                      
+                         pretrain_epoch: 4                                      
+                             woStrategy: 1                                      
+                        model_file_path: save/test/                             
+                                 warmup: 12000                                  
+                            fine_weight: 0.2                                    
+                          coarse_weight: 1.0                                    
+                            lambda_epcl: 0.07                                   
+                            epcl_warmup: 3000                                   
+                       epcl_freeze_step: 14000                                  
+                              alpha_mim: 0.1                                    
+                             div_weight: 2.0                                    
+                            lr_schedule: linear                                 
+                        freeze_patience: 3                                      
+                        min_freeze_step: 16000                                  
+                        max_freeze_step: 32000                                  
+                          freeze_metric: emo_acc                                
+                      emotion_head_type: linear                                 
+                         mlp_hidden_dim: 300                                    
+                            mlp_dropout: 0.1                                    
+               num_prototypes_per_class: 1                                      
+                              alpha_uni: 1.0                                    
+                             pcam_heads: 2                                      
+                           pcam_dropout: 0.1                                    
+                         pcam_gate_bias: -1.0                                   
+                          pcam_tau_attn: 1.5                                    
+                         erp_hidden_dim: 768                                    
+                            erp_dropout: 0.1                                    
+                             cchp_alpha: 0.1                                    
+                        cchp_reg_weight: 0.01                                   
+                    unlikelihood_weight: 0.1                                    
+                           mcp_momentum: 0.99                                   
+                             arc_margin: 0.3                                    
+                               arc_mode: cos                                    
+                            epcl_anchor: fine_emotion                           
+                             cls_anchor: default                                
+                    freeze_decay_weight: 0.05                                   
+                     emo_bias_gate_init: -2.0                                   
+                      anneal_start_step: 24000                                  
+                           anneal_steps: 16000                                  
+                      anneal_min_weight: 0.05                                   
+                   emo_vocab_topk_ratio: 0.15                                   
+                      gate_warmup_steps: 20000                                  
+                   mask_update_interval: 5000                                   
+                               patience: 5                                      
+                      bias_anneal_start: 35000                                  
+                      bias_anneal_steps: 15000                                  
+                         bias_min_scale: 0.2                                    
+                    emo_loss_ramp_start: 24000                                  
+                    emo_loss_ramp_steps: 16000                                  
+                      emo_loss_ramp_max: 1.5                                    
+                    emo_loss_ramp_shape: linear                                 
+                   composite_acc_weight: 20.0                                   
+                         composite_mode: acc                                    
+              composite_emo_loss_weight: 8.0                                    
+                       proto_prefix_len: 4                                      
+                      proto_prefix_init: proto                                  
+                    proto_prefix_source: ckpt                                   
+       proto_prefix_prior_path: results/cloud_archive/v9_trial11_B_gnorm6/CASE_7499_37.5058_composite_best
+                             check_iter: 500                                    
+                               max_step: 10000                                  
+                               exp_name: v9_trial2                              
+                    lr_decay_start_step: 3000                                   
+                         lr_decay_steps: 7000                                   
+                           pretrain_emb: 1                                      
+                        label_smoothing: 1                                      
+                                   noam: 1                                      
+                        act_loss_weight: 0.001                                  
+                                dropout: 0.1                                    
+================================================================================
+[*] [V9 架构] MCP 模式启用类间样本级斥力 (class_aware_uniformity_loss)：alpha_uni=1.0，仅推开不同类别样本，同类样本不施力，与 alignment 拉力协同驱动类内聚集 + 类间分离。

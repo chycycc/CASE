@@ -39,7 +39,7 @@ if [ "$ENV_MODE" = "4G" ]; then
     echo "[*] 加载 4GB 显存轻量模式 (RTX 3050Ti 本地兼容训练)"
     echo "    - 实验代号: ${EXP_NAME}"
     echo "    - 特性: FP32 全精度原生无损 + 单步 Batch 4 梯度累加 8 次 (等效 Batch 32) + 显存峰值 < 900MB"
-    echo "    - 时序映射: 前向步数与时序调度按 8x 等比映射，确保 10,000 次真实参数更新完全对齐云端"
+    echo "    - 时序映射: 调度按 8x 映射；梯度累加仅作工程烟测，不保证云端优化轨迹等价"
     echo "======================================================================"
     BATCH_SIZE=4
     ACCUM_STEPS=8
@@ -51,7 +51,7 @@ if [ "$ENV_MODE" = "4G" ]; then
     MIN_SAVE_STEP=24000    # 对应 3000 次更新保护期
     PATIENCE=6
     
-    # 4G 模式专属时序调度 (乘以 8x 保证与云端 24G 优化器轨迹严格等价)
+    # 4G 调度按 8x 映射；不据此宣称累加优化路径与 24G 数学等价。
     LR_DECAY_START=24000   # 3000 * 8
     LR_DECAY_STEPS=48000   # 6000 * 8
     GATE_WARMUP=20000      # 2500 * 8
@@ -160,11 +160,28 @@ PY
         [ "$ENV_MODE" = "4G" ] && T12_ARC_RAMP=20000
         EXTRA_FLAGS="--max_grad_norm 6.0 --arc_margin_ramp_steps $T12_ARC_RAMP --use_proto_prefix --proto_prefix_len 4 --use_proto_prefix_gate --proto_prefix_gate_init 0.0 --proto_prefix_init $T12_MODE --proto_prefix_source $T12_SOURCE --proto_prefix_init_npz $T12_INIT $T12_NORM_FLAGS"
         ;;
+    v10_trial1_sep_dec_head)
+        if [ -n "$EXTRA_FLAGS" ]; then
+            echo "[V10 T1] This named profile fixes EXTRA_FLAGS; unset inherited overrides first." >&2
+            exit 1
+        fi
+        if [ -e "$OUTPUT_DIR" ] || [ -e "$LOG_FILE" ]; then
+            echo "[V10 T1] Output already exists: $EXP_NAME; refusing to overwrite." >&2
+            exit 1
+        fi
+        V10_ARC_RAMP=2500
+        [ "$ENV_MODE" = "4G" ] && V10_ARC_RAMP=20000
+        EXTRA_FLAGS="--max_grad_norm 6.0 --arc_margin_ramp_steps $V10_ARC_RAMP --use_separate_dec_emo_head"
+        ;;
 esac
 
-# 2. 建立独立日志与实验产出目录
+# 2. 建立独立日志与实验产出目录（按实验名前缀自适应 results/v10 与 results/v9）
+RESULTS_DIR="results/v9"
+case "$EXP_NAME" in
+    v10_*) RESULTS_DIR="results/v10" ;;
+esac
 mkdir -p logs
-mkdir -p results/v9
+mkdir -p "${RESULTS_DIR}"
 
 echo "[*] 启动配置全览:"
 echo "    - 实验代号: ${EXP_NAME}"
@@ -174,6 +191,52 @@ echo "    - 权重保存: ${OUTPUT_DIR}"
 echo "    - 训练日志: ${LOG_FILE}"
 echo "    - 评估间隔: 每 ${CHECK_ITER} 步 | 最大步数: ${MAX_STEP} 步 | 保护期: ${MIN_SAVE_STEP} 步"
 echo "======================================================================"
+
+# BEGIN_RUNTIME_METADATA
+# 独立进程探测真实默认清零行为，不改变训练进程的 RNG 或优化器。
+record_runtime_metadata() {
+"${pythonpath}" - "${OUTPUT_DIR}/env_metadata.json" "${ENV_MODE}" "${EXP_NAME}" <<'PY'
+import inspect, json, os, platform, sys
+import numpy, sklearn, torch
+
+def probe_zero_grad(device):
+    p = torch.nn.Parameter(torch.ones(1, device=device))
+    opt = torch.optim.Adam([p])
+    p.grad = torch.ones_like(p)
+    opt.zero_grad()
+    return {"device": device, "signature": str(inspect.signature(opt.zero_grad)),
+            "grad_is_none": p.grad is None,
+            "grad_is_zero_tensor": p.grad is not None and bool((p.grad == 0).all().item())}
+
+def validate_zero_grad(info, mode, experiment):
+    # V10 正式路径要求分类头不因默认清零语义进入 PCGrad shared_params。
+    # 不改 zero_grad 参数；运行时不符时在训练前终止，保留元数据供定位。
+    return not (mode == "24G" and experiment == "v10_trial1_sep_dec_head"
+                and any(not p["grad_is_none"] for p in info["optimizer_zero_grad"]))
+
+info = {"python": sys.version, "platform": platform.platform(),
+        "torch": torch.__version__, "numpy": numpy.__version__, "sklearn": sklearn.__version__,
+        "cuda_version": torch.version.cuda, "cudnn_version": torch.backends.cudnn.version(),
+        "cuda_available": torch.cuda.is_available(),
+        "gpu_name": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "hardware_mode": sys.argv[2], "experiment": sys.argv[3], "recorded_before_training": True,
+        "optimizer_zero_grad": [probe_zero_grad("cpu")]}
+if torch.cuda.is_available():
+    info["optimizer_zero_grad"].append(probe_zero_grad("cuda:0"))
+info["runtime_contract_passed"] = validate_zero_grad(info, sys.argv[2], sys.argv[3])
+os.makedirs(os.path.dirname(sys.argv[1]), exist_ok=True)
+with open(sys.argv[1] + ".tmp", "w", encoding="utf-8") as f:
+    json.dump(info, f, ensure_ascii=False, indent=2)
+os.replace(sys.argv[1] + ".tmp", sys.argv[1])
+print("[Runtime Preflight] " + json.dumps(info, ensure_ascii=False), flush=True)
+if not info["runtime_contract_passed"]:
+    raise RuntimeError("V10 24G requires default Adam.zero_grad() to set existing gradients to None; "
+                       "runtime mismatch, training was not started. See env_metadata.json.")
+PY
+}
+# END_RUNTIME_METADATA
+
+record_runtime_metadata 2>&1 | tee "${LOG_FILE}"
 
 ${pythonpath} main.py \
   --dataset ${DATASET} \
@@ -229,7 +292,7 @@ ${pythonpath} main.py \
   --patience ${PATIENCE} \
   ${EXTRA_FLAGS} \
   --save_path ${OUTPUT_DIR} \
-  --model_file_path ${OUTPUT_DIR} 2>&1 | tee ${LOG_FILE}
+  --model_file_path ${OUTPUT_DIR} 2>&1 | tee -a ${LOG_FILE}
 
 echo "======================================================================"
 echo "[*] 训练完成！自动启动全量学术指标自动化审计..."
@@ -237,12 +300,45 @@ echo "======================================================================"
 
 ${pythonpath} src/scripts/eval_pipeline.py \
   --model_path ${OUTPUT_DIR} \
-  --results_path "results/v9/${EXP_NAME}_eval.txt" \
-  --plot_path "results/v9/${EXP_NAME}_manifold.png" \
+  --results_path "${RESULTS_DIR}/${EXP_NAME}_eval.txt" \
+  --plot_path "${RESULTS_DIR}/${EXP_NAME}_manifold.png" \
   --batch_size ${BATCH_SIZE} \
   --gpu ${GPU_ID} \
   --use_arc_margin \
   ${EXTRA_FLAGS} 2>&1 | tee -a ${LOG_FILE}
+
+# BEGIN_ARTIFACT_PACKAGING
+# 与本地验收共用真实打包函数；不依赖前缀初始化文件存在。
+package_artifacts() {
+mkdir -p "${DOWNLOAD_DIR}"
+if [ "${EXP_NAME}" = "v10_trial1_sep_dec_head" ]; then
+    for REQUIRED_FILE in env_metadata.json dec_emo_diagnostics.jsonl; do
+        if [ ! -s "${OUTPUT_DIR}/${REQUIRED_FILE}" ]; then
+            echo "[V10 T1] Missing required artifact: ${OUTPUT_DIR}/${REQUIRED_FILE}" >&2
+            return 1
+        fi
+    done
+    if ! compgen -G "${OUTPUT_DIR}/CASE_*_composite_best" > /dev/null || ! compgen -G "${OUTPUT_DIR}/CASE_*_ppl_best" > /dev/null; then
+        echo "[V10 T1] Both composite_best and ppl_best checkpoints are required." >&2
+        return 1
+    fi
+fi
+cp -f "${LOG_FILE}" "${DOWNLOAD_DIR}/" 2>/dev/null || true
+cp -f "${OUTPUT_DIR}/eval_metrics.json" "${DOWNLOAD_DIR}/" 2>/dev/null || true
+cp -f "${RESULTS_DIR}/${EXP_NAME}_eval.txt" "${DOWNLOAD_DIR}/" 2>/dev/null || true
+cp -f "${RESULTS_DIR}/${EXP_NAME}_manifold.png" "${DOWNLOAD_DIR}/" 2>/dev/null || true
+cp -f "${RESULTS_DIR}/${EXP_NAME}_results.txt" "${DOWNLOAD_DIR}/" 2>/dev/null || true
+for INIT_FILE in proto_prefix_init.npz prefix_init_metadata.json prefix_diagnostics.jsonl dec_emo_diagnostics.jsonl env_metadata.json; do
+    if [ -f "${OUTPUT_DIR}/${INIT_FILE}" ]; then
+        cp -f "${OUTPUT_DIR}/${INIT_FILE}" "${DOWNLOAD_DIR}/"
+    fi
+done
+if compgen -G "${OUTPUT_DIR}/CASE_*_best" > /dev/null; then
+    sha256sum "${OUTPUT_DIR}"/CASE_*_best > "${DOWNLOAD_DIR}/checkpoint_sha256.txt"
+fi
+sha256sum main.sh main.py src/models/common.py src/models/CASE/model.py src/utils/config.py src/utils/prefix_runtime.py src/utils/data/loader.py src/scripts/eval_pipeline.py src/scripts/eval_prototype_ncm.py > "${DOWNLOAD_DIR}/source_sha256.txt"
+}
+# END_ARTIFACT_PACKAGING
 
 # 3. 汇总所有需要回传或归档的文件到统一输出目录
 if [ -d "${HOME}/autodl-tmp" ]; then
@@ -250,21 +346,7 @@ if [ -d "${HOME}/autodl-tmp" ]; then
 else
     DOWNLOAD_DIR="results/download/${EXP_NAME}"
 fi
-mkdir -p "${DOWNLOAD_DIR}"
-cp -f "${LOG_FILE}" "${DOWNLOAD_DIR}/" 2>/dev/null || true
-cp -f "${OUTPUT_DIR}/eval_metrics.json" "${DOWNLOAD_DIR}/" 2>/dev/null || true
-cp -f "results/v9/${EXP_NAME}_eval.txt" "${DOWNLOAD_DIR}/" 2>/dev/null || true
-cp -f "results/v9/${EXP_NAME}_manifold.png" "${DOWNLOAD_DIR}/" 2>/dev/null || true
-cp -f "results/v9/${EXP_NAME}_results.txt" "${DOWNLOAD_DIR}/" 2>/dev/null || true
-for INIT_FILE in proto_prefix_init.npz prefix_init_metadata.json prefix_diagnostics.jsonl; do
-    if [ -f "${OUTPUT_DIR}/${INIT_FILE}" ]; then
-        cp -f "${OUTPUT_DIR}/${INIT_FILE}" "${DOWNLOAD_DIR}/"
-    fi
-done
-if [ -f "${OUTPUT_DIR}/prefix_init_metadata.json" ]; then
-    sha256sum "${OUTPUT_DIR}"/CASE_*_best > "${DOWNLOAD_DIR}/checkpoint_sha256.txt"
-    sha256sum main.sh main.py src/models/common.py src/models/CASE/model.py src/utils/config.py src/utils/prefix_runtime.py src/utils/data/loader.py src/scripts/eval_pipeline.py src/scripts/eval_prototype_ncm.py > "${DOWNLOAD_DIR}/source_sha256.txt"
-fi
+package_artifacts
 
 echo "======================================================================"
 echo "[*] 全部完成！产出文件已汇总至:"

@@ -35,7 +35,7 @@ if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from src.utils.config import config
-from src.utils.prefix_runtime import checkpoint_prefix_norm
+from src.utils.prefix_runtime import checkpoint_prefix_norm, checkpoint_separate_dec_emo_head
 from src.utils.common import set_seed
 from src.models.CASE.model import CASE
 from src.utils.data.loader import prepare_data_seq
@@ -105,8 +105,11 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
             raise RuntimeError("Checkpoint prefix metadata/weights disagree; refusing topology fallback")
     config.use_proto_prefix_gate = bool(gate_keys)
     config.use_proto_prefix_norm = checkpoint_prefix_norm(state)
+    from src.utils.prefix_runtime import checkpoint_separate_dec_emo_head
+    config.use_separate_dec_emo_head = checkpoint_separate_dec_emo_head(state)
     print(f"    [拓扑识别] use_proto_prefix_norm={config.use_proto_prefix_norm}")
     print(f"    [拓扑识别] use_proto_prefix_gate={config.use_proto_prefix_gate}")
+    print(f"    [拓扑识别] use_separate_dec_emo_head={config.use_separate_dec_emo_head}")
     config.use_erp = any("erp." in k for k in raw_keys)
     config.dataset = "ED"
     config.batch_size = batch_size
@@ -147,6 +150,10 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
     missing_keys, unexpected_keys = model.load_state_dict(model_state, strict=False)
 
     CRITICAL = ("pcam.", "epcl_criterion.", "emotion_linear.", "decoder.", "encoder.", "generator.")
+    if getattr(config, "use_separate_dec_emo_head", False):
+        CRITICAL = CRITICAL + ("dec_emotion_linear.",)
+    else:
+        assert not any(k.startswith("dec_emotion_linear.") for k in unexpected_keys), "[致命 H1] 共享头模式下存在多余 dec_emotion_linear 权重"
     bad_missing = [k for k in missing_keys if any(k.startswith(p) for p in CRITICAL)]
     bad_unexpected = [k for k in unexpected_keys if any(k.startswith(p) for p in CRITICAL)]
     assert not bad_missing, f"[致命 H1] 关键权重缺失，禁止继续评测: {bad_missing[:10]}"
@@ -155,6 +162,8 @@ def safe_load_checkpoint(checkpoint_path, batch_size=32):
     model.eval()
     model.is_eval = True
     model.print_proto_prefix_gate_status(stage="checkpoint_restored")
+    if hasattr(model, "print_dec_emo_head_status"):
+        model.print_dec_emo_head_status(stage="checkpoint_restored")
     print("[+] H1 拓扑断言通过，权重加载就绪！")
     return model, vocab, dev_set, test_set
 
